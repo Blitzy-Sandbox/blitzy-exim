@@ -785,8 +785,14 @@ version = "0.1.0"
 dependencies = [
  "exim-dns",
  "exim-drivers",
+ "exim-expand",
  "exim-store",
  "inventory",
+ "libc",
+ "log",
+ "nix",
+ "regex",
+ "serde",
  "thiserror 2.0.18",
  "tracing",
 ]
