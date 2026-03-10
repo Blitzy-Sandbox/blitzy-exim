@@ -1,63 +1,149 @@
+# =============================================================================
+# Exim Mail Transfer Agent — Rust Workspace Root Manifest
+# =============================================================================
+#
+# This workspace implements a complete C-to-Rust rewrite of the Exim MTA,
+# producing a single `exim` binary from 17 crates. It replaces the role of
+# src/Makefile for Rust compilation (the original Makefile is preserved and
+# extended with a `make rust` target).
+#
+# Build commands:
+#   cargo build --workspace                    # Build all crates (dev profile)
+#   cargo build --release                      # Optimized binary (LTO enabled)
+#   cargo check --workspace                    # Type-check only
+#   cargo clippy --workspace -- -D warnings    # Lint (zero diagnostics required)
+#   cargo fmt --check                          # Format verification
+#   cargo test --workspace                     # Run all tests
+#
+# Enforced quality gates (.cargo/config.toml):
+#   • RUSTFLAGS="-D warnings" — all warnings are compile errors
+#   • Zero unsafe code outside exim-ffi crate
+#   • Cargo feature flags replace all 1,677 C preprocessor conditionals
+#
+# Architecture overview:
+#   exim-core (binary) depends on 16 library crates organized as:
+#   ┌─────────────────────────────────────────────────────────┐
+#   │                     exim-core (bin)                      │
+#   │  CLI parsing, daemon mode, queue runner, signal handling │
+#   ├─────────────┬────────────┬────────────┬─────────────────┤
+#   │ exim-config │ exim-smtp  │ exim-acl   │ exim-deliver    │
+#   │ exim-expand │ exim-tls   │ exim-dns   │ exim-spool      │
+#   ├─────────────┴────────────┴────────────┴─────────────────┤
+#   │                   exim-drivers (traits)                   │
+#   │  exim-auths │ exim-routers │ exim-transports             │
+#   │  exim-lookups │ exim-miscmods                            │
+#   ├──────────────────────────────────────────────────────────┤
+#   │              exim-store (memory/taint)                    │
+#   │              exim-ffi (unsafe C bindings)                 │
+#   └──────────────────────────────────────────────────────────┘
+
 [workspace]
 resolver = "2"
 members = [
+  # ── Binary crate ─────────────────────────────────────────────────────────
+  # Produces the `exim` executable. Main entry point with mode dispatch
+  # (daemon, delivery, queue-runner, verify, expand-test, filter-test, etc.)
   "exim-core",
-  "exim-config",
-  "exim-expand",
-  "exim-smtp",
-  "exim-deliver",
-  "exim-acl",
-  "exim-tls",
-  "exim-store",
-  "exim-drivers",
-  "exim-auths",
-  "exim-routers",
-  "exim-transports",
-  "exim-lookups",
-  "exim-miscmods",
-  "exim-dns",
-  "exim-spool",
-  "exim-ffi",
+
+  # ── Core engine crates ───────────────────────────────────────────────────
+  "exim-config",       # Configuration file parser          (replaces readconf.c)
+  "exim-expand",       # String expansion ${...} DSL engine (replaces expand.c)
+  "exim-smtp",         # SMTP inbound + outbound protocol   (replaces smtp_in.c, smtp_out.c)
+  "exim-deliver",      # Delivery orchestration + routing    (replaces deliver.c, route.c)
+  "exim-acl",          # Access Control List evaluation      (replaces acl.c)
+  "exim-tls",          # TLS abstraction layer               (replaces tls*.c, dane*.c)
+  "exim-dns",          # DNS resolution + DNSBL              (replaces dns.c, dnsbl.c, host.c)
+  "exim-spool",        # Spool file I/O (byte-level compat)  (replaces spool_in/out.c)
+
+  # ── Memory and type safety ──────────────────────────────────────────────
+  "exim-store",        # Arena allocator + Tainted<T>/Clean<T> (replaces store.c)
+
+  # ── Driver framework + implementations ──────────────────────────────────
+  "exim-drivers",      # Trait definitions + inventory registry (replaces drtables.c)
+  "exim-auths",        # 9 authenticator drivers               (replaces auths/*.c)
+  "exim-routers",      # 7 router drivers                      (replaces routers/*.c)
+  "exim-transports",   # 6 transport drivers                   (replaces transports/*.c)
+  "exim-lookups",      # 22+ lookup backends                   (replaces lookups/*.c)
+  "exim-miscmods",     # Optional modules: DKIM, ARC, SPF, etc. (replaces miscmods/*.c)
+
+  # ── FFI boundary (ONLY crate with unsafe code) ─────────────────────────
+  "exim-ffi",          # C library FFI: libpam, libperl, libgsasl, hintsdb, etc.
 ]
 default-members = ["exim-core"]
 
+# =============================================================================
+# Shared package metadata
+# =============================================================================
+# Member crates may inherit these fields via `field.workspace = true` in their
+# own Cargo.toml, ensuring consistent metadata across the workspace.
+
+[workspace.package]
+version = "4.99.0"
+edition = "2021"
+rust-version = "1.80"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/Exim/exim"
+description = "Exim Mail Transfer Agent — Rust implementation"
+
+# =============================================================================
+# Workspace-wide shared dependencies
+# =============================================================================
+# All dependency versions are pinned per AAP §0.6.1. Individual crates reference
+# these via `dependency.workspace = true` to guarantee version consistency.
+# Dependencies listed here are NOT automatically included in any crate — each
+# member crate must explicitly opt-in to the dependencies it needs.
+
 [workspace.dependencies]
-# Serialization
+
+# ── Serialization ──────────────────────────────────────────────────────────
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 
-# Error handling
+# ── Error handling ─────────────────────────────────────────────────────────
 thiserror = "2.0.18"
 anyhow = "1.0.102"
 
-# Logging and tracing
+# ── Logging and tracing (replaces debug.c / log.c) ────────────────────────
+# tracing provides structured, span-based diagnostics matching Exim's
+# debug selector system (-d+all, -d+route, -d+transport, etc.)
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
 log = "0.4.29"
 
-# System and FFI
+# ── System interfaces and FFI ─────────────────────────────────────────────
 libc = "0.2.183"
 nix = { version = "0.31.2", features = ["signal", "process", "socket", "user"] }
 
-# Regex
+# ── Pattern matching ──────────────────────────────────────────────────────
+# regex: Rust-native regex for internal use
+# pcre2: PCRE2 bindings for Exim-compatible pattern matching in ACLs/expand
 regex = "1.12.3"
 pcre2 = "0.2.11"
 
-# Memory management
+# ── Memory management (replaces store.c 5-pool allocator) ─────────────────
+# bumpalo: per-message arena (replaces POOL_MAIN), dropped at message end
+# typed-arena: alternative arena for homogeneous allocations
 bumpalo = { version = "3.20.2", features = ["collections"] }
 typed-arena = "2.0.2"
 
-# Driver registration
+# ── Driver registration (replaces drtables.c) ─────────────────────────────
+# Compile-time driver collection via inventory::submit! macro
 inventory = "0.3.22"
 
-# CLI
+# ── CLI argument parsing ──────────────────────────────────────────────────
+# Parses Exim's CLI: -bd, -bp, -bt, -be, -bV, -d, -q, -M* families
 clap = { version = "4.5.60", features = ["derive"] }
 
-# TLS
+# ── TLS backends ──────────────────────────────────────────────────────────
+# rustls: default TLS backend (memory-safe, no C dependency)
+# openssl: optional backend (behind tls-openssl feature) for environments
+#          requiring OpenSSL (e.g., FIPS, specific cipher suites)
 rustls = "0.23.37"
 openssl = "0.10.75"
 
-# Database lookups
+# ── Database / lookup backends ────────────────────────────────────────────
+# Each is feature-gated in exim-lookups/Cargo.toml; only compiled when
+# the corresponding lookup-* feature is enabled.
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 redis = "1.0.5"
 tokio-postgres = "0.7.16"
@@ -65,23 +151,112 @@ deadpool-postgres = "0.14.1"
 mysql_async = "0.36.1"
 ldap3 = "0.12.1"
 
-# DNS
+# ── DNS resolution ────────────────────────────────────────────────────────
 hickory-resolver = "0.25.0"
 
-# Async runtime (scoped to lookup block_on ONLY)
+# ── Async runtime ────────────────────────────────────────────────────────
+# CRITICAL: tokio is scoped to lookup execution ONLY via block_on().
+# It MUST NOT be used for the main daemon event loop. The daemon uses
+# the same fork-per-connection concurrency model as the C implementation
+# with poll/select-based I/O for the listener socket.
 tokio = { version = "1.50.0", features = ["rt", "macros"] }
 
-# Dynamic loading
+# ── Dynamic library loading (replaces dlopen/dlsym for ${dlfunc}) ─────────
 libloading = "0.9.0"
 
-# Build dependencies
+# ── Build-time dependencies ──────────────────────────────────────────────
+# Used as [build-dependencies] in exim-ffi for C header binding generation.
+# Listed here at workspace level for version consistency; referenced via
+# `bindgen.workspace = true` in exim-ffi/Cargo.toml [build-dependencies].
 bindgen = "0.72.1"
 cc = "1.2.56"
 
+# =============================================================================
+# Feature Flag Architecture
+# =============================================================================
+#
+# Cargo feature flags replace ALL 1,677 C preprocessor conditionals (#ifdef /
+# #ifndef) from the original Exim source. Features are defined in individual
+# crate Cargo.toml files because virtual workspaces cannot declare [features].
+#
+# The exim-core binary crate selects features via its dependencies on library
+# crates. Building with non-default features:
+#
+#   cargo build --release -p exim-core \
+#     --features "exim-tls/tls-openssl" \
+#     --no-default-features --features "exim-lookups/lookup-pgsql"
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ Category          │ Crate           │ Features                             │
+# ├───────────────────┼─────────────────┼──────────────────────────────────────┤
+# │ TLS backend       │ exim-tls        │ tls-rustls* tls-openssl              │
+# ├───────────────────┼─────────────────┼──────────────────────────────────────┤
+# │ Authenticators    │ exim-auths      │ auth-cram-md5* auth-cyrus-sasl       │
+# │ (9 drivers)       │                 │ auth-dovecot* auth-external*         │
+# │                   │                 │ auth-gsasl auth-heimdal-gssapi       │
+# │                   │                 │ auth-plaintext* auth-spa* auth-tls*  │
+# ├───────────────────┼─────────────────┼──────────────────────────────────────┤
+# │ Routers           │ exim-routers    │ router-accept* router-dnslookup*     │
+# │ (7 drivers)       │                 │ router-ipliteral* router-iplookup    │
+# │                   │                 │ router-manualroute*                  │
+# │                   │                 │ router-queryprogram router-redirect* │
+# ├───────────────────┼─────────────────┼──────────────────────────────────────┤
+# │ Transports        │ exim-transports │ transport-appendfile*                │
+# │ (6 drivers)       │                 │ transport-autoreply*                 │
+# │                   │                 │ transport-lmtp* transport-pipe*      │
+# │                   │                 │ transport-queuefile transport-smtp*  │
+# ├───────────────────┼─────────────────┼──────────────────────────────────────┤
+# │ Lookup backends   │ exim-lookups    │ lookup-cdb* lookup-dbmdb*            │
+# │ (22 backends)     │                 │ lookup-dnsdb* lookup-dsearch*        │
+# │                   │                 │ lookup-json lookup-ldap              │
+# │                   │                 │ lookup-lmdb lookup-lsearch*          │
+# │                   │                 │ lookup-mysql lookup-nis              │
+# │                   │                 │ lookup-nisplus lookup-nmh            │
+# │                   │                 │ lookup-oracle lookup-passwd*         │
+# │                   │                 │ lookup-pgsql lookup-psl              │
+# │                   │                 │ lookup-readsock lookup-redis         │
+# │                   │                 │ lookup-spf lookup-sqlite             │
+# │                   │                 │ lookup-testdb lookup-whoson          │
+# ├───────────────────┼─────────────────┼──────────────────────────────────────┤
+# │ Optional modules  │ exim-miscmods   │ dkim* arc spf dmarc                 │
+# │ (14 modules)      │                 │ dmarc-native exim-filter*            │
+# │                   │                 │ sieve-filter* proxy* socks           │
+# │                   │                 │ xclient pam radius perl dscp         │
+# ├───────────────────┼─────────────────┼──────────────────────────────────────┤
+# │ Hints DB          │ exim-ffi        │ hintsdb-bdb hintsdb-gdbm            │
+# │ backends (5)      │                 │ hintsdb-ndbm hintsdb-tdb            │
+# │                   │                 │ hintsdb-sqlite                       │
+# ├───────────────────┼─────────────────┼──────────────────────────────────────┤
+# │ FFI modules       │ exim-ffi        │ ffi-pam ffi-radius ffi-perl         │
+# │                   │                 │ ffi-gsasl ffi-krb5 ffi-spf          │
+# └───────────────────┴─────────────────┴──────────────────────────────────────┘
+#
+# Features marked with * are enabled by default in their respective crate.
+#
+# Default feature set (matches typical Exim build with common drivers):
+#   TLS:        tls-rustls
+#   Auth:       cram-md5, plaintext, external, dovecot, spa, tls
+#   Routers:    accept, dnslookup, ipliteral, manualroute, redirect
+#   Transports: appendfile, smtp, pipe, lmtp, autoreply
+#   Lookups:    lsearch, dbmdb, dnsdb, dsearch, passwd, cdb
+#   Modules:    dkim, exim-filter, sieve-filter, proxy
+
+# =============================================================================
+# Build Profiles
+# =============================================================================
+
 [profile.release]
-lto = true
-codegen-units = 1
-strip = true
+lto = true           # Full link-time optimization for maximum single-binary perf
+codegen-units = 1    # Single codegen unit for best optimization (slower compile)
+strip = true         # Strip debug symbols — reduces binary size significantly
+opt-level = 3        # Maximum optimization level
 
 [profile.dev]
-debug = true
+debug = true         # Full debug info for development and debugging
+opt-level = 0        # No optimization for fast compile cycles
+
+# Separate profile for benchmarking with optimizations but debug info retained
+[profile.bench]
+inherits = "release"
+debug = true         # Keep debug info for profiling with perf/flamegraph
+strip = false        # Don't strip symbols for benchmark analysis
