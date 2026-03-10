@@ -689,6 +689,7 @@ version = "0.1.0"
 dependencies = [
  "exim-drivers",
  "exim-store",
+ "log",
  "regex",
  "serde",
  "thiserror 2.0.18",

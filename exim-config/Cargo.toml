@@ -1,12 +1,163 @@
+# =============================================================================
+# exim-config — Exim MTA Configuration File Parser Crate
+# =============================================================================
+#
+# Replaces src/src/readconf.c (4,765 lines) and parts of src/src/drtables.c
+# (651 lines) with a Rust-native configuration parser that provides:
+#
+#   - Full backward-compatible Exim configuration file syntax parsing
+#   - Macro expansion (.define, $macro references)
+#   - File inclusion (.include / .include_if_exists)
+#   - Conditional compilation (.ifdef / .ifndef / .elifdef / .elifndef / .else / .endif)
+#   - Option list processing for all driver types (optionlist tables)
+#   - Driver instance creation from configuration (auth, router, transport, lookup)
+#   - Configuration validation and -bP printing
+#   - Typed ConfigContext / Arc<Config> generation for downstream crates
+#
+# This crate is a critical dependency for exim-core (main binary) and serves as
+# the bridge between raw configuration text and the typed ConfigContext that all
+# other crates consume.  After parsing, the configuration is frozen into an
+# Arc<Config> and shared immutably (AAP §0.7.3).
+#
+# Source modules:
+#   src/lib.rs         — Public API: parse(), validate(), print_config()
+#   src/parser.rs      — Configuration file parser with backward-compatible syntax
+#   src/options.rs     — Option list processing for all driver types
+#   src/macros.rs      — Macro expansion, .include, .ifdef/.ifndef conditionals
+#   src/driver_init.rs — Driver instance creation from config, registry lookup
+#   src/validate.rs    — Config validation, -bP printing
+#   src/types.rs       — ConfigContext struct, Arc<Config> wrapper
+#
+# Preprocessor conditional mapping (C → Cargo features):
+#   WITH_CONTENT_SCAN     → content-scan
+#   DISABLE_TLS (negated) → tls (enabled by default)
+#   DISABLE_PRDR (negated) → prdr (enabled by default)
+#   DISABLE_DKIM (negated) → dkim (enabled by default)
+#   SUPPORT_I18N          → i18n
+#   DISABLE_WELLKNOWN (negated) → wellknown
+
 [package]
 name = "exim-config"
 version = "0.1.0"
 edition = "2021"
+description = "Exim MTA configuration file parser — full backward-compatible parsing with macro expansion, .include/.ifdef directives, driver instance creation, and config validation"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+# Per AAP §0.5.1, this crate depends on exim-store and exim-drivers.
+# All workspace-shared dependencies are referenced via `workspace = true` to
+# guarantee version consistency with the root Cargo.toml [workspace.dependencies].
 
 [dependencies]
+
+# ── Workspace-internal dependencies ──────────────────────────────────────────
+
+# exim-store: Provides Arc<Config> wrapper for frozen configuration state,
+# Tainted<T>/Clean<T> newtypes for compile-time taint tracking of
+# configuration values derived from untrusted sources, and MessageArena for
+# per-message memory allocation during config-driven string expansion.
+# Replaces the POOL_CONFIG allocation pool from store.c.
 exim-store = { path = "../exim-store" }
+
+# exim-drivers: Provides trait definitions (AuthDriver, RouterDriver,
+# TransportDriver, LookupDriver) and the inventory-based compile-time
+# registration system.  Used by driver_init.rs to instantiate driver objects
+# from configuration blocks by resolving driver names through the registry.
+# Per AAP §0.7.3: "Driver registration via inventory crate — each driver
+# resolved by name from config."
 exim-drivers = { path = "../exim-drivers" }
+
+# ── Workspace-shared dependencies ────────────────────────────────────────────
+
+# serde: Serialization framework for configuration structures.  Enables
+# structured serialization of ConfigContext for config dump operations (-bP)
+# and potential future config caching / config-as-data workflows.
 serde = { workspace = true }
+
+# thiserror: Error type derivation for ConfigError, ParseError, MacroError,
+# DriverInitError, and ValidationError types returned by the parser and
+# validator.  Provides ergonomic Display/Error trait implementations.
 thiserror = { workspace = true }
+
+# tracing: Structured logging and debugging infrastructure replacing the C
+# debug.c/log.c patterns.  Configuration parsing events, macro expansion
+# traces, driver initialization steps, and validation warnings are emitted
+# through tracing spans matching Exim's -d debug selector system
+# (-d+all, -d+config, -d+expand, etc.).
 tracing = { workspace = true }
+
+# log: Logging facade for compatibility with crates that use the log API
+# instead of tracing.  The tracing-log bridge in exim-core ensures all
+# log::info!() etc. calls are captured by the tracing subscriber.
+log = { workspace = true }
+
+# regex: Rust-native regular expression library used for pattern matching
+# in option validation (host lists, domain lists, address patterns) and
+# macro name validation during .define processing.
 regex = { workspace = true }
+
+# =============================================================================
+# Features
+# =============================================================================
+# Per AAP §0.7.3: Cargo feature flags replace ALL preprocessor conditionals.
+# The following features correspond to C preprocessor macros found in
+# readconf.c that control which configuration options are available.
+#
+# Mapping from C preprocessor macros:
+#
+#   C Macro                  Rust Feature    Sense     Description
+#   ───────────────────────  ──────────────  ────────  ──────────────────────────
+#   WITH_CONTENT_SCAN        content-scan    positive  Content scanning options
+#   DISABLE_TLS              tls             negated   TLS-related config options
+#   DISABLE_PRDR             prdr            negated   Per-Recipient Data Response
+#   DISABLE_DKIM             dkim            negated   DKIM signing/verification
+#   SUPPORT_I18N             i18n            positive  Internationalization (EAI)
+#   DISABLE_WELLKNOWN        wellknown       negated   WELLKNOWN SMTP extension
+#
+# "Negated" sense means the C code uses #ifndef DISABLE_X to enable a feature,
+# so the Rust feature flag enables it when present (matching the common case
+# where the feature is NOT disabled).
+#
+# Default features enable the options that are typically compiled into a
+# standard Exim build (TLS, PRDR, DKIM, and content scanning are standard).
+
+[features]
+default = [
+  "content-scan",
+  "tls",
+  "prdr",
+  "dkim",
+]
+
+# Enables WITH_CONTENT_SCAN option parsing: av_scanner, acl_not_smtp_mime,
+# acl_smtp_mime, and related content scanning configuration options.
+content-scan = []
+
+# Enables TLS-related configuration options: acl_smtp_starttls, tls_advertise_hosts,
+# tls_certificate, tls_privatekey, tls_verify_certificates, tls_crl, and all
+# other tls_* main configuration options.  Corresponds to the common case where
+# DISABLE_TLS is NOT defined in the C build.
+tls = []
+
+# Enables Per-Recipient Data Response (PRDR) configuration option:
+# acl_smtp_data_prdr.  Corresponds to the common case where DISABLE_PRDR is
+# NOT defined in the C build.
+prdr = []
+
+# Enables DKIM signing/verification configuration options: acl_smtp_dkim and
+# related DKIM module configuration.  Corresponds to the common case where
+# DISABLE_DKIM is NOT defined in the C build.
+dkim = []
+
+# Enables internationalization (EAI/SMTPUTF8) configuration options:
+# allow_utf8_domains and related internationalized email address handling.
+# Corresponds to SUPPORT_I18N being defined in the C build.
+i18n = []
+
+# Enables WELLKNOWN SMTP extension configuration option: acl_smtp_wellknown.
+# Corresponds to the common case where DISABLE_WELLKNOWN is NOT defined in
+# the C build.
+wellknown = []
