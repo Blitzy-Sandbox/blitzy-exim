@@ -3,6 +3,7 @@
 // This is the entry point. Modules will be expanded as implementation proceeds.
 
 pub mod cli;
+pub mod signal;
 
 fn main() {
     // Stub: will be replaced by implementation agent
