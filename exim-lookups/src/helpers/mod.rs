@@ -10,12 +10,16 @@
 //!   (replaces `lf_check_file.c`)
 //! - [`quote`] — Name=value quoting for multi-column lookup results
 //!   (replaces `lf_quote.c`)
+//! - [`sql_perform`] — Multi-server SQL failover loop
+//!   (replaces `lf_sqlperform.c`)
 
 pub mod check_file;
 pub mod quote;
+pub mod sql_perform;
 
 // Re-export the primary function and types for convenient access.
 pub use check_file::{
     check_file as check_file_fn, CheckFileError, CheckFileTarget, ExpectedFileType,
 };
 pub use quote::{lf_quote, lf_quote_bytes, lf_quote_to_string};
+pub use sql_perform::{sql_perform as sql_perform_fn, SqlPerformError, SqlPerformResult};
