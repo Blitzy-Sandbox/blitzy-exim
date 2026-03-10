@@ -61,5 +61,8 @@ pub mod gsasl;
 #[cfg(feature = "ffi-krb5")]
 pub mod krb5;
 
+#[cfg(feature = "ffi-perl")]
+pub mod perl;
+
 #[cfg(feature = "ffi-spf")]
 pub mod spf;
