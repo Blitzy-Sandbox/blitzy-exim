@@ -725,7 +725,10 @@ name = "exim-store"
 version = "0.1.0"
 dependencies = [
  "bumpalo",
+ "log",
+ "serde",
  "thiserror",
+ "tracing",
  "typed-arena",
 ]
 
