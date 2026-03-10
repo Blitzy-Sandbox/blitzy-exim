@@ -75,6 +75,11 @@ pub mod pam;
 #[cfg(feature = "ffi-spf")]
 pub mod spf;
 
+/// Oracle OCI (Oracle Call Interface) FFI bindings (wraps libclntsh).
+/// Source: src/src/lookups/oracle.c — wraps legacy OCI v2 API for Oracle SQL lookups
+#[cfg(feature = "ffi-oracle")]
+pub mod oracle;
+
 /// DMARC policy evaluation bindings (wraps libopendmarc).
 /// Source: src/src/miscmods/dmarc.c — replaces SUPPORT_DMARC preprocessor conditional
 #[cfg(feature = "ffi-dmarc")]
