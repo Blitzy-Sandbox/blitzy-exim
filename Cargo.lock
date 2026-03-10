@@ -851,12 +851,15 @@ name = "exim-transports"
 version = "0.1.0"
 dependencies = [
  "exim-drivers",
- "exim-spool",
+ "exim-ffi",
  "exim-store",
- "exim-tls",
  "inventory",
  "libc",
+ "log",
  "nix",
+ "pcre2",
+ "regex",
+ "serde",
  "thiserror 2.0.18",
  "tracing",
 ]

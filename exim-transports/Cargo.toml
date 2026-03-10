@@ -1,24 +1,319 @@
+# =============================================================================
+# exim-transports — Transport Driver Implementations for Exim MTA
+# =============================================================================
+#
+# This crate replaces the entire src/src/transports/ directory (14 C source
+# files + Makefile) with 6 Rust transport driver implementations plus the
+# Maildir helper:
+#
+#   appendfile.rs  — mbox/MBX/Maildir/Mailstore with file locking
+#   autoreply.rs   — Vacation auto-response generation
+#   lmtp.rs        — LMTP client transport (via command or socket)
+#   pipe.rs        — Pipe message to external command
+#   queuefile.rs   — Experimental spool copy (behind feature flag)
+#   smtp.rs        — Full outbound SMTP/LMTP state machine (6,573 lines in C)
+#   maildir.rs     — Maildir quota + directory management helper
+#
+# Each transport implements the TransportDriver trait from exim-drivers and
+# uses inventory::submit! for compile-time registration (AAP §0.4.2).
+#
+# Feature flags replace ALL C preprocessor conditionals (TRANSPORT_*,
+# EXPERIMENTAL_*, SUPPORT_*, DISABLE_*) per AAP §0.7.3.
+
 [package]
 name = "exim-transports"
 version = "0.1.0"
 edition = "2021"
+description = "Transport driver implementations for Exim MTA — 6 transport drivers + Maildir helper implementing TransportDriver trait"
+license = "GPL-2.0-or-later"
+publish = false
 
-[features]
-default = ["transport-appendfile", "transport-smtp", "transport-pipe", "transport-lmtp", "transport-autoreply"]
-transport-appendfile = []
-transport-autoreply = []
-transport-lmtp = []
-transport-pipe = []
-transport-queuefile = []
-transport-smtp = []
+# =============================================================================
+# Dependencies
+# =============================================================================
+#
+# Workspace-shared dependencies use { workspace = true } to reference the root
+# Cargo.toml [workspace.dependencies] section, ensuring version consistency
+# across all 18 crates.
+#
+# Path dependencies reference sibling crates in the workspace:
+#   exim-drivers — TransportDriver trait definition + inventory registration
+#   exim-store   — Tainted<T>/Clean<T> newtypes, arena allocation, MessageArena
+#   exim-ffi     — FFI bindings (optional, only when transports need C library access)
 
 [dependencies]
+
+# ── Workspace sibling crates ─────────────────────────────────────────────────
+
+# TransportDriver trait definition and inventory-based compile-time registration.
+# Every transport driver implements TransportDriver and registers via
+# inventory::submit! for runtime discovery by name from configuration.
 exim-drivers = { path = "../exim-drivers" }
+
+# Tainted<T>/Clean<T> newtype wrappers for compile-time taint tracking,
+# bumpalo::Bump per-message arena allocation, and MessageArena scoped storage.
+# Replaces the C store.c 5-pool allocator for transport-local allocations.
 exim-store = { path = "../exim-store" }
-exim-tls = { path = "../exim-tls" }
-exim-spool = { path = "../exim-spool" }
+
+# FFI bindings for C libraries without viable Rust replacements.
+# Optional: only needed if specific transports require direct C library access
+# (e.g., system-level file operations not covered by nix/libc safe wrappers).
+exim-ffi = { path = "../exim-ffi", optional = true }
+
+# ── Compile-time driver registration ────────────────────────────────────────
+
+# Each transport driver uses inventory::submit! to register itself at compile
+# time, replacing the C drtables.c static registration tables. The exim-config
+# crate resolves transport names to registered implementations at config parse.
 inventory = { workspace = true }
+
+# ── Serialization ────────────────────────────────────────────────────────────
+
+# Serialization framework used for transport option block serialization and
+# structured data handling in delivery contexts.
+serde = { workspace = true }
+
+# ── Error handling ───────────────────────────────────────────────────────────
+
+# Derive macro for transport-specific error types. Each transport defines its
+# own error enum (e.g., SmtpTransportError, AppendfileTransportError) with
+# thiserror providing Display + Error trait implementations.
 thiserror = { workspace = true }
+
+# ── Logging and tracing ─────────────────────────────────────────────────────
+
+# Structured logging replacing C DEBUG(D_transport) macro calls. Transport
+# operations emit tracing spans for delivery timing, connection lifecycle,
+# file locking, and protocol state machine transitions.
 tracing = { workspace = true }
-nix = { workspace = true }
+
+# Logging facade for compatibility with crates that use the log API.
+log = { workspace = true }
+
+# ── Pattern matching ────────────────────────────────────────────────────────
+
+# Rust-native regex for Maildir quota directory matching (maildir_dir_regex,
+# maildirfolder_create_regex) and SMTP EHLO capability extraction. Used where
+# PCRE2-specific features are not required.
+regex = { workspace = true }
+
+# ── System interfaces ───────────────────────────────────────────────────────
+
+# C type definitions and low-level system call bindings for POSIX operations
+# required by transport drivers: file locking (flock/fcntl), file permissions
+# (fchmod/fchown), directory operations, and process management.
 libc = { workspace = true }
+
+# ── Optional dependencies (feature-gated) ───────────────────────────────────
+
+# PCRE2 bindings for Exim-compatible regex matching in the SMTP transport
+# (EHLO regex matching) and appendfile transport (quota_size_regex). Enabled
+# via the pcre2-support feature flag.
+pcre2 = { workspace = true, optional = true }
+
+# Safe POSIX API wrappers for the pipe transport (fork/exec, uid/gid setting,
+# signal handling) and appendfile transport (file locking via flock/fcntl,
+# chown operations, directory creation with mode). Provides safe abstractions
+# over libc without requiring unsafe blocks (AAP §0.7.2 compliance).
+nix = { workspace = true, optional = true }
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Feature flags replace ALL C preprocessor conditionals from the transport
+# source tree per AAP §0.7.3. Each C #ifdef/#ifndef maps to a semantically
+# named Cargo feature:
+#
+#   C Preprocessor Define          →  Cargo Feature
+#   ─────────────────────────────────────────────────
+#   TRANSPORT_APPENDFILE           →  transport-appendfile
+#   TRANSPORT_AUTOREPLY            →  transport-autoreply
+#   TRANSPORT_LMTP                 →  transport-lmtp
+#   TRANSPORT_PIPE                 →  transport-pipe
+#   (smtp.c always compiled)       →  transport-smtp
+#   EXPERIMENTAL_QUEUEFILE         →  transport-queuefile
+#   SUPPORT_MAILDIR                →  maildir
+#   SUPPORT_MAILSTORE              →  mailstore
+#   SUPPORT_MBX                    →  mbx
+#   SUPPORT_DANE                   →  dane
+#   SUPPORT_SOCKS                  →  socks
+#   !DISABLE_TLS (inverted)        →  tls
+#   !DISABLE_DKIM (inverted)       →  dkim
+#   !DISABLE_PRDR (inverted)       →  prdr
+#   !DISABLE_PIPE_CONNECT (inv.)   →  pipe-connect
+#   !DISABLE_OCSP (inverted)       →  ocsp
+#   SUPPORT_I18N                   →  i18n
+#   EXPERIMENTAL_ARC               →  arc
+#   !DISABLE_ESMTP_LIMITS (inv.)   →  esmtp-limits
+#   !DISABLE_TLS_RESUME (inv.)     →  tls-resume
+#   EXPERIMENTAL_DSN_INFO          →  dsn-info
+#   EXPERIMENTAL_SRV_SMTPS         →  srv-smtps
+
+[features]
+
+# Default features enable the commonly-compiled transports and features that
+# are ON by default in standard C builds. The DISABLE_* macros are NOT defined
+# in default C builds, meaning those features are enabled; we mirror that here.
+# EXPERIMENTAL_* features and optional format support (mailstore, mbx, socks,
+# dane, i18n, arc, dsn-info, srv-smtps, queuefile) are NOT in default.
+default = [
+  # ── Core transport drivers (always compiled in typical C builds) ──────
+  "transport-appendfile",
+  "transport-autoreply",
+  "transport-lmtp",
+  "transport-pipe",
+  "transport-smtp",
+
+  # ── Maildir format support (commonly enabled) ────────────────────────
+  "maildir",
+
+  # ── SMTP sub-features (enabled by default — inverted DISABLE_* macros)
+  "tls",
+  "dkim",
+  "prdr",
+  "pipe-connect",
+  "ocsp",
+  "esmtp-limits",
+  "tls-resume",
+]
+
+# ── Individual transport driver features ─────────────────────────────────────
+# One feature per driver, gating compilation of the corresponding module.
+# Maps directly to C TRANSPORT_* / EXPERIMENTAL_* preprocessor defines.
+
+# mbox/MBX/Maildir/Mailstore delivery with POSIX file locking (fcntl/flock).
+# Replaces appendfile.c (3,373 lines). Depends on tf_maildir helper when
+# the maildir feature is also enabled.
+# C guard: #ifdef TRANSPORT_APPENDFILE
+transport-appendfile = []
+
+# Vacation auto-response message generation.
+# Replaces autoreply.c.
+# C guard: #ifdef TRANSPORT_AUTOREPLY
+transport-autoreply = []
+
+# LMTP client transport for local delivery via command pipe or TCP socket.
+# Replaces lmtp.c.
+# C guard: #ifdef TRANSPORT_LMTP
+transport-lmtp = []
+
+# Pipe message to external command with configurable environment, uid/gid,
+# resource limits, and timeout handling.
+# Replaces pipe.c.
+# C guard: #ifdef TRANSPORT_PIPE
+transport-pipe = []
+
+# Full outbound SMTP/LMTP state machine with TLS, DANE, PIPELINING, CHUNKING,
+# DKIM signing, PRDR, PIPE CONNECT early pipelining, and ESMTP extensions.
+# Replaces smtp.c (6,573 lines — largest transport driver).
+# C guard: smtp.c has NO top-level guard (always compiled); feature-flagged
+# here for consistency with the Cargo feature architecture.
+transport-smtp = []
+
+# Experimental spool file copy transport. NOT in default features.
+# Replaces queuefile.c. Requires openat() support (guaranteed on Linux).
+# C guard: #ifdef EXPERIMENTAL_QUEUEFILE
+transport-queuefile = []
+
+# ── Sub-feature flags for format/protocol support ────────────────────────────
+# These control sub-functionality within transport drivers, mapping to C
+# SUPPORT_*, DISABLE_*, and EXPERIMENTAL_* preprocessor conditionals.
+
+# Maildir format support in appendfile transport + tf_maildir helper module.
+# Enables maildir.rs module for quota management (maildirsize files),
+# directory creation (new/cur/tmp), and folder hierarchy.
+# C guard: #ifdef SUPPORT_MAILDIR
+maildir = []
+
+# Mailstore format support in appendfile transport. Each message is stored
+# as a separate file pair (message data + envelope metadata) with configurable
+# prefix and suffix for file naming.
+# C guard: #ifdef SUPPORT_MAILSTORE
+mailstore = []
+
+# MBX format support in appendfile transport. Implements the University of
+# Washington MBX mailbox format with internal index and dedicated locking.
+# C guard: #ifdef SUPPORT_MBX
+mbx = []
+
+# DANE/TLSA verification support in SMTP transport. Enables TLSA DNS record
+# lookup and certificate pinning for outbound connections.
+# C guard: #ifdef SUPPORT_DANE
+dane = []
+
+# SOCKS5 proxy support in SMTP transport. Allows outbound SMTP connections
+# to be routed through a SOCKS5 proxy server.
+# C guard: #ifdef SUPPORT_SOCKS
+socks = []
+
+# TLS/STARTTLS support in SMTP transport. Controls TLS negotiation,
+# certificate verification, cipher configuration, and secure transport.
+# Inverted from C: enabled when DISABLE_TLS is NOT defined.
+# C guard: #ifndef DISABLE_TLS
+tls = []
+
+# DKIM signing support in SMTP transport. Enables DKIM signature generation
+# on outbound messages with configurable domain, selector, and algorithm.
+# Inverted from C: enabled when DISABLE_DKIM is NOT defined.
+# C guard: #ifndef DISABLE_DKIM
+dkim = []
+
+# Per-Recipient Data Response (PRDR) extension in SMTP transport.
+# Allows per-recipient accept/reject decisions after DATA phase.
+# Inverted from C: enabled when DISABLE_PRDR is NOT defined.
+# C guard: #ifndef DISABLE_PRDR
+prdr = []
+
+# PIPE CONNECT early pipelining optimization in SMTP transport. Sends
+# EHLO + MAIL FROM before receiving the banner on cached connections.
+# Inverted from C: enabled when DISABLE_PIPE_CONNECT is NOT defined.
+# C guard: #ifndef DISABLE_PIPE_CONNECT
+pipe-connect = []
+
+# OCSP stapling support in SMTP transport. Requires TLS to be enabled.
+# Validates OCSP responses during TLS handshake for certificate revocation.
+# Inverted from C: enabled when DISABLE_OCSP is NOT defined.
+# C guard: #ifndef DISABLE_OCSP
+# Dependency: requires tls feature (OCSP operates within TLS handshake)
+ocsp = ["tls"]
+
+# Internationalization / SMTPUTF8 support in SMTP transport. Enables
+# handling of internationalized email addresses and UTF-8 headers per
+# RFC 6531 (SMTPUTF8 extension).
+# C guard: #ifdef SUPPORT_I18N
+i18n = []
+
+# ARC (Authenticated Received Chain) signing in SMTP transport.
+# Experimental feature for adding ARC headers to outbound messages.
+# C guard: #ifdef EXPERIMENTAL_ARC
+arc = []
+
+# ESMTP LIMITS extension support in SMTP transport. Advertises and
+# enforces per-connection limits (max recipients, max recipient domains).
+# Inverted from C: enabled when DISABLE_ESMTP_LIMITS is NOT defined.
+# C guard: #ifndef DISABLE_ESMTP_LIMITS
+esmtp-limits = []
+
+# TLS session resumption support in SMTP transport. Caches TLS session
+# parameters for faster reconnection to previously-visited hosts.
+# Requires TLS to be enabled.
+# Inverted from C: enabled when DISABLE_TLS_RESUME is NOT defined.
+# C guard: #if !defined(DISABLE_TLS) && !defined(DISABLE_TLS_RESUME)
+# Dependency: requires tls feature
+tls-resume = ["tls"]
+
+# DSN (Delivery Status Notification) extended info in SMTP transport.
+# Experimental feature providing additional diagnostic information.
+# C guard: #ifdef EXPERIMENTAL_DSN_INFO
+dsn-info = []
+
+# SRV record lookup for implicit TLS (SMTPS on port 465) in SMTP transport.
+# Experimental feature enabling RFC 8314 compliance via SRV records.
+# C guard: #ifdef EXPERIMENTAL_SRV_SMTPS
+srv-smtps = []
+
+# PCRE2 regex support for transport drivers. Enables PCRE2-compatible regex
+# matching for SMTP EHLO capability regexes and appendfile quota_size_regex.
+# Activates the optional pcre2 dependency.
+pcre2-support = ["dep:pcre2"]
