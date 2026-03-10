@@ -727,6 +727,7 @@ dependencies = [
  "bumpalo",
  "log",
  "serde",
+ "serde_json",
  "thiserror",
  "tracing",
  "typed-arena",

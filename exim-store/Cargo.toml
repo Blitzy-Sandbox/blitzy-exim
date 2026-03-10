@@ -62,6 +62,13 @@ tracing = { workspace = true }
 # Provides compatibility with crates that use the log facade instead of tracing.
 log = { workspace = true }
 
+[dev-dependencies]
+
+# ── Test-only JSON serialization ─────────────────────────────────────────────
+# Used in unit tests to verify Serialize/Deserialize implementations for
+# Tainted<T> and Clean<T> newtypes.
+serde_json = { workspace = true }
+
 [features]
 # This foundational crate has no feature-gated backends.  It provides core
 # memory management types (MessageArena, Tainted<T>, Clean<T>, ConfigStore,
