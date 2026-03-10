@@ -628,12 +628,15 @@ dependencies = [
 name = "exim-acl"
 version = "0.1.0"
 dependencies = [
+ "exim-dns",
  "exim-drivers",
  "exim-expand",
  "exim-lookups",
  "exim-store",
+ "log",
  "pcre2",
  "regex",
+ "serde",
  "thiserror 2.0.18",
  "tracing",
 ]
