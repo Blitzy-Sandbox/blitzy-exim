@@ -607,8 +607,11 @@ dependencies = [
 name = "exim-dns"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "exim-store",
  "hickory-resolver",
+ "log",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",
