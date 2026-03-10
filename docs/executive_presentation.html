@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exim Mail Server: C to Rust Migration — Executive Summary</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css">
+  <style>
+    .reveal {
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+    }
+    .reveal h1 {
+      font-size: 2.0em;
+      color: #1a365d;
+      font-weight: 700;
+    }
+    .reveal h2 {
+      font-size: 1.5em;
+      color: #1a365d;
+      margin-bottom: 0.2em;
+    }
+    .reveal h3 {
+      font-size: 1.0em;
+      color: #4a5568;
+      font-weight: 400;
+      font-style: italic;
+      margin-top: 0;
+      margin-bottom: 0.8em;
+    }
+    .reveal p {
+      font-size: 0.8em;
+      color: #4a5568;
+      line-height: 1.5;
+    }
+    .reveal li {
+      font-size: 0.8em;
+      color: #2d3748;
+      line-height: 1.5;
+      margin-bottom: 0.4em;
+    }
+    .reveal ul,
+    .reveal ol {
+      display: block;
+      text-align: left;
+      margin-left: 1em;
+    }
+    .reveal strong {
+      color: #1a365d;
+    }
+    .reveal .title-slide h1 {
+      font-size: 2.4em;
+      margin-bottom: 0.1em;
+    }
+    .reveal .title-slide h2 {
+      font-size: 1.4em;
+      color: #2a4365;
+      font-weight: 400;
+    }
+    .reveal small {
+      color: #718096;
+    }
+    .reveal .check {
+      color: #276749;
+      font-weight: bold;
+      font-size: 1.1em;
+    }
+  </style>
+</head>
+<body>
+  <div class="reveal">
+    <div class="slides">
+
+      <!-- Slide 1: Title -->
+      <section class="title-slide">
+        <h1>Exim Mail Server</h1>
+        <h2>C to Rust Migration</h2>
+        <h3>Executive Summary</h3>
+        <p><small>Confidential &mdash; 2025</small></p>
+      </section>
+
+      <!-- Slide 2: Why This Migration — The Problem -->
+      <section>
+        <h2>Why This Migration</h2>
+        <h3>The Challenge</h3>
+        <ul>
+          <li>Exim delivers email for millions of organizations worldwide</li>
+          <li>Built in C, where memory errors are the leading cause of critical security weaknesses across the industry</li>
+          <li>Manual memory handling creates ongoing risk</li>
+        </ul>
+      </section>
+
+      <!-- Slide 3: Why This Migration — The Solution -->
+      <section>
+        <h2>Why This Migration</h2>
+        <h3>The Solution</h3>
+        <ul>
+          <li>Rust prevents memory safety errors automatically before software is deployed</li>
+          <li>Eliminates entire categories of security weaknesses at build time</li>
+          <li>Trusted by leading technology organizations for critical infrastructure</li>
+        </ul>
+      </section>
+
+      <!-- Slide 4: What Changed — Scope -->
+      <section>
+        <h2>What Changed</h2>
+        <h3>Transformation Scope</h3>
+        <ul>
+          <li><strong>182,000</strong> lines of C rewritten in Rust</li>
+          <li><strong>242</strong> source files reorganized into <strong>18</strong> structured components</li>
+          <li>Every feature preserved &mdash; identical functionality, zero changes for users</li>
+        </ul>
+      </section>
+
+      <!-- Slide 5: What Changed — Architecture -->
+      <section>
+        <h2>What Changed</h2>
+        <h3>Modernized Architecture</h3>
+        <ul>
+          <li><strong>Before:</strong> One large, interconnected codebase</li>
+          <li><strong>After:</strong> 18 independent, well-organized components</li>
+          <li><strong>Result:</strong> Faster updates, easier maintenance, clearer responsibilities</li>
+        </ul>
+      </section>
+
+      <!-- Slide 6: Performance Results — Throughput -->
+      <section>
+        <h2>Performance Results</h2>
+        <h3>Email Processing Speed</h3>
+        <ul>
+          <li>Throughput (messages processed per hour) within <strong>10%</strong> of the original</li>
+          <li>Over 90% of original speed retained with full safety guarantees</li>
+          <li>Verified across 10,000+ email transactions per test run</li>
+        </ul>
+      </section>
+
+      <!-- Slide 7: Performance Results — Resource Usage -->
+      <section>
+        <h2>Performance Results</h2>
+        <h3>System Resources</h3>
+        <ul>
+          <li><strong>Response Time:</strong> Within 5% of original</li>
+          <li><strong>Memory Usage:</strong> Within 20% of original</li>
+          <li><strong>Configuration Loading:</strong> Comparable speed</li>
+        </ul>
+        <p>Safety improvements achieved with minimal resource cost.</p>
+      </section>
+
+      <!-- Slide 8: Security Posture — Before -->
+      <section>
+        <h2>Security Posture</h2>
+        <h3>Before the Migration</h3>
+        <ul>
+          <li>440 locations in the code requiring manual memory handling</li>
+          <li>Each location a potential entry point for attackers</li>
+          <li>Human review alone cannot reliably catch all errors</li>
+        </ul>
+      </section>
+
+      <!-- Slide 9: Security Posture — After -->
+      <section>
+        <h2>Security Posture</h2>
+        <h3>After the Migration</h3>
+        <ul>
+          <li>Rust's build tools automatically prevent memory safety errors</li>
+          <li>All interactions with external software isolated in one controlled area</li>
+          <li>Fewer than 50 carefully documented interaction points</li>
+        </ul>
+      </section>
+
+      <!-- Slide 10: Risk Assessment — Risks and Mitigations -->
+      <section>
+        <h2>Risk Assessment</h2>
+        <h3>Identified Risks and Mitigations</h3>
+        <ul>
+          <li><strong>Risk:</strong> Behavioral changes &mdash; <strong>Mitigated:</strong> 1,205 tests pass unchanged</li>
+          <li><strong>Risk:</strong> Performance impact &mdash; <strong>Mitigated:</strong> All measurements verified within targets</li>
+          <li><strong>Risk:</strong> Team readiness &mdash; <strong>Mitigated:</strong> Incremental training program</li>
+        </ul>
+      </section>
+
+      <!-- Slide 11: Risk Assessment — Compatibility -->
+      <section>
+        <h2>Risk Assessment</h2>
+        <h3>Full Backward Compatibility</h3>
+        <ul>
+          <li>All existing email configurations work without any changes</li>
+          <li>All communication rules and message formats remain identical</li>
+          <li>All administrative tools continue to function normally</li>
+          <li>Zero modifications required by system operators</li>
+        </ul>
+      </section>
+
+      <!-- Slide 12: Migration Timeline -->
+      <section>
+        <h2>Migration Timeline</h2>
+        <ol>
+          <li><strong>Planning</strong> &mdash; Architecture and component design</li>
+          <li><strong>Implementation</strong> &mdash; Rewriting all 18 components in Rust</li>
+          <li><strong>Testing</strong> &mdash; Validating all 1,205 test cases</li>
+          <li><strong>Benchmarking</strong> &mdash; Performance verification against targets</li>
+          <li><strong>Deployment</strong> &mdash; Staged rollout with monitoring</li>
+        </ol>
+      </section>
+
+      <!-- Slide 13: Key Metrics Summary -->
+      <section>
+        <h2>Key Metrics Summary</h2>
+        <ul>
+          <li><span class="check">&#x2713;</span> <strong>Test Suite:</strong> 1,205 tests passing</li>
+          <li><span class="check">&#x2713;</span> <strong>Performance:</strong> All metrics within target limits</li>
+          <li><span class="check">&#x2713;</span> <strong>Safety:</strong> All risky operations confined to one controlled area</li>
+          <li><span class="check">&#x2713;</span> <strong>Compatibility:</strong> Works with all existing systems without changes</li>
+        </ul>
+      </section>
+
+      <!-- Slide 14: Recommendation -->
+      <section>
+        <h2>Recommendation</h2>
+        <ul>
+          <li>Migration complete &mdash; ready for staged production deployment</li>
+          <li>Begin phased rollout with non-critical email routes first</li>
+          <li>Establish monitoring baselines, then expand to full infrastructure</li>
+        </ul>
+      </section>
+
+      <!-- Slide 15: Thank You / Q&A -->
+      <section>
+        <h1>Thank You</h1>
+        <h3>Questions &amp; Discussion</h3>
+        <p>Contact: <em>team@exim.org</em></p>
+      </section>
+
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script>
+    Reveal.initialize({
+      hash: true,
+      transition: 'slide',
+      slideNumber: true
+    });
+  </script>
+</body>
+</html>
