@@ -68,6 +68,9 @@ fn main() {
     #[cfg(feature = "ffi-spf")]
     generate_spf_bindings(&out_dir);
 
+    #[cfg(feature = "ffi-dmarc")]
+    generate_dmarc_bindings(&out_dir);
+
     #[cfg(feature = "hintsdb-bdb")]
     generate_bdb_bindings(&out_dir);
 
@@ -108,6 +111,9 @@ fn write_feature_manifest(out_dir: &Path) {
     if cfg!(feature = "ffi-spf") {
         features.push("ffi-spf");
     }
+    if cfg!(feature = "ffi-dmarc") {
+        features.push("ffi-dmarc");
+    }
     if cfg!(feature = "hintsdb-bdb") {
         features.push("hintsdb-bdb");
     }
@@ -146,6 +152,7 @@ fn write_feature_manifest(out_dir: &Path) {
     feature = "ffi-gsasl",
     feature = "ffi-krb5",
     feature = "ffi-spf",
+    feature = "ffi-dmarc",
     feature = "hintsdb-bdb",
     feature = "hintsdb-gdbm",
     feature = "hintsdb-ndbm",
@@ -902,6 +909,96 @@ fn generate_spf_bindings(out_dir: &Path) {
     bindings
         .write_to_file(out_dir.join("spf_bindings.rs"))
         .expect("Failed to write SPF bindings file");
+}
+
+// =============================================================================
+// libopendmarc Binding Generator (ffi-dmarc)
+// =============================================================================
+// Source context: src/src/miscmods/dmarc.c — DMARC policy evaluation via
+//   libopendmarc. The library does not ship a pkg-config file so we link
+//   directly via -lopendmarc and use the system header <opendmarc/dmarc.h>.
+//
+// The OPENDMARC_LIB_T struct contains platform-dependent fields (MAXPATHLEN,
+// MAXNS, struct sockaddr_in) so bindgen is required for correct layout.
+// =============================================================================
+
+#[cfg(feature = "ffi-dmarc")]
+fn generate_dmarc_bindings(out_dir: &Path) {
+    // libopendmarc has no pkg-config — emit the link directive manually.
+    println!("cargo:rustc-link-lib=opendmarc");
+
+    // The opendmarc header includes <sys/param.h>, <sys/socket.h>,
+    // <netinet/in.h>, and <resolv.h>, so we create a thin wrapper that
+    // ensures all prerequisite system headers are present.
+    let wrapper = out_dir.join("wrapper_dmarc.h");
+    let wrapper_content = "\
+#include <sys/types.h>
+#include <sys/param.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <resolv.h>
+#include <opendmarc/dmarc.h>
+";
+    fs::write(&wrapper, wrapper_content).expect("Failed to write DMARC wrapper header");
+    println!("cargo:rerun-if-changed={}", wrapper.display());
+
+    let builder = create_builder(
+        wrapper
+            .to_str()
+            .expect("DMARC wrapper path not valid UTF-8"),
+    );
+
+    let bindings = builder
+        // Library lifecycle
+        .allowlist_function("opendmarc_policy_library_init")
+        .allowlist_function("opendmarc_policy_library_shutdown")
+        // Connection / policy context lifecycle
+        .allowlist_function("opendmarc_policy_connect_init")
+        .allowlist_function("opendmarc_policy_connect_clear")
+        .allowlist_function("opendmarc_policy_connect_rset")
+        .allowlist_function("opendmarc_policy_connect_shutdown")
+        // Store information
+        .allowlist_function("opendmarc_policy_store_from_domain")
+        .allowlist_function("opendmarc_policy_store_dkim")
+        .allowlist_function("opendmarc_policy_store_spf")
+        .allowlist_function("opendmarc_policy_store_dmarc")
+        .allowlist_function("opendmarc_policy_query_dmarc")
+        .allowlist_function("opendmarc_policy_parse_dmarc")
+        // Policy evaluation
+        .allowlist_function("opendmarc_get_policy_to_enforce")
+        .allowlist_function("opendmarc_get_policy_token_used")
+        // Fetch DMARC record attributes
+        .allowlist_function("opendmarc_policy_fetch_alignment")
+        .allowlist_function("opendmarc_policy_fetch_pct")
+        .allowlist_function("opendmarc_policy_fetch_adkim")
+        .allowlist_function("opendmarc_policy_fetch_aspf")
+        .allowlist_function("opendmarc_policy_fetch_p")
+        .allowlist_function("opendmarc_policy_fetch_sp")
+        .allowlist_function("opendmarc_policy_fetch_rua")
+        .allowlist_function("opendmarc_policy_fetch_ruf")
+        .allowlist_function("opendmarc_policy_fetch_utilized_domain")
+        .allowlist_function("opendmarc_policy_fetch_from_domain")
+        // Utility
+        .allowlist_function("opendmarc_policy_status_to_str")
+        .allowlist_function("opendmarc_policy_check_alignment")
+        .allowlist_function("opendmarc_policy_to_buf")
+        // TLD file loading
+        .allowlist_function("opendmarc_tld_read_file")
+        .allowlist_function("opendmarc_tld_shutdown")
+        // Types
+        .allowlist_type("OPENDMARC_LIB_T")
+        .allowlist_type("DMARC_POLICY_T")
+        .allowlist_type("OPENDMARC_STATUS_T")
+        // Constants — allow all DMARC_*, OPENDMARC_*, ARES_* defines
+        .allowlist_var("DMARC_.*")
+        .allowlist_var("OPENDMARC_.*")
+        .allowlist_var("ARES_.*")
+        .generate()
+        .expect("Failed to generate libopendmarc FFI bindings");
+
+    bindings
+        .write_to_file(out_dir.join("dmarc_bindings.rs"))
+        .expect("Failed to write DMARC bindings file");
 }
 
 // =============================================================================

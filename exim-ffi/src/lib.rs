@@ -74,3 +74,8 @@ pub mod pam;
 
 #[cfg(feature = "ffi-spf")]
 pub mod spf;
+
+/// DMARC policy evaluation bindings (wraps libopendmarc).
+/// Source: src/src/miscmods/dmarc.c — replaces SUPPORT_DMARC preprocessor conditional
+#[cfg(feature = "ffi-dmarc")]
+pub mod dmarc;
