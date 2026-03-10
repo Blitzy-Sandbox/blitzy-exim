@@ -55,5 +55,8 @@
 // are created. Only modules with source files present on disk are declared
 // below to avoid rustfmt resolution errors.
 
+#[cfg(feature = "ffi-krb5")]
+pub mod krb5;
+
 #[cfg(feature = "ffi-spf")]
 pub mod spf;
