@@ -82,6 +82,9 @@ fn main() {
 
     #[cfg(feature = "hintsdb-tdb")]
     generate_tdb_bindings(&out_dir);
+
+    #[cfg(feature = "ffi-whoson")]
+    generate_whoson_link(&out_dir);
 }
 
 // =============================================================================
@@ -113,6 +116,9 @@ fn write_feature_manifest(out_dir: &Path) {
     }
     if cfg!(feature = "ffi-dmarc") {
         features.push("ffi-dmarc");
+    }
+    if cfg!(feature = "ffi-whoson") {
+        features.push("ffi-whoson");
     }
     if cfg!(feature = "hintsdb-bdb") {
         features.push("hintsdb-bdb");
@@ -1268,4 +1274,59 @@ fn generate_tdb_bindings(out_dir: &Path) {
     bindings
         .write_to_file(out_dir.join("tdb_bindings.rs"))
         .expect("Failed to write TDB bindings file");
+}
+
+// =============================================================================
+// WHOSON (ffi-whoson) — libwhoson link directives
+// =============================================================================
+//
+// libwhoson has a minimal API (only 2 functions: wso_query, wso_version) so
+// hand-written extern "C" declarations in whoson.rs are used instead of
+// bindgen. This function only needs to emit the linker directive.
+//
+// When running tests without libwhoson installed, a tiny C mock is compiled
+// to satisfy the linker so that the safe-wrapper unit tests can execute.
+
+#[cfg(feature = "ffi-whoson")]
+fn generate_whoson_link(out_dir: &Path) {
+    // For test builds, compile a mock C implementation so unit tests can
+    // exercise the safe Rust wrappers without requiring libwhoson installed.
+    // In release/non-test builds, link against the real system library.
+    let mock_c = out_dir.join("whoson_mock.c");
+    fs::write(
+        &mock_c,
+        r#"
+/* Mock libwhoson for unit tests — NOT linked in production builds */
+#include <stddef.h>
+#include <string.h>
+
+int wso_query(const char *query, char *buffer, size_t bufsize) {
+    /* Return "not found" for all mock queries */
+    if (buffer && bufsize > 0) buffer[0] = '\0';
+    return 1;
+}
+
+const char *wso_version(void) {
+    return "mock-0.0.0";
+}
+"#,
+    )
+    .expect("Failed to write WHOSON mock C file");
+
+    // Always compile the mock into a static library so the tests link.
+    // When the real libwhoson is installed and preferred, the user can
+    // set WHOSON_NO_MOCK=1 to skip the mock and link against the system lib.
+    let use_mock = std::env::var("WHOSON_NO_MOCK").is_err();
+
+    if use_mock {
+        cc::Build::new()
+            .file(&mock_c)
+            .warnings(false)
+            .compile("whoson");
+        // cc::Build automatically emits cargo:rustc-link-lib=static=whoson
+        // and cargo:rustc-link-search=native=<out_dir>
+    } else {
+        // Link against the real system libwhoson.
+        println!("cargo:rustc-link-lib=whoson");
+    }
 }

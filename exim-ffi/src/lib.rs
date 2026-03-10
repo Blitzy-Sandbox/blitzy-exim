@@ -79,3 +79,8 @@ pub mod spf;
 /// Source: src/src/miscmods/dmarc.c — replaces SUPPORT_DMARC preprocessor conditional
 #[cfg(feature = "ffi-dmarc")]
 pub mod dmarc;
+
+/// WHOSON dynamic IP user tracking bindings (wraps libwhoson).
+/// Source: src/src/lookups/whoson.c — replaces LOOKUP_WHOSON preprocessor conditional
+#[cfg(feature = "ffi-whoson")]
+pub mod whoson;

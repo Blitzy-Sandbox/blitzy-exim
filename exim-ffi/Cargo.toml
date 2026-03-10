@@ -70,6 +70,7 @@ ffi-gsasl = []         # libgsasl — GNU SASL (replaces AUTH_GSASL)
 ffi-krb5 = []          # libkrb5/Heimdal — Kerberos GSSAPI (replaces AUTH_HEIMDAL_GSSAPI)
 ffi-spf = []           # libspf2 — SPF validation (replaces SUPPORT_SPF)
 ffi-dmarc = []         # libopendmarc — DMARC policy evaluation (replaces SUPPORT_DMARC)
+ffi-whoson = []        # libwhoson — WHOSON dynamic IP tracking (replaces LOOKUP_WHOSON)
 
 # Hints database backend features
 # These are mutually exclusive at runtime but can all be compiled simultaneously.
