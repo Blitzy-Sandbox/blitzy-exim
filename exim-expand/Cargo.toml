@@ -1,14 +1,258 @@
+# =============================================================================
+# exim-expand — String Expansion Engine for Exim MTA
+# =============================================================================
+#
+# Crate manifest for the string expansion engine that replaces the monolithic
+# src/src/expand.c (9,210 lines — the single largest file in the Exim codebase).
+#
+# Architecture: tokenizer → parser → evaluator pipeline
+#   tokenizer.rs  — Lexical analysis of ${...} expressions
+#   parser.rs     — AST construction from token stream
+#   evaluator.rs  — AST evaluation producing expanded strings
+#   variables.rs  — $variable substitution (200+ variables)
+#   conditions.rs — ${if ...} conditional logic (40+ conditions)
+#   lookups.rs    — ${lookup ...} integration bridge
+#   transforms.rs — ${operator:subject} transforms (50+ operators)
+#   run.rs        — ${run ...} command execution
+#   dlfunc.rs     — ${dlfunc} dynamic function calls (feature-gated)
+#   perl.rs       — ${perl} integration via FFI (feature-gated)
+#
+# This is a pure library crate consumed by exim-core and other workspace crates.
+# Crate name in Rust code: exim_expand (hyphen → underscore per Rust convention).
+
 [package]
 name = "exim-expand"
 version = "0.1.0"
 edition = "2021"
+description = "String expansion engine for Exim MTA — tokenizer → parser → evaluator pipeline replacing expand.c"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Dependencies
+# =============================================================================
 
 [dependencies]
+
+# ── Workspace path dependencies ─────────────────────────────────────────────
+# These are internal crates from the Exim Rust workspace.
+
+# Tainted<T>/Clean<T> newtypes, MessageArena, Arc<Config> — expand.c is
+# tightly coupled to store.c for taint tracking and memory allocation
+# (AAP §0.4.3: compile-time taint enforcement replaces runtime is_tainted())
 exim-store = { path = "../exim-store" }
-exim-lookups = { path = "../exim-lookups" }
-exim-ffi = { path = "../exim-ffi" }
+
+# LookupDriver trait for lookup dispatch — needed by the evaluator to resolve
+# ${lookup ...} type queries through the driver registry (AAP §0.4.2)
+exim-drivers = { path = "../exim-drivers" }
+
+# ${lookup ...} integration bridge — OPTIONAL, enabled by lookup-integration
+# feature (AAP §0.5.1: "${lookup ...} integration bridge")
+exim-lookups = { path = "../exim-lookups", optional = true }
+
+# ${perl} integration and ${dlfunc} dynamic loading — OPTIONAL, enabled by
+# perl feature (AAP §0.5.1: "${perl} integration via exim-ffi")
+exim-ffi = { path = "../exim-ffi", optional = true }
+
+# DNS-related expansion variable lookups — OPTIONAL, enabled by dns feature
+exim-dns = { path = "../exim-dns", optional = true }
+
+# ── Workspace-shared external dependencies ──────────────────────────────────
+# Versions pinned via [workspace.dependencies] in root Cargo.toml per AAP §0.6.1.
+# All use `workspace = true` to guarantee version consistency (AAP §0.6.3).
+
+# Serialization framework (workspace-wide) — used for config and internal data
 serde = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+
+# JSON parsing for forall_json/forany_json conditions and ${extract} named
+# field extraction (expand.c uses JSON iteration for object/array traversal)
+serde_json = { workspace = true }
+
+# Rust-native regex for sg{} substitution and match conditions
+# (AAP §0.6.1: regex 1.12.3)
 regex = { workspace = true }
+
+# PCRE2 bindings for Exim-compatible pattern matching in ${if match ...} and
+# ${sg ...} operations (AAP §0.6.1: pcre2 0.2.11, used by exim-acl/exim-expand)
 pcre2 = { workspace = true }
+
+# Error type derivation for ExpandError enum (workspace-wide)
+thiserror = { workspace = true }
+
+# Structured logging/debugging replacing DEBUG(D_expand) C macros
+# (workspace-wide — AAP §0.6.1: tracing 0.1.44)
+tracing = { workspace = true }
+
+# Logging facade for crate compatibility (workspace-wide)
+log = { workspace = true }
+
+# C type definitions for ${run} child process management, stat() for ${stat}
+# operator, and various system-level expansion operations
+libc = { workspace = true }
+
+# Application error handling (workspace-wide)
+anyhow = { workspace = true }
+
+# ── Cryptographic / hash dependencies ───────────────────────────────────────
+# Required by transforms.rs (${md5}, ${sha1}, ${sha2}, ${sha3}, ${hmac}),
+# conditions.rs (crypteq with {md5}/{sha1} schemes), and evaluator.rs (${hmac}).
+# These are NOT in workspace deps — versions from RustCrypto ecosystem.
+
+# MD5 hash for ${md5:subject}, crypteq {md5}, and ${hmac{md5}{...}}
+md-5 = "0.10.6"
+
+# SHA-1 hash for ${sha1:subject}, crypteq {sha1}, and ${hmac{sha1}{...}}
+sha1 = "0.10.6"
+
+# SHA-256 hash for ${sha2:subject} / ${sha256:subject} operators
+sha2 = "0.10.9"
+
+# SHA3-256 hash for ${sha3:subject} operator
+sha3 = "0.10.8"
+
+# RustCrypto Digest trait — unified hash function interface required by
+# hmac crate and all hash operator implementations
+digest = "0.10.7"
+
+# HMAC computation for ${hmac{algorithm}{secret}{data}} expansion item
+hmac = "0.12.1"
+
+# Base64 encoding/decoding for ${base64}, ${base64d}, ${str2b64}, ${hex2b64},
+# crypteq base64 comparison, and ${prvs}/${prvscheck} tag encoding
+base64 = "0.22.1"
+
+# Random number generation for ${randint:max} operator — replaces C
+# vaguely_random_number() which used arc4random/srandom/random
+rand = "0.10.0"
+
+# ── Feature-gated optional external dependencies ────────────────────────────
+
+# Dynamic library loading for ${dlfunc} — replaces C dlopen()/dlsym()/dlerror()
+# (AAP §0.6.1: libloading 0.9.0). Only compiled when dlfunc feature is enabled.
+libloading = { workspace = true, optional = true }
+
+# Safe POSIX API wrappers for ${run} fork/exec — killpg(), umask(), Pid
+# (AAP §0.6.1: nix 0.31.2). Only compiled when run feature is enabled.
+nix = { workspace = true, optional = true }
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Cargo feature flags replace ALL C preprocessor conditionals (#ifdef/#ifndef)
+# found in expand.c (AAP §0.7.3). Each feature maps to a specific C conditional
+# and controls compile-time inclusion of the corresponding expansion variables,
+# conditions, items, or operators.
+#
+# Feature names use kebab-case for consistency with workspace conventions.
+
+[features]
+
+# Default features — match the default C build configuration
+# SUPPORT_CRYPTEQ is enabled by default in C (expand.c lines 28-31)
+default = ["crypteq"]
+
+# ── Core expansion features (from agent prompt Phase 3) ─────────────────────
+
+# International email support — UTF-8 domain/localpart operators
+# Replaces: #ifdef SUPPORT_I18N (expand.c lines 120-122, 191-196, 590-592)
+i18n = []
+
+# Sender Rewriting Scheme support — SRS encode/decode, inbound_srs condition
+# Replaces: #ifdef SUPPORT_SRS (expand.c lines 138-140, 173-176, 345-347, 396-399)
+srs = []
+
+# ${perl} integration via embedded Perl interpreter through exim-ffi
+# Replaces: #ifdef EXIM_PERL (expand.c lines 5377-5442, 9156-9179)
+perl = ["dep:exim-ffi"]
+
+# ${dlfunc} dynamic function loading via libloading
+# Replaces: #ifdef EXPAND_DLFUNC (expand.c lines 7138-7222)
+dlfunc = ["dep:libloading"]
+
+# crypteq condition — password hash comparison ({md5}, {sha1}, {crypt}, {crypt16})
+# Replaces: #ifdef SUPPORT_CRYPTEQ (expand.c lines 34-41, 3211+)
+crypteq = []
+
+# Content scanning variables ($av_failed, $spam_*, $malware_*)
+# Replaces: #ifdef WITH_CONTENT_SCAN (expand.c lines 473-475, 576-578, 593-610, 661-714)
+content-scan = []
+
+# DKIM expansion variables ($dkim_algo, $dkim_domain, $dkim_status, etc.)
+# Replaces: #ifndef DISABLE_DKIM (expand.c lines 493-516, 2153+)
+dkim = []
+
+# DMARC expansion variables ($dmarc_status, $dmarc_status_text, etc.)
+# Replaces: #ifdef EXIM_HAVE_DMARC (expand.c lines 517-524)
+dmarc = []
+
+# ARC expansion variables ($arc_domains, $arc_oldest_pass, $arc_state, etc.)
+# Replaces: #ifdef EXPERIMENTAL_ARC (expand.c lines 461-466)
+arc = []
+
+# DCC expansion variables ($dcc_header, $dcc_result)
+# Replaces: #ifdef EXPERIMENTAL_DCC (expand.c lines 489-492)
+dcc = []
+
+# Event expansion variables ($event_data, $event_defer_errno, $event_name)
+# Replaces: #ifndef DISABLE_EVENT (expand.c lines 531-538)
+event = []
+
+# ${lookup ...} expansion item integration — enables ${lookup} in expansion strings
+# Replaces: lookup-related code paths in expand_string_internal()
+lookup-integration = ["dep:exim-lookups"]
+
+# ${run ...} command execution with POSIX child process management
+# Replaces: fork/exec in expand.c EITEM_RUN handler (lines 5818-5975)
+run = ["dep:nix"]
+
+# ── Additional expansion conditional features ───────────────────────────────
+# These cover remaining preprocessor conditionals found in expand.c that are
+# not in the core set above. Each maps to a specific #ifdef/#ifndef block.
+
+# TLS-related expansion variables ($tls_in_cipher, $tls_out_peerdn, etc.)
+# Replaces: #ifndef DISABLE_TLS (expand.c — 9 conditional blocks, ~20 variables)
+tls = []
+
+# TLS session resumption variables
+# Replaces: #ifndef DISABLE_TLS_RESUME (expand.c lines 745-747, 763-765)
+tls-resume = []
+
+# DANE/TLSA expansion variables ($tls_out_dane, etc.)
+# Replaces: #ifdef SUPPORT_DANE (expand.c lines 756-758, 769-771)
+dane = []
+
+# SPF expansion variables ($spf_header_comment, $spf_received, etc.)
+# Replaces: #ifdef EXIM_HAVE_SPF (expand.c lines 715-723)
+spf = []
+
+# PAM condition in ${if pam ...} evaluation
+# Replaces: #ifdef SUPPORT_PAM (expand.c lines 2813+)
+pam = []
+
+# RADIUS condition in ${if radius ...} evaluation
+# Replaces: #ifdef RADIUS_CONFIG_FILE (expand.c lines 2828+)
+radius = []
+
+# PRDR expansion variables ($prdr_requested)
+# Replaces: #ifndef DISABLE_PRDR (expand.c lines 628-630)
+prdr = []
+
+# Proxy protocol expansion variables ($proxy_*)
+# Replaces: #ifdef SUPPORT_PROXY (expand.c lines 632-638)
+proxy = []
+
+# SHA-256 hash operator ${sha2:subject}
+# Replaces: #ifdef EXIM_HAVE_SHA2 (expand.c lines 7612+)
+sha2-op = []
+
+# SHA-3 hash operator ${sha3:subject}
+# Replaces: #ifdef EXIM_HAVE_SHA3 (expand.c lines 7644+)
+sha3-op = []
+
+# DNS expansion variable resolution
+dns = ["dep:exim-dns"]
+
+# local_scan variable ($local_scan_data)
+# Replaces: #ifdef HAVE_LOCAL_SCAN (expand.c lines 566-568)
+local-scan = []
