@@ -100,3 +100,11 @@ pub mod nis;
 /// Source: src/src/lookups/nisplus.c — replaces LOOKUP_NISPLUS preprocessor conditional
 #[cfg(feature = "ffi-nisplus")]
 pub mod nisplus;
+
+/// Cyrus SASL (libsasl2) server-side authentication bindings.
+/// Source: src/src/auths/cyrus_sasl.c — replaces AUTH_CYRUS_SASL preprocessor conditional.
+/// Provides safe wrappers around sasl_server_init, sasl_server_new, sasl_listmech,
+/// sasl_server_start, sasl_server_step, sasl_getprop, sasl_setprop, and sasl_dispose.
+/// NOT to be confused with libgsasl (GNU SASL) which is wrapped in `gsasl.rs`.
+#[cfg(feature = "ffi-cyrus-sasl")]
+pub mod cyrus_sasl;

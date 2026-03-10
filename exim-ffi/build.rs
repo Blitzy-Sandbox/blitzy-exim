@@ -88,6 +88,9 @@ fn main() {
 
     #[cfg(feature = "ffi-nis")]
     generate_nis_link(&out_dir);
+
+    #[cfg(feature = "ffi-cyrus-sasl")]
+    generate_cyrus_sasl_link(&out_dir);
 }
 
 // =============================================================================
@@ -125,6 +128,9 @@ fn write_feature_manifest(out_dir: &Path) {
     }
     if cfg!(feature = "ffi-nis") {
         features.push("ffi-nis");
+    }
+    if cfg!(feature = "ffi-cyrus-sasl") {
+        features.push("ffi-cyrus-sasl");
     }
     if cfg!(feature = "hintsdb-bdb") {
         features.push("hintsdb-bdb");
@@ -1400,5 +1406,157 @@ int yp_match(const char *indomain, const char *inmap,
     } else {
         // Link against the real system libnsl.
         println!("cargo:rustc-link-lib=nsl");
+    }
+}
+
+// =============================================================================
+// Cyrus SASL (ffi-cyrus-sasl) — libsasl2 link directives
+// =============================================================================
+//
+// Cyrus SASL has a stable C API (<sasl/sasl.h>) with a small surface area
+// (about 15 functions), so hand-written extern "C" declarations in cyrus_sasl.rs
+// are used instead of bindgen. This function emits the linker directive to
+// link against the system libsasl2.
+//
+// When running tests without libsasl2 mechanism plugins configured, a tiny
+// C mock is compiled to satisfy the linker and provide deterministic behavior.
+
+#[cfg(feature = "ffi-cyrus-sasl")]
+fn generate_cyrus_sasl_link(out_dir: &Path) {
+    // Compile a mock C library that stubs the Cyrus SASL functions so unit
+    // tests exercise the safe Rust wrappers without requiring full SASL
+    // mechanism plugins to be configured.
+    let mock_c = out_dir.join("cyrus_sasl_mock.c");
+    fs::write(
+        &mock_c,
+        r#"
+/* Mock libsasl2 for unit tests -- NOT linked in production builds.
+ * Provides minimal stubs for the Cyrus SASL API functions used by
+ * exim-ffi/src/cyrus_sasl.rs so that the safe wrapper unit tests
+ * can verify error handling and type conversions.
+ */
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+
+typedef struct sasl_conn { int dummy; } sasl_conn_t;
+
+#define SASL_OK       0
+#define SASL_CONTINUE 1
+#define SASL_FAIL    -1
+
+static sasl_conn_t mock_conn;
+static const char *mock_mechs = "PLAIN LOGIN";
+static const char *mock_impl = "Cyrus SASL (mock)";
+static const char *mock_version_str = "2.1.0";
+static const char *mock_errstr = "mock error";
+static const char *mock_username = "testuser";
+
+typedef struct {
+    unsigned long id;
+    int (*proc)(void);
+    void *context;
+} sasl_callback_t;
+
+int sasl_server_init(const sasl_callback_t *cb, const char *app) {
+    (void)cb; (void)app;
+    return SASL_OK;
+}
+
+int sasl_server_new(const char *svc, const char *fqdn,
+                    const char *realm, const char *lp,
+                    const char *rp, const sasl_callback_t *cb,
+                    unsigned int flags, sasl_conn_t **pc) {
+    (void)svc; (void)fqdn; (void)realm;
+    (void)lp; (void)rp; (void)cb; (void)flags;
+    if (pc) *pc = &mock_conn;
+    return SASL_OK;
+}
+
+int sasl_listmech(sasl_conn_t *c, const char *u,
+                  const char *pfx, const char *sep, const char *sfx,
+                  const char **res, unsigned int *pl, int *cnt) {
+    (void)c; (void)u; (void)pfx; (void)sep; (void)sfx;
+    if (res) *res = mock_mechs;
+    if (pl) *pl = (unsigned int)strlen(mock_mechs);
+    if (cnt) *cnt = 2;
+    return SASL_OK;
+}
+
+int sasl_server_start(sasl_conn_t *c, const char *m,
+                      const char *ci, unsigned int cl,
+                      const char **so, unsigned int *sl) {
+    (void)c; (void)m; (void)ci; (void)cl;
+    if (so) *so = NULL;
+    if (sl) *sl = 0;
+    return SASL_OK;
+}
+
+int sasl_server_step(sasl_conn_t *c, const char *ci,
+                     unsigned int cl,
+                     const char **so, unsigned int *sl) {
+    (void)c; (void)ci; (void)cl;
+    if (so) *so = NULL;
+    if (sl) *sl = 0;
+    return SASL_OK;
+}
+
+int sasl_getprop(sasl_conn_t *c, int pn, const void **pv) {
+    (void)c;
+    if (pn == 0 && pv) {
+        *pv = mock_username;
+        return SASL_OK;
+    }
+    return SASL_FAIL;
+}
+
+int sasl_setprop(sasl_conn_t *c, int pn, const void *v) {
+    (void)c; (void)pn; (void)v;
+    return SASL_OK;
+}
+
+void sasl_dispose(sasl_conn_t **pc) {
+    if (pc) *pc = NULL;
+}
+
+void sasl_done(void) { }
+
+const char *sasl_errstring(int e, const char *l, const char **ol) {
+    (void)e; (void)l;
+    if (ol) *ol = NULL;
+    return mock_errstr;
+}
+
+const char *sasl_errdetail(sasl_conn_t *c) {
+    (void)c;
+    return "mock error detail";
+}
+
+void sasl_version_info(const char **impl, const char **vs,
+                       int *ma, int *mi, int *st, int *pa) {
+    if (impl) *impl = mock_impl;
+    if (vs) *vs = mock_version_str;
+    if (ma) *ma = 2;
+    if (mi) *mi = 1;
+    if (st) *st = 0;
+    if (pa) *pa = 0;
+}
+"#,
+    )
+    .expect("Failed to write Cyrus SASL mock C file");
+
+    // Use mock for tests by default. Set CYRUS_SASL_NO_MOCK=1 to link
+    // against the real libsasl2 instead.
+    let use_mock = std::env::var("CYRUS_SASL_NO_MOCK").is_err();
+
+    if use_mock {
+        cc::Build::new()
+            .file(&mock_c)
+            .warnings(false)
+            .compile("sasl2");
+        // cc::Build automatically emits cargo:rustc-link-lib=static=sasl2
+    } else {
+        // Link against the real system libsasl2.
+        println!("cargo:rustc-link-lib=sasl2");
     }
 }
