@@ -1,0 +1,30 @@
+[package]
+name = "exim-miscmods"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["dkim", "exim-filter", "sieve-filter", "proxy"]
+dkim = []
+arc = []
+spf = []
+dmarc = []
+dmarc-native = []
+exim-filter = []
+sieve-filter = []
+proxy = []
+socks = []
+xclient = []
+pam = []
+radius = []
+perl = []
+dscp = []
+
+[dependencies]
+exim-drivers = { path = "../exim-drivers" }
+exim-store = { path = "../exim-store" }
+exim-ffi = { path = "../exim-ffi" }
+inventory = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }

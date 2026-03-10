@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+  "exim-core",
+  "exim-config",
+  "exim-expand",
+  "exim-smtp",
+  "exim-deliver",
+  "exim-acl",
+  "exim-tls",
+  "exim-store",
+  "exim-drivers",
+  "exim-auths",
+  "exim-routers",
+  "exim-transports",
+  "exim-lookups",
+  "exim-miscmods",
+  "exim-dns",
+  "exim-spool",
+  "exim-ffi",
+]
+default-members = ["exim-core"]
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+# Error handling
+thiserror = "2.0.18"
+anyhow = "1.0.102"
+
+# Logging and tracing
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
+log = "0.4.29"
+
+# System and FFI
+libc = "0.2.183"
+nix = { version = "0.31.2", features = ["signal", "process", "socket", "user"] }
+
+# Regex
+regex = "1.12.3"
+pcre2 = "0.2.11"
+
+# Memory management
+bumpalo = { version = "3.20.2", features = ["collections"] }
+typed-arena = "2.0.2"
+
+# Driver registration
+inventory = "0.3.22"
+
+# CLI
+clap = { version = "4.5.60", features = ["derive"] }
+
+# TLS
+rustls = "0.23.37"
+openssl = "0.10.75"
+
+# Database lookups
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+redis = "1.0.5"
+tokio-postgres = "0.7.16"
+deadpool-postgres = "0.14.1"
+mysql_async = "0.36.1"
+ldap3 = "0.12.1"
+
+# DNS
+hickory-resolver = "0.25.0"
+
+# Async runtime (scoped to lookup block_on ONLY)
+tokio = { version = "1.50.0", features = ["rt", "macros"] }
+
+# Dynamic loading
+libloading = "0.9.0"
+
+# Build dependencies
+bindgen = "0.72.1"
+cc = "1.2.56"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+debug = true

@@ -1,0 +1,11 @@
+[package]
+name = "exim-dns"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exim-store = { path = "../exim-store" }
+hickory-resolver = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "exim-smtp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exim-acl = { path = "../exim-acl" }
+exim-tls = { path = "../exim-tls" }
+exim-store = { path = "../exim-store" }
+exim-drivers = { path = "../exim-drivers" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }

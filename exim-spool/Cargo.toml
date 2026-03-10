@@ -1,0 +1,10 @@
+[package]
+name = "exim-spool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exim-store = { path = "../exim-store" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "exim-routers"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["router-accept", "router-dnslookup", "router-ipliteral", "router-manualroute", "router-redirect"]
+router-accept = []
+router-dnslookup = []
+router-ipliteral = []
+router-iplookup = []
+router-manualroute = []
+router-queryprogram = []
+router-redirect = []
+
+[dependencies]
+exim-drivers = { path = "../exim-drivers" }
+exim-store = { path = "../exim-store" }
+exim-dns = { path = "../exim-dns" }
+inventory = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name = "exim-acl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exim-expand = { path = "../exim-expand" }
+exim-lookups = { path = "../exim-lookups" }
+exim-store = { path = "../exim-store" }
+exim-drivers = { path = "../exim-drivers" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+pcre2 = { workspace = true }
+regex = { workspace = true }

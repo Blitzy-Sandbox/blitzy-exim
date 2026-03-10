@@ -1,0 +1,28 @@
+[package]
+name = "exim-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+ffi-pam = []
+ffi-radius = []
+ffi-perl = []
+ffi-gsasl = []
+ffi-krb5 = []
+ffi-spf = []
+hintsdb-bdb = []
+hintsdb-gdbm = []
+hintsdb-ndbm = []
+hintsdb-tdb = []
+hintsdb-sqlite = ["rusqlite"]
+
+[dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }
+libloading = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+
+[build-dependencies]
+bindgen = { workspace = true }
+cc = { workspace = true }

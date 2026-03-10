@@ -1,0 +1,12 @@
+[package]
+name = "exim-config"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exim-store = { path = "../exim-store" }
+exim-drivers = { path = "../exim-drivers" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }

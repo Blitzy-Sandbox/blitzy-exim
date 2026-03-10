@@ -1,0 +1,14 @@
+[package]
+name = "exim-expand"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exim-store = { path = "../exim-store" }
+exim-lookups = { path = "../exim-lookups" }
+exim-ffi = { path = "../exim-ffi" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+pcre2 = { workspace = true }

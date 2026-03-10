@@ -1,0 +1,24 @@
+[package]
+name = "exim-transports"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["transport-appendfile", "transport-smtp", "transport-pipe", "transport-lmtp", "transport-autoreply"]
+transport-appendfile = []
+transport-autoreply = []
+transport-lmtp = []
+transport-pipe = []
+transport-queuefile = []
+transport-smtp = []
+
+[dependencies]
+exim-drivers = { path = "../exim-drivers" }
+exim-store = { path = "../exim-store" }
+exim-tls = { path = "../exim-tls" }
+exim-spool = { path = "../exim-spool" }
+inventory = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }

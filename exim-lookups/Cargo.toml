@@ -1,0 +1,47 @@
+[package]
+name = "exim-lookups"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["lookup-lsearch", "lookup-dbmdb", "lookup-dnsdb", "lookup-dsearch", "lookup-passwd", "lookup-cdb"]
+lookup-cdb = []
+lookup-dbmdb = []
+lookup-dnsdb = []
+lookup-dsearch = []
+lookup-json = ["serde_json"]
+lookup-ldap = ["ldap3"]
+lookup-lmdb = []
+lookup-lsearch = []
+lookup-mysql = ["mysql_async", "tokio"]
+lookup-nis = []
+lookup-nisplus = []
+lookup-nmh = []
+lookup-oracle = []
+lookup-passwd = []
+lookup-pgsql = ["tokio-postgres", "deadpool-postgres", "tokio"]
+lookup-psl = []
+lookup-readsock = []
+lookup-redis = ["redis"]
+lookup-spf = []
+lookup-sqlite = ["rusqlite"]
+lookup-testdb = []
+lookup-whoson = []
+
+[dependencies]
+exim-drivers = { path = "../exim-drivers" }
+exim-store = { path = "../exim-store" }
+exim-ffi = { path = "../exim-ffi" }
+exim-dns = { path = "../exim-dns" }
+inventory = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }
+mysql_async = { workspace = true, optional = true }
+ldap3 = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }

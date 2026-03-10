@@ -1,0 +1,15 @@
+[package]
+name = "exim-deliver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exim-routers = { path = "../exim-routers" }
+exim-transports = { path = "../exim-transports" }
+exim-store = { path = "../exim-store" }
+exim-drivers = { path = "../exim-drivers" }
+exim-spool = { path = "../exim-spool" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+nix = { workspace = true }

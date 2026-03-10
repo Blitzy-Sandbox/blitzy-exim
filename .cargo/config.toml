@@ -1,0 +1,13 @@
+# Cargo build configuration for the Exim Rust workspace
+# AAP §0.7.2: All warnings treated as errors
+[build]
+rustflags = ["-D", "warnings"]
+
+# Environment variables for FFI build customization
+[env]
+# Path to the C source tree for exim-ffi build.rs header discovery
+EXIM_C_SRC = { value = "src/src", relative = true }
+
+# Unix target configuration
+[target.'cfg(unix)']
+rustflags = ["-D", "warnings", "-C", "link-args=-rdynamic"]

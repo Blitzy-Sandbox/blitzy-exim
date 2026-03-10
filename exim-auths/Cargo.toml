@@ -1,0 +1,24 @@
+[package]
+name = "exim-auths"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["auth-cram-md5", "auth-plaintext", "auth-external", "auth-dovecot", "auth-tls", "auth-spa"]
+auth-cram-md5 = []
+auth-cyrus-sasl = []
+auth-dovecot = []
+auth-external = []
+auth-gsasl = []
+auth-heimdal-gssapi = []
+auth-plaintext = []
+auth-spa = []
+auth-tls = []
+
+[dependencies]
+exim-drivers = { path = "../exim-drivers" }
+exim-store = { path = "../exim-store" }
+exim-ffi = { path = "../exim-ffi" }
+inventory = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

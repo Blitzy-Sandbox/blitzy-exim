@@ -1,0 +1,16 @@
+[package]
+name = "exim-tls"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["tls-rustls"]
+tls-rustls = ["rustls"]
+tls-openssl = ["openssl"]
+
+[dependencies]
+exim-store = { path = "../exim-store" }
+rustls = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

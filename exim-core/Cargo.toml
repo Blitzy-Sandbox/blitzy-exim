@@ -1,0 +1,32 @@
+[package]
+name = "exim-core"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "exim"
+path = "src/main.rs"
+
+[dependencies]
+exim-config = { path = "../exim-config" }
+exim-expand = { path = "../exim-expand" }
+exim-smtp = { path = "../exim-smtp" }
+exim-deliver = { path = "../exim-deliver" }
+exim-acl = { path = "../exim-acl" }
+exim-tls = { path = "../exim-tls" }
+exim-store = { path = "../exim-store" }
+exim-drivers = { path = "../exim-drivers" }
+exim-auths = { path = "../exim-auths" }
+exim-routers = { path = "../exim-routers" }
+exim-transports = { path = "../exim-transports" }
+exim-lookups = { path = "../exim-lookups" }
+exim-miscmods = { path = "../exim-miscmods" }
+exim-dns = { path = "../exim-dns" }
+exim-spool = { path = "../exim-spool" }
+exim-ffi = { path = "../exim-ffi" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }

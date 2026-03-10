@@ -1,0 +1,9 @@
+[package]
+name = "exim-store"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bumpalo = { workspace = true }
+typed-arena = { workspace = true }
+thiserror = { workspace = true }
