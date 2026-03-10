@@ -618,8 +618,9 @@ dependencies = [
 name = "exim-drivers"
 version = "0.1.0"
 dependencies = [
- "exim-store",
  "inventory",
+ "log",
+ "serde",
  "thiserror",
  "tracing",
 ]
