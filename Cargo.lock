@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "exim-core"
-version = "0.1.0"
+version = "4.99.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -719,7 +719,9 @@ dependencies = [
  "exim-tls",
  "exim-transports",
  "libc",
+ "log",
  "nix",
+ "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
 ]
