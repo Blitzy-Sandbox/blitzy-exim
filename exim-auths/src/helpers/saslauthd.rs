@@ -538,10 +538,20 @@ mod tests {
     /// reads 4 counted strings and replies with a fixed response.
     fn run_mock_saslauthd(response: &str) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
         use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Use an atomic counter to ensure each test gets a unique socket path,
+        // avoiding collisions when tests run in parallel threads.
+        static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique_id = SOCK_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         // Create a temporary socket path.
         let dir = std::env::temp_dir();
-        let sock_path = dir.join(format!("saslauthd_test_{}.sock", std::process::id()));
+        let sock_path = dir.join(format!(
+            "saslauthd_test_{}_{}.sock",
+            std::process::id(),
+            unique_id,
+        ));
         // Remove any stale socket from a previous run.
         let _ = std::fs::remove_file(&sock_path);
 
@@ -680,10 +690,18 @@ mod tests {
     #[test]
     fn mock_daemon_receives_correct_fields() {
         use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Mutex};
 
+        static FIELDS_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique_id = FIELDS_COUNTER.fetch_add(1, Ordering::SeqCst);
+
         let dir = std::env::temp_dir();
-        let sock_path = dir.join(format!("saslauthd_fields_{}.sock", std::process::id()));
+        let sock_path = dir.join(format!(
+            "saslauthd_fields_{}_{}.sock",
+            std::process::id(),
+            unique_id,
+        ));
         let _ = std::fs::remove_file(&sock_path);
 
         let listener = UnixListener::bind(&sock_path).expect("bind");
