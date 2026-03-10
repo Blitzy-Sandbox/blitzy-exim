@@ -1,30 +1,243 @@
+# =============================================================================
+# exim-miscmods — Optional Policy, Authentication, and Filter Modules
+# =============================================================================
+#
+# Replaces the src/src/miscmods/ directory (34 files — 18 .c, 16 .h) including
+# the in-tree PDKIM library (src/src/miscmods/pdkim/ — 6 files). Implements all
+# 20+ optional policy/authentication/filter modules from the Exim C codebase as
+# Rust modules with Cargo feature flags replacing all C preprocessor conditionals.
+#
+# Module inventory (with C source line counts for reference):
+#
+#   Module          C Source                   Lines   C Preprocessor Guard
+#   ─────────────── ────────────────────────── ──────  ─────────────────────────
+#   DKIM            dkim.c + dkim_transport.c  1,837   #ifndef DISABLE_DKIM
+#   PDKIM (in-tree) pdkim/pdkim.c + signing.c  3,029   (included via dkim.c)
+#   ARC             arc.c                      2,179   #ifdef EXPERIMENTAL_ARC
+#   SPF             spf.c                        627   #ifdef SUPPORT_SPF
+#   SPF-Perl        spf_perl.c                   376   #ifdef EXPERIMENTAL_SPF_PERL
+#   DMARC           dmarc.c + dmarc_common.c   1,009   #ifdef SUPPORT_DMARC
+#   DMARC-native    dmarc_native.c + common      686   #ifdef EXPERIMENTAL_DMARC_NATIVE
+#   Exim filter     exim_filter.c              2,661   (always compiled, no guard)
+#   Sieve filter    sieve_filter.c             3,644   (always compiled, no guard)
+#   PROXY           proxy.c                      552   #ifdef SUPPORT_PROXY
+#   SOCKS           socks.c                      425   #ifdef SUPPORT_SOCKS
+#   XCLIENT         xclient.c                    356   #ifdef EXPERIMENTAL_XCLIENT
+#   PAM             pam.c                         224   #ifdef SUPPORT_PAM
+#   RADIUS          radius.c                      243   #ifndef RADIUS_CONFIG_FILE
+#   Perl            perl.c                        345   (guarded by EXIM_PERL)
+#   DSCP            dscp.c                        278   #ifdef SUPPORT_DSCP
+#
+# Rust module structure (per AAP §0.4.1):
+#   src/lib.rs                      — module re-exports
+#   src/dkim/mod.rs                 — DKIM verify/sign orchestration
+#   src/dkim/transport.rs           — DKIM transport signing shim
+#   src/dkim/pdkim/mod.rs           — DKIM streaming parser
+#   src/dkim/pdkim/signing.rs       — crypto backend abstraction
+#   src/arc.rs                      — ARC verify/sign
+#   src/spf.rs                      — SPF via libspf2 FFI
+#   src/dmarc.rs                    — DMARC via libopendmarc FFI
+#   src/dmarc_native.rs             — experimental native DMARC parser
+#   src/exim_filter.rs              — Exim filter interpreter
+#   src/sieve_filter.rs             — RFC 5228 Sieve interpreter
+#   src/proxy.rs                    — HAProxy PROXY v1/v2
+#   src/socks.rs                    — SOCKS5 client
+#   src/xclient.rs                  — XCLIENT handler
+#   src/pam.rs                      — PAM via FFI
+#   src/radius.rs                   — RADIUS via FFI
+#   src/perl.rs                     — embedded Perl via FFI
+#   src/dscp.rs                     — DSCP traffic marking
+#
+# Build commands:
+#   cargo check -p exim-miscmods                        # Type-check with defaults
+#   cargo check -p exim-miscmods --all-features         # Check all modules
+#   cargo check -p exim-miscmods --features "dkim,arc"  # Check specific features
+# =============================================================================
+
 [package]
 name = "exim-miscmods"
 version = "0.1.0"
 edition = "2021"
+description = "Optional policy, authentication, and filter modules for Exim MTA — DKIM, ARC, SPF, DMARC, Sieve, Exim filter, PROXY, SOCKS, XCLIENT, PAM, RADIUS, Perl, DSCP"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Cargo feature flags replace ALL C preprocessor conditionals (per AAP §0.7.3).
+# Each feature maps to a specific #ifdef/#ifndef guard in the original C source.
+# Feature names are semantically meaningful Cargo-style names, NOT carbon copies
+# of the C preprocessor symbols.
+#
+# Feature dependency chains enforce the same compile-time prerequisites as the
+# C source's #error guards. For example:
+#   - ARC requires DKIM (arc.c line 14: #if defined DISABLE_DKIM → #error)
+#   - DMARC requires SPF + DKIM (dmarc.c lines 19-22: #error guards)
+#   - DMARC-native requires SPF + DKIM (dmarc_native.c lines 17-22: #error guards)
+#   - SPF-Perl requires both SPF and Perl (spf_perl.c lines 18-19: #error guards)
+#
+# Note on DMARC variants: dmarc and dmarc-native are mutually exclusive in the
+# C source (dmarc_native.c line 12: #ifdef SUPPORT_DMARC → #error "Build cannot
+# support both libopendmarc and native DMARC modules"). Cargo does not support
+# mutually exclusive features natively, so both can technically be enabled
+# simultaneously. The Rust implementation should log a startup warning if both
+# are active and prefer the native implementation.
 
 [features]
-default = ["dkim", "exim-filter", "sieve-filter", "proxy"]
+default = ["dkim", "exim-filter", "sieve-filter"]
+
+# ── Mail authentication / policy modules ──────────────────────────────────────
+
+# DKIM verify/sign + in-tree PDKIM streaming parser and crypto abstraction.
+# Replaces: #ifndef DISABLE_DKIM (dkim.c line 15)
+# Includes: dkim.c, dkim_transport.c, pdkim/pdkim.c, pdkim/signing.c
 dkim = []
-arc = []
-spf = []
-dmarc = []
-dmarc-native = []
+
+# ARC (Authenticated Received Chain) verify/sign, built atop DKIM primitives.
+# Replaces: #ifdef EXPERIMENTAL_ARC (arc.c line 13)
+# Requires DKIM: arc.c line 14: #if defined DISABLE_DKIM → #error
+arc = ["dkim"]
+
+# SPF (Sender Policy Framework) via libspf2 C library through exim-ffi.
+# Replaces: #ifdef SUPPORT_SPF (spf.c line 15)
+# Activates exim-ffi/ffi-spf for libspf2 FFI bindings.
+spf = ["dep:exim-ffi", "exim-ffi/ffi-spf"]
+
+# SPF via Perl — alternative SPF implementation using embedded Perl interpreter.
+# Replaces: #ifdef EXPERIMENTAL_SPF_PERL (spf_perl.c line 16)
+# Requires Perl: spf_perl.c line 18: #ifndef EXIM_PERL → #error
+# Mutually exclusive with standard SPF at C level (spf_perl.c line 21:
+#   #ifdef SUPPORT_SPF → #error "incompat: standard and Experimental")
+# but both features can be compiled in Rust; runtime selection preferred.
+spf-perl = ["spf", "perl"]
+
+# DMARC via libopendmarc C library (external dependency) through exim-ffi.
+# Replaces: #ifdef SUPPORT_DMARC (dmarc.c line 18)
+# Requires SPF: dmarc.c line 19: #ifndef EXIM_HAVE_SPF → #error
+# Requires DKIM: dmarc.c line 21: #elif defined DISABLE_DKIM → #error
+dmarc = ["spf", "dkim", "dep:exim-ffi"]
+
+# Native DMARC parser — experimental pure-Rust DMARC without libopendmarc.
+# Replaces: #ifdef EXPERIMENTAL_DMARC_NATIVE (dmarc_native.c line 16)
+# Requires SPF: dmarc_native.c line 17: #ifndef EXIM_HAVE_SPF → #error
+# Requires DKIM: dmarc_native.c line 19: #elif defined DISABLE_DKIM → #error
+# Also requires PSL lookups: dmarc_native.c line 21: #elif !defined LOOKUP_PSL → #error
+# Note: Mutually exclusive with `dmarc` in C source (dmarc_native.c line 12-13:
+#   #ifdef SUPPORT_DMARC → #error "Build cannot support both")
+dmarc-native = ["spf", "dkim"]
+
+# ── Filter modules ────────────────────────────────────────────────────────────
+
+# Exim legacy filter interpreter — always compiled in C (no preprocessor guard).
+# Source: exim_filter.c (2,661 lines) — interprets Exim-format .forward filters.
 exim-filter = []
+
+# RFC 5228 Sieve filter interpreter — always compiled in C (no preprocessor guard).
+# Source: sieve_filter.c (3,644 lines) — interprets Sieve mail filtering scripts.
 sieve-filter = []
+
+# ── Connectivity / proxy modules ──────────────────────────────────────────────
+
+# HAProxy PROXY protocol v1/v2 handler — trust proxy-provided client addresses.
+# Replaces: #ifdef SUPPORT_PROXY (proxy.c line 16)
 proxy = []
+
+# SOCKS5 client connector — route outbound SMTP via SOCKS proxy.
+# Replaces: #ifdef SUPPORT_SOCKS (socks.c line 15)
 socks = []
+
+# Postfix XCLIENT extension handler — accept proxy-provided connection info.
+# Replaces: #ifdef EXPERIMENTAL_XCLIENT (xclient.c line 11)
 xclient = []
-pam = []
-radius = []
-perl = []
+
+# ── Auth helper modules ───────────────────────────────────────────────────────
+
+# PAM (Pluggable Authentication Modules) via libpam C library through exim-ffi.
+# Replaces: #ifdef SUPPORT_PAM (pam.c — guarded, see line 17+ commentary)
+# Activates exim-ffi/ffi-pam for libpam FFI bindings.
+pam = ["dep:exim-ffi", "exim-ffi/ffi-pam"]
+
+# RADIUS authentication via libradius/radiusclient C library through exim-ffi.
+# Replaces: #ifndef RADIUS_CONFIG_FILE → dummy (radius.c line 27)
+# Activates exim-ffi/ffi-radius for libradius FFI bindings.
+radius = ["dep:exim-ffi", "exim-ffi/ffi-radius"]
+
+# Embedded Perl interpreter via libperl C library through exim-ffi.
+# Replaces: EXIM_PERL preprocessor conditional (perl.c)
+# Activates exim-ffi/ffi-perl for libperl FFI bindings.
+perl = ["dep:exim-ffi", "exim-ffi/ffi-perl"]
+
+# ── Traffic marking ───────────────────────────────────────────────────────────
+
+# DSCP (Differentiated Services Code Point) traffic marking via setsockopt.
+# Replaces: #ifdef SUPPORT_DSCP (dscp.c line 12)
 dscp = []
 
+# =============================================================================
+# Dependencies
+# =============================================================================
+
 [dependencies]
+
+# ── Workspace crate dependencies ─────────────────────────────────────────────
+
+# Driver trait definitions and inventory-based compile-time registration system.
+# Provides AuthDriver, RouterDriver, TransportDriver, LookupDriver traits and
+# the registry for inventory::submit! macro usage in module implementations.
 exim-drivers = { path = "../exim-drivers" }
+
+# Rust memory management: Tainted<T>/Clean<T> newtypes, MessageArena,
+# Arc<Config> wrapper. Used across all modules for taint-safe string handling
+# and per-message allocation.
 exim-store = { path = "../exim-store" }
-exim-ffi = { path = "../exim-ffi" }
+
+# Minimal C FFI shim layer — ONLY crate with unsafe code (per AAP §0.7.2).
+# Optional dependency: pulled in only when FFI-dependent features are enabled
+# (spf, dmarc, pam, radius, perl). Each FFI-using feature activates the
+# corresponding exim-ffi sub-feature (ffi-spf, ffi-pam, ffi-radius, ffi-perl).
+exim-ffi = { path = "../exim-ffi", optional = true }
+
+# ── Workspace shared dependencies ────────────────────────────────────────────
+# All versions inherited from root Cargo.toml [workspace.dependencies].
+
+# Compile-time driver registration — each module implementation uses
+# inventory::submit! for automatic registration with the driver registry.
 inventory = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+
+# Serialization framework — used for structured config option handling and
+# DKIM/ARC/DMARC policy record serialization.
 serde = { workspace = true }
+
+# Error type derivation — generates Display + Error implementations for
+# module-specific error enums (DkimError, SpfError, FilterError, etc.).
+thiserror = { workspace = true }
+
+# Structured logging/debugging — replaces Exim's debug.c/log.c with
+# span-based diagnostics matching the debug selector system.
+tracing = { workspace = true }
+
+# Logging facade compatibility — enables interoperability with crates
+# that use the `log` facade instead of `tracing`.
+log = { workspace = true }
+
+# Rust-native regex engine — supplements PCRE2 for internal pattern matching
+# in filter interpreters and DKIM/ARC header parsing.
+regex = { workspace = true }
+
+# PCRE2 bindings — Exim-compatible pattern matching required by
+# exim_filter.c and sieve_filter.c which use PCRE2 regex syntax.
+pcre2 = { workspace = true }
+
+# C type definitions — required for low-level operations in DSCP (setsockopt
+# with IPPROTO_IP/IPV6_TCLASS) and PROXY protocol (socket address structures).
+libc = { workspace = true }
+
+# =============================================================================
+# Library Target
+# =============================================================================
+
+[lib]
+name = "exim_miscmods"
+path = "src/lib.rs"
