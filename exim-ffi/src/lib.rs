@@ -69,5 +69,8 @@ pub mod krb5;
 #[cfg(feature = "ffi-perl")]
 pub mod perl;
 
+#[cfg(feature = "ffi-pam")]
+pub mod pam;
+
 #[cfg(feature = "ffi-spf")]
 pub mod spf;

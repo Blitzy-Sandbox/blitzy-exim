@@ -295,6 +295,9 @@ fn generate_pam_bindings(out_dir: &Path) {
         .allowlist_var("PAM_ERROR_MSG")
         .allowlist_var("PAM_USER")
         .allowlist_var("PAM_SERVICE")
+        .allowlist_var("PAM_SILENT")
+        .allowlist_var("PAM_USER_UNKNOWN")
+        .allowlist_var("PAM_ACCT_EXPIRED")
         .generate()
         .expect("Failed to generate PAM FFI bindings");
 
