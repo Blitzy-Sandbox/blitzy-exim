@@ -616,6 +616,13 @@ SV* exim_ffi_ERRSV(pTHX);
 fn generate_gsasl_bindings(out_dir: &Path) {
     let (include_paths, _link_paths) = probe_library("libgsasl", "gsasl");
 
+    // Emit cargo:rustc-check-cfg directives so the compiler knows about
+    // our custom cfg attributes (required for -D warnings / check-cfg lint).
+    println!("cargo::rustc-check-cfg=cfg(gsasl_have_scram_sha_256)");
+    println!("cargo::rustc-check-cfg=cfg(gsasl_scram_s_key)");
+    println!("cargo::rustc-check-cfg=cfg(gsasl_have_exporter)");
+    println!("cargo::rustc-check-cfg=cfg(gsasl_channelbind_hack)");
+
     // Detect GSASL version and emit cfg attributes for version-dependent
     // features (matching the C preprocessor gating in gsasl.c lines 43-71).
     detect_gsasl_version();
@@ -648,14 +655,25 @@ fn generate_gsasl_bindings(out_dir: &Path) {
         .allowlist_function("gsasl_check_version")
         .allowlist_function("gsasl_callback_set")
         .allowlist_function("gsasl_callback")
+        // Hook functions (for callback data passing)
+        .allowlist_function("gsasl_callback_hook_set")
+        .allowlist_function("gsasl_callback_hook_get")
+        .allowlist_function("gsasl_session_hook_set")
+        .allowlist_function("gsasl_session_hook_get")
+        // Memory management
+        .allowlist_function("gsasl_free")
         // Types
         .allowlist_type("Gsasl")
         .allowlist_type("Gsasl_session")
         .allowlist_type("Gsasl_property")
+        .allowlist_type("Gsasl_rc")
         // Status constants
         .allowlist_var("GSASL_OK")
         .allowlist_var("GSASL_NEEDS_MORE")
         .allowlist_var("GSASL_AUTHENTICATION_ERROR")
+        .allowlist_var("GSASL_NO_CALLBACK")
+        .allowlist_var("GSASL_UNKNOWN_MECHANISM")
+        .allowlist_var("GSASL_MALLOC_ERROR")
         // Version constants (for runtime checks)
         .allowlist_var("GSASL_VERSION_MAJOR")
         .allowlist_var("GSASL_VERSION_MINOR")

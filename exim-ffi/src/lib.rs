@@ -55,6 +55,9 @@
 // are created. Only modules with source files present on disk are declared
 // below to avoid rustfmt resolution errors.
 
+#[cfg(feature = "ffi-gsasl")]
+pub mod gsasl;
+
 #[cfg(feature = "ffi-krb5")]
 pub mod krb5;
 
