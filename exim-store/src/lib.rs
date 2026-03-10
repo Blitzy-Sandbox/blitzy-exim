@@ -17,11 +17,13 @@
 //   POOL_MESSAGE (+taint)  Scoped struct dropped at end of message transaction
 //   Taint tracking         Tainted<T> / Clean<T> newtypes (zero runtime cost)
 
-// Stub: remaining modules (arena, config_store, taint) will be
+// Stub: remaining modules (arena, taint) will be
 // replaced by their respective implementation agents.
 
+pub mod config_store;
 pub mod message_store;
 pub mod search_cache;
 
+pub use config_store::{ConfigBuilder, ConfigData, ConfigStore};
 pub use message_store::MessageStore;
 pub use search_cache::{CacheEntry, SearchCache, SearchCacheStats};
