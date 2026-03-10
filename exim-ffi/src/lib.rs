@@ -89,3 +89,8 @@ pub mod dmarc;
 /// Source: src/src/lookups/whoson.c — replaces LOOKUP_WHOSON preprocessor conditional
 #[cfg(feature = "ffi-whoson")]
 pub mod whoson;
+
+/// NIS+ directory service bindings (wraps libnsl NIS+ API from rpcsvc/nis.h).
+/// Source: src/src/lookups/nisplus.c — replaces LOOKUP_NISPLUS preprocessor conditional
+#[cfg(feature = "ffi-nisplus")]
+pub mod nisplus;

@@ -72,6 +72,8 @@ ffi-spf = []           # libspf2 — SPF validation (replaces SUPPORT_SPF)
 ffi-dmarc = []         # libopendmarc — DMARC policy evaluation (replaces SUPPORT_DMARC)
 ffi-oracle = []        # libclntsh — Oracle OCI v2 FFI for Oracle SQL lookups (replaces LOOKUP_ORACLE)
 ffi-whoson = []        # libwhoson — WHOSON dynamic IP tracking (replaces LOOKUP_WHOSON)
+ffi-nisplus = []       # libnsl — NIS+ directory service lookups (replaces LOOKUP_NISPLUS)
+ffi-nis = []           # libnsl — NIS (YP) directory service lookups (replaces LOOKUP_NIS)
 
 # Hints database backend features
 # These are mutually exclusive at runtime but can all be compiled simultaneously.
