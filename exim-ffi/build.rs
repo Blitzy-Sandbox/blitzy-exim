@@ -855,9 +855,10 @@ fn generate_spf_bindings(out_dir: &Path) {
         // Query operations
         .allowlist_function("SPF_request_query_mailfrom")
         .allowlist_function("SPF_request_query_rcptto")
-        // Response accessors
+        // Response lifecycle and accessors
         .allowlist_function("SPF_response_result")
         .allowlist_function("SPF_response_reason")
+        .allowlist_function("SPF_response_free")
         .allowlist_function("SPF_strresult")
         .allowlist_function("SPF_strreason")
         // Library version
