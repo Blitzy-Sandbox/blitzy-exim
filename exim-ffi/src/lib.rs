@@ -55,6 +55,11 @@
 // are created. Only modules with source files present on disk are declared
 // below to avoid rustfmt resolution errors.
 
+/// RADIUS authentication bindings (wraps libradius/radiusclient/freeradiusclient).
+/// Source: src/src/miscmods/radius.c — replaces RADIUS_CONFIG_FILE preprocessor conditional
+#[cfg(feature = "ffi-radius")]
+pub mod radius;
+
 #[cfg(feature = "ffi-gsasl")]
 pub mod gsasl;
 
