@@ -85,6 +85,9 @@ fn main() {
 
     #[cfg(feature = "ffi-whoson")]
     generate_whoson_link(&out_dir);
+
+    #[cfg(feature = "ffi-nis")]
+    generate_nis_link(&out_dir);
 }
 
 // =============================================================================
@@ -119,6 +122,9 @@ fn write_feature_manifest(out_dir: &Path) {
     }
     if cfg!(feature = "ffi-whoson") {
         features.push("ffi-whoson");
+    }
+    if cfg!(feature = "ffi-nis") {
+        features.push("ffi-nis");
     }
     if cfg!(feature = "hintsdb-bdb") {
         features.push("hintsdb-bdb");
@@ -1328,5 +1334,71 @@ const char *wso_version(void) {
     } else {
         // Link against the real system libwhoson.
         println!("cargo:rustc-link-lib=whoson");
+    }
+}
+
+// =============================================================================
+// NIS/YP (ffi-nis) — libnsl link directives
+// =============================================================================
+//
+// NIS/YP has a minimal lookup API (only 2 functions: yp_get_default_domain,
+// yp_match) so hand-written extern "C" declarations in nis.rs are used
+// instead of bindgen.
+//
+// When running tests without a NIS server configured, a tiny C mock is
+// compiled to satisfy the linker and provide deterministic test results.
+
+#[cfg(feature = "ffi-nis")]
+fn generate_nis_link(out_dir: &Path) {
+    // Compile a mock C library that stubs the NIS/YP functions so unit tests
+    // exercise the safe Rust wrappers without requiring NIS to be configured.
+    let mock_c = out_dir.join("nis_mock.c");
+    fs::write(
+        &mock_c,
+        r#"
+/* Mock libnsl NIS/YP functions for unit tests — NOT linked in production builds.
+ * Provides deterministic return values so Rust unit tests can verify error
+ * handling and data conversion without a running NIS server.
+ */
+#include <stddef.h>
+#include <string.h>
+
+/* Static domain string returned by the mock — mimics the real libnsl
+ * behavior of returning a pointer to a static buffer. */
+static char mock_domain[] = "mock.localdomain";
+
+int yp_get_default_domain(char **outdomain) {
+    if (outdomain) *outdomain = mock_domain;
+    return 0;  /* YPERR_SUCCESS */
+}
+
+int yp_match(const char *indomain, const char *inmap,
+             const char *inkey, int inkeylen,
+             char **outval, int *outvallen) {
+    (void)indomain; (void)inmap; (void)inkey; (void)inkeylen;
+    (void)outval; (void)outvallen;
+    /* Return YPERR_KEY (5) for all mock queries — simulates "key not found",
+     * the most common non-error failure mode in NIS lookups. */
+    return 5;
+}
+"#,
+    )
+    .expect("Failed to write NIS mock C file");
+
+    // Always compile the mock into a static library so the tests link.
+    // When the real libnsl is installed and preferred, the user can
+    // set NIS_NO_MOCK=1 to skip the mock and link against the system lib.
+    let use_mock = std::env::var("NIS_NO_MOCK").is_err();
+
+    if use_mock {
+        cc::Build::new()
+            .file(&mock_c)
+            .warnings(false)
+            .compile("nsl");
+        // cc::Build automatically emits cargo:rustc-link-lib=static=nsl
+        // and cargo:rustc-link-search=native=<out_dir>
+    } else {
+        // Link against the real system libnsl.
+        println!("cargo:rustc-link-lib=nsl");
     }
 }

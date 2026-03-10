@@ -90,6 +90,12 @@ pub mod dmarc;
 #[cfg(feature = "ffi-whoson")]
 pub mod whoson;
 
+/// NIS (YP) directory service bindings (wraps libnsl NIS/YP API from rpcsvc/ypclnt.h).
+/// Source: src/src/lookups/nis.c — replaces LOOKUP_NIS preprocessor conditional.
+/// Provides safe wrappers around yp_get_default_domain() and yp_match().
+#[cfg(feature = "ffi-nis")]
+pub mod nis;
+
 /// NIS+ directory service bindings (wraps libnsl NIS+ API from rpcsvc/nis.h).
 /// Source: src/src/lookups/nisplus.c — replaces LOOKUP_NISPLUS preprocessor conditional
 #[cfg(feature = "ffi-nisplus")]
