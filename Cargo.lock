@@ -647,8 +647,7 @@ dependencies = [
  "cc",
  "libc",
  "libloading 0.9.0",
- "rusqlite",
- "thiserror",
+ "pkg-config",
 ]
 
 [[package]]
