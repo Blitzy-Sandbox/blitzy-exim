@@ -1,47 +1,227 @@
+# =============================================================================
+# exim-lookups — Lookup Module Implementations for Exim MTA
+# =============================================================================
+#
+# This crate replaces the entire src/src/lookups/ directory (26 C source files
+# plus Makefile) and parts of src/src/search.c. It implements 22 lookup
+# backends plus 3 shared helper functions (lf_check_file, lf_quote,
+# lf_sqlperform), each backend implementing the LookupDriver trait from
+# exim-drivers.
+#
+# This crate has the HEAVIEST dependency footprint of all workspace crates
+# due to the wide variety of backend databases and protocols supported.
+# Feature flags gate each lookup backend individually so only the needed
+# dependencies are compiled.
+#
+# C-to-Rust lookup backend mapping (from src/src/lookups/Makefile):
+#   cdb, dbmdb, dnsdb, dsearch, json, ldap, lmdb, lsearch, mysql, nis,
+#   nisplus, nmh, oracle, passwd, pgsql, psl, readsock, redis, spf,
+#   sqlite, testdb, whoson
+#
+# Plus always-built helper objects replaced by src/helpers/:
+#   lf_check_file, lf_quote, lf_sqlperform
+#
+# Driver registration: The C Makefile generates avail_static_lookups.c which
+# registers all built-in lookup modules. In Rust, each module file uses
+# inventory::submit! for compile-time registration via the exim-drivers
+# registry.
+
 [package]
 name = "exim-lookups"
 version = "0.1.0"
 edition = "2021"
+description = "Lookup module implementations for Exim MTA — 25+ backends implementing LookupDriver trait"
+license = "GPL-2.0-or-later"
+publish = false
 
-[features]
-default = ["lookup-lsearch", "lookup-dbmdb", "lookup-dnsdb", "lookup-dsearch", "lookup-passwd", "lookup-cdb"]
-lookup-cdb = []
-lookup-dbmdb = []
-lookup-dnsdb = []
-lookup-dsearch = []
-lookup-json = ["serde_json"]
-lookup-ldap = ["ldap3"]
-lookup-lmdb = []
-lookup-lsearch = []
-lookup-mysql = ["mysql_async", "tokio"]
-lookup-nis = []
-lookup-nisplus = []
-lookup-nmh = []
-lookup-oracle = []
-lookup-passwd = []
-lookup-pgsql = ["tokio-postgres", "deadpool-postgres", "tokio"]
-lookup-psl = []
-lookup-readsock = []
-lookup-redis = ["redis"]
-lookup-spf = []
-lookup-sqlite = ["rusqlite"]
-lookup-testdb = []
-lookup-whoson = []
+# =============================================================================
+# Dependencies
+# =============================================================================
+#
+# All workspace-shared dependencies use { workspace = true } to reference the
+# root Cargo.toml [workspace.dependencies] section for version consistency.
+#
+# CRITICAL (AAP §0.7.3): tokio runtime is scoped ONLY to lookup execution
+# via tokio::runtime::Runtime::block_on(). It MUST NOT be used for the main
+# daemon event loop. The tokio dependency is gated behind the async-lookups
+# feature so it is only pulled in when MySQL, PostgreSQL, or LDAP lookups
+# are enabled.
 
 [dependencies]
+
+# ── Workspace path dependencies ────────────────────────────────────────────
+# LookupDriver trait definition and inventory-based driver registration
 exim-drivers = { path = "../exim-drivers" }
+
+# Tainted<T>/Clean<T> newtypes, arena allocation, memory management
 exim-store = { path = "../exim-store" }
-exim-ffi = { path = "../exim-ffi" }
-exim-dns = { path = "../exim-dns" }
-inventory = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+
+# FFI bindings for C-library-backed lookups (NIS, NIS+, Oracle, Whoson, DBM)
+# OPTIONAL: only pulled in when FFI-backed lookup features are enabled
+exim-ffi = { path = "../exim-ffi", optional = true }
+
+# ── Required workspace dependencies (always compiled) ─────────────────────
+# Serialization framework used across lookup implementations
 serde = { workspace = true }
+
+# Error type derivation for LookupError and backend-specific errors
+thiserror = { workspace = true }
+
+# Structured logging/debugging — replaces C DEBUG(D_lookup) macros
+tracing = { workspace = true }
+
+# Logging facade for crate compatibility
+log = { workspace = true }
+
+# Pattern matching for wildlsearch/nwildlsearch in lsearch.rs
+regex = { workspace = true }
+
+# System interfaces: getpwnam() for passwd lookup, stat/fstat in check_file
+libc = { workspace = true }
+
+# Compile-time driver registration via inventory::submit! macro
+inventory = { workspace = true }
+
+# ── Feature-gated optional dependencies ────────────────────────────────────
+# Each dependency below is only compiled when the corresponding lookup-*
+# feature flag is enabled. Versions are pinned per AAP §0.6.1.
+
+# JSON traversal — replaces Jansson C library for json.rs lookup
+# Version: 1.0.149 (via workspace)
 serde_json = { workspace = true, optional = true }
+
+# SQLite lookup backend — version 0.38.0 (via workspace, bundled feature)
 rusqlite = { workspace = true, optional = true }
+
+# Redis lookup backend — version 1.0.5 (via workspace)
 redis = { workspace = true, optional = true }
+
+# PostgreSQL lookup backend — version 0.7.16 (via workspace)
+# Async API bridged via tokio::runtime::Runtime::block_on()
 tokio-postgres = { workspace = true, optional = true }
+
+# PostgreSQL connection pooling — version 0.14.1 (via workspace)
 deadpool-postgres = { workspace = true, optional = true }
+
+# MySQL/MariaDB lookup backend — version 0.36.1 (via workspace)
+# Async API bridged via tokio::runtime::Runtime::block_on()
 mysql_async = { workspace = true, optional = true }
+
+# LDAP directory lookup backend — version 0.12.1 (via workspace)
 ldap3 = { workspace = true, optional = true }
+
+# DNS resolution for dnsdb lookup — version 0.25.0 (via workspace)
+# Provides A/AAAA/MX/SRV/TLSA/PTR resolution
+hickory-resolver = { workspace = true, optional = true }
+
+# Async runtime — version 1.50.0 (via workspace)
+# CRITICAL (AAP §0.7.3): Scoped to lookup execution ONLY via block_on().
+# Gated behind async-lookups meta-feature to avoid pulling in when not needed.
 tokio = { workspace = true, optional = true }
+
+# LMDB key-value store lookup backend — fully typed LMDB wrapper
+# Not in workspace deps; specified directly as it is only used by this crate.
+heed = { version = "0.22.0", optional = true }
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Feature flags replace the C build system's LOOKUP_* preprocessor defines
+# from Local/Makefile and the scripts/lookups-Makefile interpolation.
+# Each lookup backend has its own feature flag with a lookup- prefix
+# (kebab-case per Rust convention).
+#
+# AAP §0.7.3: Cargo feature flags replace ALL preprocessor conditionals.
+
+[features]
+
+# Default features — backends that are always built in the C Makefile
+# (OBJ_ALWAYS or commonly enabled in standard configurations)
+default = [
+    "lookup-lsearch",
+    "lookup-cdb",
+    "lookup-dbmdb",
+    "lookup-dnsdb",
+    "lookup-dsearch",
+    "lookup-passwd",
+    "lookup-testdb",
+]
+
+# ── Individual lookup backend features ─────────────────────────────────────
+# Each feature corresponds to one lookup backend module. Pure Rust backends
+# have no extra dependency requirements. FFI-backed backends pull in exim-ffi.
+# Async database backends pull in the async-lookups meta-feature for tokio.
+
+# CDB read-only constant database (pure Rust parser, no extra deps)
+lookup-cdb = []
+
+# DBM hints database glue (needs FFI for Berkeley DB/GDBM/NDBM backends)
+lookup-dbmdb = ["dep:exim-ffi"]
+
+# DNS query lookup via hickory-resolver (A/AAAA/MX/SRV/TLSA/PTR/TXT)
+lookup-dnsdb = ["dep:hickory-resolver"]
+
+# Directory entry search (pure Rust, uses std::fs)
+lookup-dsearch = []
+
+# JSON file traversal via serde_json (replaces Jansson C library)
+lookup-json = ["dep:serde_json"]
+
+# LDAP directory lookup via ldap3 crate (async, bridged via block_on)
+lookup-ldap = ["dep:ldap3", "async-lookups"]
+
+# LMDB key-value store via heed crate (typed LMDB wrapper)
+lookup-lmdb = ["dep:heed"]
+
+# Line-scan file lookup: lsearch, wildlsearch, nwildlsearch (pure Rust)
+lookup-lsearch = []
+
+# MySQL/MariaDB SQL lookup via mysql_async (async, bridged via block_on)
+lookup-mysql = ["dep:mysql_async", "async-lookups"]
+
+# NIS (Yellow Pages) directory lookup via FFI
+lookup-nis = ["dep:exim-ffi"]
+
+# NIS+ directory lookup via FFI
+lookup-nisplus = ["dep:exim-ffi"]
+
+# NMH datagram protocol lookup (pure Rust socket I/O)
+lookup-nmh = []
+
+# Oracle OCI SQL lookup via FFI
+lookup-oracle = ["dep:exim-ffi"]
+
+# System passwd database lookup (pure Rust via libc getpwnam)
+lookup-passwd = []
+
+# PostgreSQL SQL lookup via tokio-postgres + connection pooling (async, bridged)
+lookup-pgsql = ["dep:tokio-postgres", "dep:deadpool-postgres", "async-lookups"]
+
+# Public Suffix List lookup (pure Rust)
+lookup-psl = []
+
+# Socket request/response lookup (pure Rust TCP/Unix socket I/O)
+lookup-readsock = []
+
+# Redis key-value lookup via redis crate
+lookup-redis = ["dep:redis"]
+
+# SPF lookup shim (delegates to exim-miscmods SPF implementation)
+lookup-spf = []
+
+# SQLite query lookup via rusqlite (bundled SQLite)
+lookup-sqlite = ["dep:rusqlite"]
+
+# Synthetic test backends (no external deps — used by test suite)
+lookup-testdb = []
+
+# Whoson dynamic IP lookup via FFI
+lookup-whoson = ["dep:exim-ffi"]
+
+# ── Meta-feature: async runtime for database lookups ───────────────────────
+# Enables tokio runtime for async database backends (MySQL, PostgreSQL, LDAP).
+# tokio::runtime::Runtime::block_on() bridges async APIs into the synchronous
+# fork-per-connection model. This feature is automatically activated by any
+# lookup backend that requires async I/O.
+async-lookups = ["dep:tokio"]
