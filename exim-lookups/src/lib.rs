@@ -30,3 +30,6 @@ pub mod sqlite;
 
 #[cfg(feature = "lookup-nmh")]
 pub mod nmh;
+
+#[cfg(feature = "lookup-psl")]
+pub mod psl;

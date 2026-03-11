@@ -123,6 +123,17 @@ tokio = { workspace = true, optional = true }
 # Not in workspace deps; specified directly as it is only used by this crate.
 heed = { version = "0.22.0", optional = true }
 
+# Public Suffix List parsing and matching — version 2.3.0
+# Used by psl.rs for PSL/registrable domain lookups, replacing the 250-line
+# custom PSL matching algorithm in C psl.c. With the 'idna' feature enabled,
+# handles internationalized domain name matching internally.
+publicsuffix = { version = "2.3.0", features = ["idna"], optional = true }
+
+# IDNA (Internationalized Domain Names in Applications) — version 1.0.3
+# Used by psl.rs for UTF-8 domain ↔ A-label (punycode) conversion,
+# replacing C string_domain_utf8_to_alabel() and string_domain_alabel_to_utf8().
+idna = { version = "1.0.3", optional = true }
+
 # =============================================================================
 # Feature Flags
 # =============================================================================
@@ -198,8 +209,8 @@ lookup-passwd = []
 # PostgreSQL SQL lookup via tokio-postgres + connection pooling (async, bridged)
 lookup-pgsql = ["dep:tokio-postgres", "dep:deadpool-postgres", "async-lookups"]
 
-# Public Suffix List lookup (pure Rust)
-lookup-psl = []
+# Public Suffix List lookup (pure Rust, uses publicsuffix + idna crates)
+lookup-psl = ["dep:publicsuffix", "dep:idna"]
 
 # Socket request/response lookup (pure Rust TCP/Unix socket I/O)
 lookup-readsock = []
