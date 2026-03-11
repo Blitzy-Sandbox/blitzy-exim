@@ -22,5 +22,8 @@ pub mod ldap;
 #[cfg(feature = "lookup-redis")]
 pub mod redis;
 
+#[cfg(feature = "lookup-json")]
+pub mod json;
+
 #[cfg(feature = "lookup-sqlite")]
 pub mod sqlite;
