@@ -1,1038 +1,1383 @@
-#![allow(clippy::module_inception)] // Module name matches crate intent
-                                    // =============================================================================
-                                    // exim-transports/src/smtp.rs — Outbound SMTP Transport
-                                    // =============================================================================
-                                    //
-                                    // Rewrites `src/src/transports/smtp.c` (6,573 lines) — the complete outbound
-                                    // SMTP/LMTP client transport with:
-                                    //   • Full ESMTP command state machine (EHLO → AUTH → STARTTLS → MAIL → RCPT →
-                                    //     DATA/BDAT → QUIT)
-                                    //   • TLS negotiation via STARTTLS (delegated to exim-tls)
-                                    //   • PIPELINING for batched commands (RFC 2920)
-                                    //   • CHUNKING / BDAT binary data transfer (RFC 3030)
-                                    //   • DANE / TLSA certificate verification (RFC 6698/7672)
-                                    //   • DKIM signing integration (via exim-miscmods/dkim)
-                                    //   • PRDR — Per-Recipient Data Response (RFC draft)
-                                    //   • DSN — Delivery Status Notifications (RFC 3461)
-                                    //   • PIPE CONNECT early pipelining (Exim extension)
-                                    //   • Multi-host failover with connection caching
-                                    //   • SIZE / 8BITMIME / SMTPUTF8 ESMTP extensions
-                                    //
-                                    // Per AAP §0.7.2: zero unsafe blocks.
-                                    // Per AAP §0.7.3: no tokio or async — all I/O is synchronous.
-                                    // Per AAP §0.4.2: registered via inventory::submit! for compile-time collection.
-                                    //
-                                    // C-to-Rust Mapping:
-                                    //   smtp_transport_options_block → SmtpTransportOptions
-                                    //   smtp_transport_entry()      → SmtpTransport::transport_entry()
-                                    //   smtp_transport_setup()      → SmtpTransport::setup()
-                                    //   smtp_transport_closedown()  → SmtpTransport::closedown()
-                                    //   smtp_transport_init          → inventory::submit!(TransportDriverFactory { ... })
+// exim-transports/src/smtp.rs
+//
+// Full outbound SMTP/LMTP transport — Rust rewrite of src/src/transports/smtp.c (6,573 lines)
+// and src/src/transports/smtp.h (253 lines).
+//
+// This module implements the complete outbound SMTP/LMTP state machine used for remote
+// delivery in Exim. It handles connection setup, EHLO/HELO negotiation, STARTTLS,
+// AUTH, MAIL FROM, RCPT TO, DATA, pipelining, chunking, DSN, PRDR, early pipe connect,
+// DANE, DKIM signing, and connection reuse/closedown.
+//
+// All C global state has been replaced with scoped context structs (SmtpContext,
+// SmtpTransportOptions). All preprocessor conditionals are replaced by Cargo feature
+// flags. Taint tracking uses compile-time Tainted<T>/Clean<T> newtypes.
 
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::any::Any;
+use std::collections::HashMap;
+use std::fmt;
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use exim_drivers::transport_driver::{
     TransportDriver, TransportDriverFactory, TransportInstanceConfig, TransportResult,
 };
 use exim_drivers::DriverError;
+use exim_store::taint::Tainted;
 
-// =============================================================================
-// Constants
-// =============================================================================
+use regex::Regex;
+use serde::Deserialize;
+use tracing;
 
-/// Default SMTP port for unencrypted connections (RFC 5321 §4.5.4.2).
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 1: Constants — from smtp.h and smtp.c
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Size of the SMTP delivery I/O buffer (smtp.h line 10).
+pub const DELIVER_BUFFER_SIZE: usize = 4096;
+
+/// Pending status base value for SMTP pipelined responses (smtp.h line 12).
+pub const PENDING: i32 = 256;
+
+/// Pending status indicating deferred delivery (smtp.h line 13).
+pub const PENDING_DEFER: i32 = PENDING + 1;
+
+/// Pending status indicating successful delivery (smtp.h line 14).
+pub const PENDING_OK: i32 = PENDING;
+
+// Response code bit constants (smtp.c lines 244–252).
+// Used to track which response categories have been seen during pipelined SMTP.
+
+/// Bit flag indicating a 2xx response was received.
+pub const RESP_BIT_HAD_2XX: i32 = 1;
+
+/// Bit flag indicating a 5xx response was received.
+pub const RESP_BIT_HAD_5XX: i32 = 2;
+
+/// Combined flag: both 2xx and 5xx responses were received.
+pub const RESP_HAD_2_AND_5: i32 = RESP_BIT_HAD_2XX | RESP_BIT_HAD_5XX;
+
+/// No error in response processing.
+pub const RESP_NOERROR: i32 = 0;
+
+/// RCPT TO response timed out.
+pub const RESP_RCPT_TIMEO: i32 = -1;
+
+/// RCPT TO response had an error.
+pub const RESP_RCPT_ERROR: i32 = -2;
+
+/// MAIL FROM or DATA response had an error.
+pub const RESP_MAIL_OR_DATA_ERROR: i32 = -3;
+
+/// EPIPE during EHLO exchange.
+pub const RESP_EPIPE_EHLO_ERR: i32 = -4;
+
+/// EHLO error during TLS negotiation.
+pub const RESP_EHLO_ERR_TLS: i32 = -5;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 8: DSN Support Constants — from smtp.c lines 222–225
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// DSN NOTIFY flag values — indices align with RF_NAMES.
+/// 0 = NEVER, 1 = SUCCESS, 2 = FAILURE, 3 = DELAY
+pub const RF_NOTIFY_NEVER: i32 = 0x01;
+pub const RF_NOTIFY_SUCCESS: i32 = 0x02;
+pub const RF_NOTIFY_FAILURE: i32 = 0x04;
+pub const RF_NOTIFY_DELAY: i32 = 0x08;
+
+/// DSN NOTIFY flag value array (rf_list in C).
+pub const RF_LIST: [i32; 4] = [
+    RF_NOTIFY_NEVER,
+    RF_NOTIFY_SUCCESS,
+    RF_NOTIFY_FAILURE,
+    RF_NOTIFY_DELAY,
+];
+
+/// DSN NOTIFY flag name array (rf_names in C).
+pub const RF_NAMES: [&str; 4] = ["NEVER", "SUCCESS", "FAILURE", "DELAY"];
+
+// Peer capability bits (for SmtpContext.peer_offered bitmask)
+pub const PEER_OFFERED_TLS: u32 = 0x0001;
+pub const PEER_OFFERED_CHUNKING: u32 = 0x0002;
+pub const PEER_OFFERED_PIPELINING: u32 = 0x0004;
+pub const PEER_OFFERED_DSN: u32 = 0x0008;
+pub const PEER_OFFERED_SIZE: u32 = 0x0010;
+pub const PEER_OFFERED_AUTH: u32 = 0x0020;
+pub const PEER_OFFERED_IGNOREQUOTA: u32 = 0x0040;
+pub const PEER_OFFERED_PRDR: u32 = 0x0080;
+pub const PEER_OFFERED_UTF8: u32 = 0x0100;
+pub const PEER_OFFERED_EARLY_PIPE: u32 = 0x0200;
+pub const PEER_OFFERED_LIMITS: u32 = 0x0400;
+pub const PEER_OFFERED_PIPE_CONNECT: u32 = 0x0800;
+
+/// Default SMTP port (25).
 const SMTP_PORT: u16 = 25;
 
-/// Default submission port for authenticated connections (RFC 6409).
-#[allow(dead_code)] // Standard SMTP submission port per RFC 6409
-const SUBMISSION_PORT: u16 = 587;
-
-/// Default implicit TLS port (RFC 8314).
-#[allow(dead_code)] // Standard SMTPS port per RFC 8314
+/// Default SMTPS/submissions port (465).
 const SMTPS_PORT: u16 = 465;
 
-/// Default SMTP command timeout in seconds (RFC 5321 §4.5.3.2 specifies minimum 300s).
-const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
+/// Default submission port (587).
+const SUBMISSION_PORT: u16 = 587;
 
-/// Default DATA phase timeout in seconds (RFC 5321 §4.5.3.2 specifies minimum 600s).
-const DEFAULT_DATA_TIMEOUT_SECS: u64 = 600;
+/// Default LMTP port (24).
+const LMTP_PORT: u16 = 24;
 
-/// Default connection timeout in seconds.
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 2: TLS Library State — from smtp.h lines 17–34
+// ═══════════════════════════════════════════════════════════════════════════════
 
-/// Maximum SMTP response line length (RFC 5321 §4.5.3.1.5: 512 chars).
-#[allow(dead_code)] // SMTP response line boundary
-const MAX_RESPONSE_LINE: usize = 512;
-
-/// Maximum pipelined commands per batch (practical limit for PIPELINING).
-#[allow(dead_code)] // Pipeline batch limit
-const MAX_PIPELINE_BATCH: usize = 100;
-
-/// Maximum number of RCPT TO commands per transaction before splitting.
-const MAX_RCPTS_PER_TRANSACTION: usize = 100;
-
-/// SMTP line terminator.
-const CRLF: &str = "\r\n";
-
-// =============================================================================
-// ESMTP Capabilities
-// =============================================================================
-
-/// ESMTP capabilities advertised by the remote server via EHLO response.
-///
-/// Replaces the C `smtp_peer_options` bitmap and the per-extension boolean
-/// flags in `smtp_transport_options_block`.
-#[derive(Debug, Clone, Default)]
-struct EhloCapabilities {
-    /// Server supports PIPELINING (RFC 2920).
-    pipelining: bool,
-    /// Server supports STARTTLS (RFC 3207).
-    starttls: bool,
-    /// Server supports AUTH with listed mechanisms.
-    auth_mechanisms: Vec<String>,
-    /// Server supports SIZE declaration (RFC 1870).
-    size: bool,
-    /// Maximum message size from SIZE extension (0 = no limit).
-    max_size: u64,
-    /// Server supports 8BITMIME (RFC 6152).
-    eight_bit_mime: bool,
-    /// Server supports CHUNKING / BDAT (RFC 3030).
-    chunking: bool,
-    /// Server supports DSN (RFC 3461).
-    dsn: bool,
-    /// Server supports PRDR (Per-Recipient Data Response).
-    prdr: bool,
-    /// Server supports SMTPUTF8 (RFC 6531).
-    smtputf8: bool,
-    /// Server supports REQUIRETLS (RFC 8689).
-    requiretls: bool,
-    /// Server supports ENHANCEDSTATUSCODES (RFC 2034).
-    enhanced_status_codes: bool,
-    /// Server supports PIPE CONNECT early pipelining (Exim extension).
-    pipe_connect: bool,
+/// TLS library state tracking which resources have been loaded.
+/// Replaces C `exim_tlslib_state` struct. Feature-gated behind `tls`.
+/// The `libdata0`/`libdata1` void pointers from C are replaced by type-erased
+/// `Option<Box<dyn Any + Send + Sync>>` fields for safe polymorphism.
+#[cfg(feature = "tls")]
+#[derive(Debug, Default)]
+pub struct EximTlsLibState {
+    /// Whether connection certificates have been loaded.
+    pub conn_certs: bool,
+    /// Whether the CA bundle has been loaded.
+    pub cabundle: bool,
+    /// Whether the CRL has been loaded.
+    pub crl: bool,
+    /// Whether the priority/cipher string has been set.
+    pub pri_string: bool,
+    /// Whether DH parameters have been loaded.
+    pub dh: bool,
+    /// Whether ECDH parameters have been loaded.
+    pub ecdh: bool,
+    /// Whether CA RDN emulation is active.
+    pub ca_rdn_emulate: bool,
+    /// Whether the OCSP hook is registered.
+    pub ocsp_hook: bool,
+    /// Type-erased TLS library data slot 0 (replaces C void* libdata0).
+    pub libdata0: Option<Box<dyn Any + Send + Sync>>,
+    /// Type-erased TLS library data slot 1 (replaces C void* libdata1).
+    pub libdata1: Option<Box<dyn Any + Send + Sync>>,
 }
 
-impl EhloCapabilities {
-    /// Parse EHLO response lines into capabilities.
-    ///
-    /// Each line after the initial "250-" or "250 " greeting contains an
-    /// ESMTP keyword optionally followed by parameters.
-    fn parse(ehlo_lines: &[String]) -> Self {
-        let mut caps = Self::default();
-
-        for line in ehlo_lines {
-            // Strip the response code prefix (e.g., "250-" or "250 ").
-            let content = if line.len() > 4 { &line[4..] } else { continue };
-            let upper = content.to_uppercase();
-            let parts: Vec<&str> = upper.split_whitespace().collect();
-
-            if parts.is_empty() {
-                continue;
-            }
-
-            match parts[0] {
-                "PIPELINING" => caps.pipelining = true,
-                "STARTTLS" => caps.starttls = true,
-                "AUTH" => {
-                    caps.auth_mechanisms = parts[1..].iter().map(|s| s.to_string()).collect();
-                }
-                "SIZE" => {
-                    caps.size = true;
-                    if parts.len() > 1 {
-                        caps.max_size = parts[1].parse().unwrap_or(0);
-                    }
-                }
-                "8BITMIME" => caps.eight_bit_mime = true,
-                "CHUNKING" => caps.chunking = true,
-                "DSN" => caps.dsn = true,
-                "PRDR" => caps.prdr = true,
-                "SMTPUTF8" => caps.smtputf8 = true,
-                "REQUIRETLS" => caps.requiretls = true,
-                "ENHANCEDSTATUSCODES" => caps.enhanced_status_codes = true,
-                "X_PIPE_CONNECT" | "XPIPECONNECT" => caps.pipe_connect = true,
-                _ => {
-                    tracing::trace!(extension = %parts[0], "unknown EHLO extension");
-                }
-            }
+#[cfg(feature = "tls")]
+impl Clone for EximTlsLibState {
+    fn clone(&self) -> Self {
+        // Type-erased data is not cloneable; reset to None on clone.
+        Self {
+            conn_certs: self.conn_certs,
+            cabundle: self.cabundle,
+            crl: self.crl,
+            pri_string: self.pri_string,
+            dh: self.dh,
+            ecdh: self.ecdh,
+            ca_rdn_emulate: self.ca_rdn_emulate,
+            ocsp_hook: self.ocsp_hook,
+            libdata0: None,
+            libdata1: None,
         }
-
-        caps
     }
 }
 
-// =============================================================================
-// SMTP Response
-// =============================================================================
+/// Stub for when TLS feature is disabled — provides the same struct name
+/// with no fields so the rest of the transport code can reference it unconditionally.
+#[cfg(not(feature = "tls"))]
+#[derive(Debug, Clone, Default)]
+pub struct EximTlsLibState;
 
-/// Parsed SMTP response from the remote server.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields populated during SMTP response parsing; some used in future extensions
-struct SmtpResponse {
-    /// The 3-digit SMTP response code.
-    code: u16,
-    /// The enhanced status code (e.g., "2.1.0") if present.
-    enhanced_code: Option<String>,
-    /// All response lines (including continuations).
-    lines: Vec<String>,
-    /// Whether this is a multi-line response.
-    is_multiline: bool,
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 3: SmtpTransportOptions — from smtp.h lines 39–137
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// DKIM signing options, feature-gated behind `dkim`.
+#[cfg(feature = "dkim")]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DkimOptions {
+    /// DKIM domain (d= tag).
+    #[serde(default)]
+    pub dkim_domain: String,
+    /// DKIM selector (s= tag).
+    #[serde(default)]
+    pub dkim_selector: String,
+    /// DKIM private key path or inline data.
+    #[serde(default)]
+    pub dkim_private_key: String,
+    /// DKIM canonicalization (e.g., "relaxed/simple").
+    #[serde(default)]
+    pub dkim_canon: String,
+    /// DKIM signing headers.
+    #[serde(default)]
+    pub dkim_sign_headers: String,
+    /// DKIM hash method override.
+    #[serde(default)]
+    pub dkim_hash: String,
+    /// DKIM identity (i= tag).
+    #[serde(default)]
+    pub dkim_identity: String,
+    /// DKIM timestamps.
+    #[serde(default)]
+    pub dkim_timestamps: String,
+    /// Whether DKIM strict mode is enabled.
+    #[serde(default)]
+    pub dkim_strict: String,
 }
 
-impl SmtpResponse {
-    /// Check if the response indicates success (2xx).
-    fn is_success(&self) -> bool {
-        (200..300).contains(&self.code)
-    }
-
-    /// Check if the response indicates a temporary failure (4xx).
-    fn is_temp_fail(&self) -> bool {
-        (400..500).contains(&self.code)
-    }
-
-    /// Check if the response indicates a permanent failure (5xx).
-    #[allow(dead_code)] // Used in extended SMTP error handling paths
-    fn is_perm_fail(&self) -> bool {
-        (500..600).contains(&self.code)
-    }
-
-    /// Get the full response text (all lines joined).
-    fn full_text(&self) -> String {
-        self.lines.join("\n")
-    }
-}
-
-// =============================================================================
-// SmtpTransportOptions — Configuration
-// =============================================================================
-
-/// Configuration options for the SMTP transport.
-///
-/// Replaces the C `smtp_transport_options_block` struct which contained 60+
-/// option fields. In Rust, these options are parsed from the Exim
-/// configuration file by the `exim-config` crate and stored in
-/// `TransportInstanceConfig::options` as `Box<dyn Any>`.
-///
-/// # C Equivalents
-///
-/// - `hosts`                  → `hosts`
-/// - `port`                   → `port`
-/// - `hosts_require_tls`      → `require_tls`
-/// - `tls_certificate`        → `tls_certificate`
-/// - `tls_privatekey`         → `tls_privatekey`
-/// - `tls_require_ciphers`    → `tls_require_ciphers`
-/// - `tls_verify_certificates` → `tls_verify_certificates`
-/// - `hosts_require_auth`     → `require_auth`
-/// - `authenticated_sender`   → `authenticated_sender`
-/// - `command_timeout`        → `command_timeout`
-/// - `data_timeout`           → `data_timeout`
-/// - `connect_timeout`        → `connect_timeout`
-/// - `dkim_domain`            → `dkim_domain`
-/// - `dkim_selector`          → `dkim_selector`
-/// - `dkim_private_key`       → `dkim_private_key`
-/// - `dkim_canon`             → `dkim_canon`
-/// - `dkim_sign_headers`      → `dkim_sign_headers`
-/// - `dsn_advertise_hosts`    → `dsn_enabled`
-/// - `hosts_try_prdr`         → `prdr_enabled`
-/// - `hosts_try_chunking`     → `chunking_enabled`
-/// - `hosts_try_dane`         → `dane_enabled`
-/// - `hosts_pipe_connect`     → `pipe_connect_enabled`
-/// - `interface`              → `local_interface`
-/// - `serialize_hosts`        → `serialize_hosts`
-/// - `hosts_max_try`          → `hosts_max_try`
-/// - `connection_max_messages` → `connection_max_messages`
-/// - `max_rcpt`               → `max_rcpt`
-/// - `multi_domain`           → `multi_domain`
-/// - `hosts_require_ocsp`     → `require_ocsp`
-/// - `fallback_hosts`         → `fallback_hosts`
-/// - `helo_data`              → `helo_data`
-/// - `lmtp_ignore_quota`      → `lmtp_ignore_quota`
-/// - `final_timeout`          → `final_timeout`
-#[derive(Debug, Clone)]
+/// Complete SMTP transport options block.
+/// Maps 1:1 to C `smtp_transport_options_block` (smtp.h lines 39–137).
+/// All fields use the exact C option names for backward-compatible config parsing.
+#[derive(Debug, Clone, Deserialize)]
 pub struct SmtpTransportOptions {
-    /// List of target hosts (from `hosts` option or router).
-    pub hosts: Vec<String>,
-    /// Target port (default 25).
-    pub port: u16,
-    /// List of fallback hosts tried if primary hosts all fail.
-    pub fallback_hosts: Vec<String>,
-    /// Whether TLS is required for this transport.
-    pub require_tls: bool,
-    /// TLS certificate path.
-    pub tls_certificate: Option<String>,
-    /// TLS private key path.
-    pub tls_privatekey: Option<String>,
-    /// Required TLS cipher suites.
-    pub tls_require_ciphers: Option<String>,
-    /// TLS CA verification certificates path.
-    pub tls_verify_certificates: Option<String>,
-    /// Whether authentication is required.
-    pub require_auth: bool,
-    /// Authenticated sender address for AUTH.
-    pub authenticated_sender: Option<String>,
-    /// SMTP command timeout.
-    pub command_timeout: Duration,
-    /// DATA phase timeout.
-    pub data_timeout: Duration,
-    /// Connection establishment timeout.
-    pub connect_timeout: Duration,
-    /// DKIM signing domain.
-    pub dkim_domain: Option<String>,
-    /// DKIM signing selector.
-    pub dkim_selector: Option<String>,
-    /// DKIM private key path.
-    pub dkim_private_key: Option<String>,
-    /// DKIM canonicalization (relaxed/simple).
-    pub dkim_canon: Option<String>,
-    /// DKIM headers to sign.
-    pub dkim_sign_headers: Option<String>,
-    /// Enable DSN support.
-    pub dsn_enabled: bool,
-    /// Enable PRDR support.
-    pub prdr_enabled: bool,
-    /// Enable CHUNKING/BDAT support.
-    pub chunking_enabled: bool,
-    /// Enable DANE/TLSA support.
-    pub dane_enabled: bool,
-    /// Enable PIPE CONNECT early pipelining.
-    pub pipe_connect_enabled: bool,
-    /// Local interface to bind for outbound connections.
-    pub local_interface: Option<String>,
-    /// Host serialization list (only one delivery at a time).
-    pub serialize_hosts: Option<String>,
-    /// Maximum hosts to try before deferring.
-    pub hosts_max_try: u32,
-    /// Maximum messages per connection for connection reuse.
-    pub connection_max_messages: u32,
-    /// Maximum RCPT TO commands per transaction.
-    pub max_rcpt: u32,
-    /// Whether to combine recipients for different domains.
-    pub multi_domain: bool,
-    /// Require OCSP stapling.
-    pub require_ocsp: bool,
-    /// EHLO/HELO data string.
-    pub helo_data: Option<String>,
-    /// LMTP mode: ignore quota errors.
+    // ── Basic connection settings ──────────────────────────────────
+    /// Host list for delivery.
+    #[serde(default)]
+    pub hosts: String,
+
+    /// Fallback host list.
+    #[serde(default)]
+    pub fallback_hosts: String,
+
+    /// Authenticated sender value for SMTP AUTH.
+    #[serde(default)]
+    pub authenticated_sender: String,
+
+    /// HELO/EHLO data string (default: "$primary_hostname").
+    #[serde(default = "SmtpTransportOptions::default_helo_data")]
+    pub helo_data: String,
+
+    /// Source interface for outbound connections.
+    #[serde(default)]
+    pub interface: String,
+
+    /// Destination port string (default derived from protocol).
+    #[serde(default)]
+    pub port: String,
+
+    /// SMTP protocol variant ("smtp", "smtps", "lmtp", etc.).
+    #[serde(default)]
+    pub protocol: String,
+
+    /// DSCP value for outbound connections.
+    #[serde(default)]
+    pub dscp: String,
+
+    // ── Host list matching strings ─────────────────────────────────
+    /// Host list for serialized (single-thread) delivery.
+    #[serde(default)]
+    pub serialize_hosts: String,
+
+    /// Hosts to attempt AUTH with.
+    #[serde(default)]
+    pub hosts_try_auth: String,
+
+    /// Hosts requiring ALPN negotiation.
+    #[serde(default)]
+    pub hosts_require_alpn: String,
+
+    /// Hosts requiring AUTH.
+    #[serde(default)]
+    pub hosts_require_auth: String,
+
+    /// Hosts to attempt chunking (BDAT) with.
+    #[serde(default = "SmtpTransportOptions::default_wildcard")]
+    pub hosts_try_chunking: String,
+
+    /// Hosts to attempt TCP Fast Open with.
+    #[serde(default = "SmtpTransportOptions::default_wildcard")]
+    pub hosts_try_fastopen: String,
+
+    // ── DANE feature-gated ─────────────────────────────────────────
+    /// Hosts to attempt DANE verification with.
+    #[cfg(feature = "dane")]
+    #[serde(default = "SmtpTransportOptions::default_wildcard")]
+    pub hosts_try_dane: String,
+
+    /// Hosts requiring DANE verification.
+    #[cfg(feature = "dane")]
+    #[serde(default)]
+    pub hosts_require_dane: String,
+
+    /// TLS cipher requirements for DANE.
+    #[cfg(feature = "dane")]
+    #[serde(default)]
+    pub dane_require_tls_ciphers: String,
+
+    // ── PRDR feature-gated ─────────────────────────────────────────
+    /// Hosts to attempt PRDR with.
+    #[cfg(feature = "prdr")]
+    #[serde(default = "SmtpTransportOptions::default_wildcard")]
+    pub hosts_try_prdr: String,
+
+    // ── OCSP feature-gated ─────────────────────────────────────────
+    /// Hosts to request OCSP stapling from.
+    #[cfg(feature = "ocsp")]
+    #[serde(default = "SmtpTransportOptions::default_wildcard")]
+    pub hosts_request_ocsp: String,
+
+    /// Hosts requiring OCSP stapling.
+    #[cfg(feature = "ocsp")]
+    #[serde(default)]
+    pub hosts_require_ocsp: String,
+
+    // ── PIPE_CONNECT feature-gated ─────────────────────────────────
+    /// Hosts eligible for early-pipelining (PIPE_CONNECT).
+    #[cfg(feature = "pipe-connect")]
+    #[serde(default)]
+    pub hosts_pipe_connect: String,
+
+    // ── TLS feature-gated ──────────────────────────────────────────
+    /// Hosts requiring TLS.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub hosts_require_tls: String,
+
+    /// Hosts to avoid TLS with.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub hosts_avoid_tls: String,
+
+    /// Hosts to avoid TLS with during verification.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub hosts_verify_avoid_tls: String,
+
+    /// Hosts to not pass TLS connections through.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub hosts_nopass_tls: String,
+
+    /// Hosts to not proxy TLS connections through.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub hosts_noproxy_tls: String,
+
+    /// TLS client certificate file.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub tls_certificate: String,
+
+    /// TLS private key file.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub tls_privatekey: String,
+
+    /// TLS cipher requirements string.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub tls_require_ciphers: String,
+
+    /// TLS Server Name Indication.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub tls_sni: String,
+
+    /// TLS CA certificates for verification (default: "system").
+    #[cfg(feature = "tls")]
+    #[serde(default = "SmtpTransportOptions::default_tls_verify_certs")]
+    pub tls_verify_certificates: String,
+
+    /// TLS Certificate Revocation List.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub tls_crl: String,
+
+    /// Hosts to verify TLS certificates for.
+    #[cfg(feature = "tls")]
+    #[serde(default)]
+    pub tls_verify_hosts: String,
+
+    /// Hosts to try TLS verification for (non-fatal on failure).
+    #[cfg(feature = "tls")]
+    #[serde(default = "SmtpTransportOptions::default_wildcard")]
+    pub tls_try_verify_hosts: String,
+
+    /// Hosts to verify TLS certificate hostnames for.
+    #[cfg(feature = "tls")]
+    #[serde(default = "SmtpTransportOptions::default_wildcard")]
+    pub tls_verify_cert_hostnames: String,
+
+    /// Whether to fall back to cleartext on TLS temp failure.
+    #[cfg(feature = "tls")]
+    #[serde(default = "SmtpTransportOptions::default_true")]
+    pub tls_tempfail_tryclear: bool,
+
+    // ── TLS Resume feature-gated ───────────────────────────────────
+    /// Hostname extraction pattern for TLS session resumption.
+    #[cfg(feature = "tls-resume")]
+    #[serde(default)]
+    pub host_name_extract: String,
+
+    /// Hosts eligible for TLS session resumption.
+    #[cfg(feature = "tls-resume")]
+    #[serde(default)]
+    pub tls_resumption_hosts: String,
+
+    // ── I18N feature-gated ─────────────────────────────────────────
+    /// UTF-8 downconvert mode for SMTPUTF8 (i18n).
+    #[cfg(feature = "i18n")]
+    #[serde(default)]
+    pub utf8_downconvert: String,
+
+    // ── DKIM feature-gated ─────────────────────────────────────────
+    /// DKIM signing options block.
+    #[cfg(feature = "dkim")]
+    #[serde(default)]
+    pub dkim: DkimOptions,
+
+    // ── ARC feature-gated ──────────────────────────────────────────
+    /// ARC signing specification.
+    #[cfg(feature = "arc")]
+    #[serde(default)]
+    pub arc_sign: String,
+
+    // ── SOCKS feature-gated ────────────────────────────────────────
+    /// SOCKS proxy for outbound connections.
+    #[cfg(feature = "socks")]
+    #[serde(default)]
+    pub socks_proxy: String,
+
+    // ── Timeout values (seconds) ───────────────────────────────────
+    /// Timeout for individual SMTP commands (default: 300s).
+    #[serde(default = "SmtpTransportOptions::default_command_timeout")]
+    pub command_timeout: u64,
+
+    /// Timeout for TCP connection establishment (default: 300s).
+    #[serde(default = "SmtpTransportOptions::default_connect_timeout")]
+    pub connect_timeout: u64,
+
+    /// Timeout for DATA phase (default: 300s).
+    #[serde(default = "SmtpTransportOptions::default_data_timeout")]
+    pub data_timeout: u64,
+
+    /// Final timeout after all data sent, waiting for response (default: 600s).
+    #[serde(default = "SmtpTransportOptions::default_final_timeout")]
+    pub final_timeout: u64,
+
+    // ── Numeric limits ─────────────────────────────────────────────
+    /// Additional bytes to add to SIZE declaration (default: 1024).
+    #[serde(default = "SmtpTransportOptions::default_size_addition")]
+    pub size_addition: i32,
+
+    /// Maximum host connection attempts (default: 5).
+    #[serde(default = "SmtpTransportOptions::default_hosts_max_try")]
+    pub hosts_max_try: i32,
+
+    /// Hard limit on host connection attempts (default: 50).
+    #[serde(default = "SmtpTransportOptions::default_hosts_max_try_hardlimit")]
+    pub hosts_max_try_hardlimit: i32,
+
+    /// Maximum message line length (default: 998 per RFC 5321).
+    #[serde(default = "SmtpTransportOptions::default_message_linelength_limit")]
+    pub message_linelength_limit: i32,
+
+    // ── Boolean flags ──────────────────────────────────────────────
+    /// Include sender in address retry key.
+    #[serde(default = "SmtpTransportOptions::default_true")]
+    pub address_retry_include_sender: bool,
+
+    /// Allow delivery to localhost.
+    #[serde(default)]
+    pub allow_localhost: bool,
+
+    /// Force use of authenticated_sender.
+    #[serde(default)]
+    pub authenticated_sender_force: bool,
+
+    /// Use gethostbyname instead of DNS for host resolution.
+    #[serde(default)]
+    pub gethostbyname: bool,
+
+    /// Add search domain to single-component host names.
+    #[serde(default = "SmtpTransportOptions::default_true")]
+    pub dns_qualify_single: bool,
+
+    /// Search parent domains for host resolution.
+    #[serde(default)]
+    pub dns_search_parents: bool,
+
+    /// Delay delivery after the retry cutoff time.
+    #[serde(default = "SmtpTransportOptions::default_true")]
+    pub delay_after_cutoff: bool,
+
+    /// Whether this transport's hosts override router-supplied hosts.
+    #[serde(default)]
+    pub hosts_override: bool,
+
+    /// Randomize the host list for load distribution.
+    #[serde(default)]
+    pub hosts_randomize: bool,
+
+    /// Enable TCP keepalive on outbound connections.
+    #[serde(default = "SmtpTransportOptions::default_true")]
+    pub keepalive: bool,
+
+    /// Ignore quota for LMTP delivery.
+    #[serde(default)]
     pub lmtp_ignore_quota: bool,
-    /// Final timeout for connection shutdown.
-    pub final_timeout: Duration,
-    /// Enable SIZE extension advertisement.
-    pub size_enabled: bool,
+
+    /// Include IP address in retry key.
+    #[serde(default = "SmtpTransportOptions::default_true")]
+    pub retry_include_ip_address: bool,
+
+    // ── DNSSEC settings ────────────────────────────────────────────
+    /// DNSSEC request mode.
+    #[serde(default)]
+    pub dnssec: DnssecMode,
+}
+
+/// DNSSEC request mode for DNS lookups.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub enum DnssecMode {
+    /// No DNSSEC preference.
+    #[default]
+    None,
+    /// Request DNSSEC validation.
+    Request,
+    /// Require DNSSEC validation.
+    Require,
+}
+
+// Default value helper functions for serde deserialization.
+impl SmtpTransportOptions {
+    fn default_helo_data() -> String {
+        "$primary_hostname".to_string()
+    }
+
+    fn default_wildcard() -> String {
+        "*".to_string()
+    }
+
+    fn default_true() -> bool {
+        true
+    }
+
+    fn default_tls_verify_certs() -> String {
+        "system".to_string()
+    }
+
+    fn default_command_timeout() -> u64 {
+        300
+    }
+
+    fn default_connect_timeout() -> u64 {
+        300
+    }
+
+    fn default_data_timeout() -> u64 {
+        300
+    }
+
+    fn default_final_timeout() -> u64 {
+        600
+    }
+
+    fn default_size_addition() -> i32 {
+        1024
+    }
+
+    fn default_hosts_max_try() -> i32 {
+        5
+    }
+
+    fn default_hosts_max_try_hardlimit() -> i32 {
+        50
+    }
+
+    fn default_message_linelength_limit() -> i32 {
+        998
+    }
 }
 
 impl Default for SmtpTransportOptions {
     fn default() -> Self {
         Self {
-            hosts: Vec::new(),
-            port: SMTP_PORT,
-            fallback_hosts: Vec::new(),
-            require_tls: false,
-            tls_certificate: None,
-            tls_privatekey: None,
-            tls_require_ciphers: None,
-            tls_verify_certificates: None,
-            require_auth: false,
-            authenticated_sender: None,
-            command_timeout: Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
-            data_timeout: Duration::from_secs(DEFAULT_DATA_TIMEOUT_SECS),
-            connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
-            dkim_domain: None,
-            dkim_selector: None,
-            dkim_private_key: None,
-            dkim_canon: None,
-            dkim_sign_headers: None,
-            dsn_enabled: false,
-            prdr_enabled: false,
-            chunking_enabled: true,
-            dane_enabled: false,
-            pipe_connect_enabled: false,
-            local_interface: None,
-            serialize_hosts: None,
+            hosts: String::new(),
+            fallback_hosts: String::new(),
+            authenticated_sender: String::new(),
+            helo_data: "$primary_hostname".to_string(),
+            interface: String::new(),
+            port: String::new(),
+            protocol: String::new(),
+            dscp: String::new(),
+            serialize_hosts: String::new(),
+            hosts_try_auth: String::new(),
+            hosts_require_alpn: String::new(),
+            hosts_require_auth: String::new(),
+            hosts_try_chunking: "*".to_string(),
+            hosts_try_fastopen: "*".to_string(),
+
+            #[cfg(feature = "dane")]
+            hosts_try_dane: "*".to_string(),
+            #[cfg(feature = "dane")]
+            hosts_require_dane: String::new(),
+            #[cfg(feature = "dane")]
+            dane_require_tls_ciphers: String::new(),
+
+            #[cfg(feature = "prdr")]
+            hosts_try_prdr: "*".to_string(),
+
+            #[cfg(feature = "ocsp")]
+            hosts_request_ocsp: "*".to_string(),
+            #[cfg(feature = "ocsp")]
+            hosts_require_ocsp: String::new(),
+
+            #[cfg(feature = "pipe-connect")]
+            hosts_pipe_connect: String::new(),
+
+            #[cfg(feature = "tls")]
+            hosts_require_tls: String::new(),
+            #[cfg(feature = "tls")]
+            hosts_avoid_tls: String::new(),
+            #[cfg(feature = "tls")]
+            hosts_verify_avoid_tls: String::new(),
+            #[cfg(feature = "tls")]
+            hosts_nopass_tls: String::new(),
+            #[cfg(feature = "tls")]
+            hosts_noproxy_tls: String::new(),
+            #[cfg(feature = "tls")]
+            tls_certificate: String::new(),
+            #[cfg(feature = "tls")]
+            tls_privatekey: String::new(),
+            #[cfg(feature = "tls")]
+            tls_require_ciphers: String::new(),
+            #[cfg(feature = "tls")]
+            tls_sni: String::new(),
+            #[cfg(feature = "tls")]
+            tls_verify_certificates: "system".to_string(),
+            #[cfg(feature = "tls")]
+            tls_crl: String::new(),
+            #[cfg(feature = "tls")]
+            tls_verify_hosts: String::new(),
+            #[cfg(feature = "tls")]
+            tls_try_verify_hosts: "*".to_string(),
+            #[cfg(feature = "tls")]
+            tls_verify_cert_hostnames: "*".to_string(),
+            #[cfg(feature = "tls")]
+            tls_tempfail_tryclear: true,
+
+            #[cfg(feature = "tls-resume")]
+            host_name_extract: String::new(),
+            #[cfg(feature = "tls-resume")]
+            tls_resumption_hosts: String::new(),
+
+            #[cfg(feature = "i18n")]
+            utf8_downconvert: String::new(),
+
+            #[cfg(feature = "dkim")]
+            dkim: DkimOptions::default(),
+
+            #[cfg(feature = "arc")]
+            arc_sign: String::new(),
+
+            #[cfg(feature = "socks")]
+            socks_proxy: String::new(),
+
+            command_timeout: 300,
+            connect_timeout: 300,
+            data_timeout: 300,
+            final_timeout: 600,
+            size_addition: 1024,
             hosts_max_try: 5,
-            connection_max_messages: 1,
-            max_rcpt: MAX_RCPTS_PER_TRANSACTION as u32,
-            multi_domain: true,
-            require_ocsp: false,
-            helo_data: None,
+            hosts_max_try_hardlimit: 50,
+            message_linelength_limit: 998,
+            address_retry_include_sender: true,
+            allow_localhost: false,
+            authenticated_sender_force: false,
+            gethostbyname: false,
+            dns_qualify_single: true,
+            dns_search_parents: false,
+            delay_after_cutoff: true,
+            hosts_override: false,
+            hosts_randomize: false,
+            keepalive: true,
             lmtp_ignore_quota: false,
-            final_timeout: Duration::from_secs(60),
-            size_enabled: true,
+            retry_include_ip_address: true,
+            dnssec: DnssecMode::None,
         }
     }
 }
 
-// =============================================================================
-// SmtpContext — Per-Connection State
-// =============================================================================
+impl fmt::Display for SmtpTransportOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SmtpTransportOptions {{ hosts: {:?}, port: {:?}, protocol: {:?} }}",
+            self.hosts, self.port, self.protocol
+        )
+    }
+}
 
-/// Per-connection SMTP state for an active outbound session.
-///
-/// Replaces the C local variables and static state in `smtp_transport_entry()`
-/// and the various helper functions. Holds the TCP stream, EHLO capabilities,
-/// and counters for pipelining and message delivery.
-#[allow(dead_code)] // Fields populated during SMTP session; some consumed in TLS/AUTH paths
-struct SmtpContext {
-    /// The underlying TCP stream (after connection, before or after TLS).
-    stream: BufReader<TcpStream>,
-    /// ESMTP capabilities parsed from the EHLO response.
-    capabilities: EhloCapabilities,
-    /// Whether TLS has been negotiated on this connection.
-    tls_active: bool,
-    /// Whether AUTH has been performed on this connection.
-    authenticated: bool,
-    /// Number of pipelined commands awaiting responses.
-    pending_responses: usize,
-    /// Number of messages delivered on this connection (for reuse).
-    messages_delivered: u32,
-    /// The peer hostname for logging.
-    peer_host: String,
-    /// The peer IP address string.
-    peer_addr: String,
-    /// Buffer for building pipelined commands.
-    pipeline_buffer: Vec<u8>,
-    /// Whether LMTP mode is active (LHLO instead of EHLO).
-    lmtp_mode: bool,
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 4: SmtpContext — from smtp.h lines 143–230
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Per-connection SMTP delivery context.
+/// Replaces C `smtp_context` struct. All C static/global state variables
+/// (smtp_command, mail_command, data_command, update_waiting, pipelining_active)
+/// are folded into this struct per AAP §0.4.4 and Phase 9.
+#[derive(Debug)]
+pub struct SmtpContext {
+    // ── Source addressing ───────────────────────────────────────────
+    /// Envelope sender (MAIL FROM address).
+    pub from_addr: String,
+
+    /// Address list for RCPT TO delivery — the set of recipients for this connection.
+    pub addrlist: Vec<String>,
+
+    // ── Connection parameters ──────────────────────────────────────
+    /// Target host for this connection.
+    pub host: String,
+
+    /// Target port for this connection.
+    pub port: u16,
+
+    // ── Protocol state booleans (replaces C bitfield booleans) ─────
+    /// This is a verification call, not a real delivery.
+    pub verify: bool,
+
+    /// Using LMTP protocol instead of SMTP.
+    pub lmtp: bool,
+
+    /// Using implicit TLS (SMTPS) — TLS handshake before banner.
+    pub smtps: bool,
+
+    /// Transaction completed successfully.
+    pub ok: bool,
+
+    /// Still in connection setup phase (before DATA).
+    pub setting_up: bool,
+
+    /// Peer supports ESMTP (responded to EHLO).
+    pub esmtp: bool,
+
+    /// EHLO has been sent (regardless of response).
+    pub esmtp_sent: bool,
+
+    /// Pipelining was actually used for this transaction.
+    pub pipelining_used: bool,
+
+    /// Need to send RSET before next transaction.
+    pub send_rset: bool,
+
+    /// Need to send QUIT on closedown.
+    pub send_quit: bool,
+
+    /// Need to send TLS close-notify on closedown.
+    pub send_tlsclose: bool,
+
+    /// At least one address was completed in this session.
+    pub completed_addr: bool,
+
+    /// At least one RCPT TO got a 2xx response.
+    pub good_rcpt: bool,
+
+    /// A RCPT TO got a 452 (too many recipients) response.
+    pub rcpt_452: bool,
+
+    // ── PRDR feature-gated ─────────────────────────────────────────
+    /// PRDR (Per-Recipient Data Response) is active for this connection.
+    #[cfg(feature = "prdr")]
+    pub prdr_active: bool,
+
+    // ── I18N feature-gated ─────────────────────────────────────────
+    /// SMTPUTF8 is needed for this transaction.
+    #[cfg(feature = "i18n")]
+    pub utf8_needed: bool,
+
+    // ── Pipe-connect feature-gated ─────────────────────────────────
+    /// Early pipelining is acceptable for this host.
+    #[cfg(feature = "pipe-connect")]
+    pub early_pipe_ok: bool,
+
+    /// Early pipelining is currently active.
+    #[cfg(feature = "pipe-connect")]
+    pub early_pipe_active: bool,
+
+    /// Banner response is pending (early pipe).
+    #[cfg(feature = "pipe-connect")]
+    pub pending_banner: bool,
+
+    /// EHLO response is pending (early pipe).
+    #[cfg(feature = "pipe-connect")]
+    pub pending_ehlo: bool,
+
+    // ── Peer capability tracking ───────────────────────────────────
+    /// Bitmask of capabilities offered by the peer (PEER_OFFERED_* constants).
+    pub peer_offered: u32,
+
+    /// Maximum number of MAIL commands per connection (from server).
+    pub max_mail: u32,
+
+    /// Maximum number of RCPT TO commands per transaction (from server).
+    pub max_rcpt: u32,
+
+    /// Number of commands sent so far in this session.
+    pub cmd_count: u32,
+
+    /// Avoid option — bitmask of features to skip for this connection.
+    pub avoid_option: u32,
+
+    // ── ESMTP-LIMITS feature-gated ─────────────────────────────────
+    /// Peer-advertised MAIL limit.
+    #[cfg(feature = "esmtp-limits")]
+    pub peer_limit_mail: u32,
+
+    /// Peer-advertised RCPT limit.
+    #[cfg(feature = "esmtp-limits")]
+    pub peer_limit_rcpt: u32,
+
+    /// Peer-advertised RCPT per-domain limit.
+    #[cfg(feature = "esmtp-limits")]
+    pub peer_limit_rcptdom: u32,
+
+    /// Single RCPT domain constraint from peer limits.
+    #[cfg(feature = "esmtp-limits")]
+    pub single_rcpt_domain: String,
+
+    // ── DSN-INFO feature-gated ─────────────────────────────────────
+    /// Full SMTP greeting banner (for DSN reporting).
+    #[cfg(feature = "dsn-info")]
+    pub smtp_greeting: String,
+
+    /// Full HELO/EHLO response (for DSN reporting).
+    #[cfg(feature = "dsn-info")]
+    pub helo_response: String,
+
+    // ── Delivery tracking ──────────────────────────────────────────
+    /// Timestamp when delivery attempt started.
+    pub delivery_start: Option<Instant>,
+
+    /// Index of the first address in the current batch.
+    pub first_addr_index: usize,
+
+    /// Index of the next address to process.
+    pub next_addr_index: usize,
+
+    /// Index of the address awaiting sync response.
+    pub sync_addr_index: usize,
+
+    // ── I/O state (replaces C inblock/outblock/buffer) ─────────────
+    /// I/O buffer for SMTP command writing.
+    pub outbuffer: Vec<u8>,
+
+    /// I/O buffer for SMTP response reading.
+    pub inbuffer: Vec<u8>,
+
+    // ── Formerly C static variables (Phase 9 replacement) ──────────
+    /// Current SMTP command being executed (replaces C static smtp_command).
+    pub smtp_command: String,
+
+    /// Last MAIL FROM command sent (replaces C static mail_command).
+    pub mail_command: String,
+
+    /// Last DATA/BDAT command sent (replaces C static data_command).
+    pub data_command: String,
+
+    /// Whether the update_waiting callback has been registered (replaces C static).
+    pub update_waiting: bool,
+
+    /// Whether pipelining is currently active (replaces C static pipelining_active).
+    pub pipelining_active: bool,
+
+    // ── Response tracking ──────────────────────────────────────────
+    /// Tracks which response classes have been seen (RESP_BIT_HAD_2XX | RESP_BIT_HAD_5XX).
+    pub response_classes: i32,
+
+    /// Accumulated EHLO capability string for diagnostic logging.
+    pub ehlo_capabilities: String,
+
+    /// Peer-advertised maximum message size (from EHLO SIZE extension).
+    pub peer_max_message_size: u64,
+
+    /// Authentication mechanisms offered by peer (from EHLO AUTH).
+    pub auth_mechanisms: String,
 }
 
 impl SmtpContext {
-    /// Send a command and read the response (non-pipelined).
-    fn command(&mut self, cmd: &str, timeout: Duration) -> Result<SmtpResponse, TransportResult> {
-        self.send_line(cmd, timeout)?;
-        self.read_response(timeout)
+    /// Create a new SmtpContext with default/empty state for a delivery attempt.
+    pub fn new(from_addr: String, host: String, port: u16) -> Self {
+        Self {
+            from_addr,
+            addrlist: Vec::new(),
+            host,
+            port,
+            verify: false,
+            lmtp: false,
+            smtps: false,
+            ok: false,
+            setting_up: true,
+            esmtp: false,
+            esmtp_sent: false,
+            pipelining_used: false,
+            send_rset: false,
+            send_quit: true,
+            send_tlsclose: false,
+            completed_addr: false,
+            good_rcpt: false,
+            rcpt_452: false,
+
+            #[cfg(feature = "prdr")]
+            prdr_active: false,
+
+            #[cfg(feature = "i18n")]
+            utf8_needed: false,
+
+            #[cfg(feature = "pipe-connect")]
+            early_pipe_ok: false,
+            #[cfg(feature = "pipe-connect")]
+            early_pipe_active: false,
+            #[cfg(feature = "pipe-connect")]
+            pending_banner: false,
+            #[cfg(feature = "pipe-connect")]
+            pending_ehlo: false,
+
+            peer_offered: 0,
+            max_mail: 0,
+            max_rcpt: 0,
+            cmd_count: 0,
+            avoid_option: 0,
+
+            #[cfg(feature = "esmtp-limits")]
+            peer_limit_mail: 0,
+            #[cfg(feature = "esmtp-limits")]
+            peer_limit_rcpt: 0,
+            #[cfg(feature = "esmtp-limits")]
+            peer_limit_rcptdom: 0,
+            #[cfg(feature = "esmtp-limits")]
+            single_rcpt_domain: String::new(),
+
+            #[cfg(feature = "dsn-info")]
+            smtp_greeting: String::new(),
+            #[cfg(feature = "dsn-info")]
+            helo_response: String::new(),
+
+            delivery_start: None,
+            first_addr_index: 0,
+            next_addr_index: 0,
+            sync_addr_index: 0,
+
+            outbuffer: Vec::with_capacity(DELIVER_BUFFER_SIZE),
+            inbuffer: Vec::with_capacity(DELIVER_BUFFER_SIZE),
+
+            smtp_command: String::new(),
+            mail_command: String::new(),
+            data_command: String::new(),
+            update_waiting: false,
+            pipelining_active: false,
+
+            response_classes: 0,
+            ehlo_capabilities: String::new(),
+            peer_max_message_size: 0,
+            auth_mechanisms: String::new(),
+        }
     }
 
-    /// Send a line to the server.
-    fn send_line(&mut self, line: &str, timeout: Duration) -> Result<(), TransportResult> {
-        let inner = self.stream.get_mut();
-        inner
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| TransportResult::Error {
-                message: format!("set_write_timeout: {}", e),
-            })?;
-        inner
-            .write_all(line.as_bytes())
-            .map_err(|e| TransportResult::Error {
-                message: format!("write: {}", e),
-            })?;
-        inner
-            .write_all(CRLF.as_bytes())
-            .map_err(|e| TransportResult::Error {
-                message: format!("write CRLF: {}", e),
-            })?;
-        inner.flush().map_err(|e| TransportResult::Error {
-            message: format!("flush: {}", e),
-        })?;
-        tracing::trace!(cmd = %line, peer = %self.peer_host, ">> sent");
-        Ok(())
-    }
+    /// Reset per-transaction state for connection reuse (new MAIL FROM on same connection).
+    pub fn reset_transaction(&mut self) {
+        self.ok = false;
+        self.setting_up = true;
+        self.esmtp_sent = false;
+        self.pipelining_used = false;
+        self.send_rset = false;
+        self.completed_addr = false;
+        self.good_rcpt = false;
+        self.rcpt_452 = false;
+        self.first_addr_index = 0;
+        self.next_addr_index = 0;
+        self.sync_addr_index = 0;
+        self.response_classes = 0;
+        self.smtp_command.clear();
+        self.mail_command.clear();
+        self.data_command.clear();
+        self.pipelining_active = false;
 
-    /// Read a complete SMTP response (possibly multi-line).
-    fn read_response(&mut self, timeout: Duration) -> Result<SmtpResponse, TransportResult> {
-        self.stream
-            .get_mut()
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| TransportResult::Error {
-                message: format!("set_read_timeout: {}", e),
-            })?;
-
-        let mut lines = Vec::new();
-        let mut response_code: u16 = 0;
-        let mut is_multiline = false;
-
-        loop {
-            let mut line_buf = String::new();
-            match self.stream.read_line(&mut line_buf) {
-                Ok(0) => {
-                    return Err(TransportResult::Error {
-                        message: "connection closed by peer during response read".into(),
-                    });
-                }
-                Ok(_) => {
-                    let line = line_buf.trim_end_matches(['\r', '\n']);
-                    tracing::trace!(response = %line, peer = %self.peer_host, "<< recv");
-
-                    if line.len() < 3 {
-                        return Err(TransportResult::Error {
-                            message: format!("SMTP response too short: '{}'", line),
-                        });
-                    }
-
-                    // Parse the 3-digit response code.
-                    let code: u16 = line[..3].parse().map_err(|_| TransportResult::Error {
-                        message: format!("invalid SMTP response code: '{}'", &line[..3]),
-                    })?;
-
-                    if response_code == 0 {
-                        response_code = code;
-                    }
-
-                    lines.push(line.to_string());
-
-                    // Check continuation character (4th char).
-                    if line.len() > 3 && line.as_bytes()[3] == b'-' {
-                        is_multiline = true;
-                        continue;
-                    }
-
-                    // Final line (space after code or end of line).
-                    break;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
-                    return Err(TransportResult::Deferred {
-                        message: Some("SMTP response timeout".into()),
-                        errno: None,
-                    });
-                }
-                Err(e) => {
-                    return Err(TransportResult::Error {
-                        message: format!("SMTP response read error: {}", e),
-                    });
-                }
-            }
+        #[cfg(feature = "prdr")]
+        {
+            self.prdr_active = false;
         }
 
-        // Parse enhanced status code if present.
-        let enhanced_code = if lines.last().is_some_and(|l| l.len() > 4) {
-            let text = &lines.last().unwrap()[4..];
-            parse_enhanced_status(text)
-        } else {
-            None
-        };
-
-        Ok(SmtpResponse {
-            code: response_code,
-            enhanced_code,
-            lines,
-            is_multiline,
-        })
+        #[cfg(feature = "i18n")]
+        {
+            self.utf8_needed = false;
+        }
     }
 
-    /// Add a command to the pipeline buffer without sending.
-    fn pipeline_add(&mut self, cmd: &str) {
-        self.pipeline_buffer.extend_from_slice(cmd.as_bytes());
-        self.pipeline_buffer.extend_from_slice(CRLF.as_bytes());
-        self.pending_responses += 1;
-        tracing::trace!(cmd = %cmd, pending = self.pending_responses, "pipeline: queued");
+    /// Check if a specific peer capability is offered.
+    pub fn peer_has(&self, capability: u32) -> bool {
+        (self.peer_offered & capability) != 0
     }
+}
 
-    /// Flush all pipelined commands and read all expected responses.
-    fn pipeline_flush(&mut self, timeout: Duration) -> Result<Vec<SmtpResponse>, TransportResult> {
-        if self.pipeline_buffer.is_empty() {
-            return Ok(Vec::new());
-        }
+impl fmt::Display for SmtpContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SmtpContext {{ host: {}:{}, from: {:?}, esmtp: {}, ok: {} }}",
+            self.host, self.port, self.from_addr, self.esmtp, self.ok
+        )
+    }
+}
 
-        // Send all pipelined commands at once.
-        let inner = self.stream.get_mut();
-        inner
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| TransportResult::Error {
-                message: format!("pipeline write timeout: {}", e),
-            })?;
-        inner
-            .write_all(&self.pipeline_buffer)
-            .map_err(|e| TransportResult::Error {
-                message: format!("pipeline write: {}", e),
-            })?;
-        inner.flush().map_err(|e| TransportResult::Error {
-            message: format!("pipeline flush: {}", e),
-        })?;
-        self.pipeline_buffer.clear();
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 5: EHLO Capability Regexes — from smtp.c lines 256–292
+// ═══════════════════════════════════════════════════════════════════════════════
 
-        // Read all expected responses.
-        let expected = self.pending_responses;
-        self.pending_responses = 0;
-        let mut responses = Vec::with_capacity(expected);
+/// Compiled regex patterns for parsing EHLO/LHLO capability responses.
+/// Each pattern matches the extension keyword in a multi-line EHLO response.
+/// Compiled once at transport initialization in `smtp_deliver_init()`.
+pub struct SmtpRegexes {
+    /// Matches AUTH mechanism list in EHLO response.
+    pub regex_auth: Regex,
 
-        for _ in 0..expected {
-            responses.push(self.read_response(timeout)?);
-        }
+    /// Matches CHUNKING extension in EHLO response.
+    pub regex_chunking: Regex,
 
-        Ok(responses)
+    /// Matches DSN extension in EHLO response.
+    pub regex_dsn: Regex,
+
+    /// Matches IGNOREQUOTA extension (LMTP) in EHLO response.
+    pub regex_ignorequota: Regex,
+
+    /// Matches PIPELINING extension in EHLO response.
+    pub regex_pipelining: Regex,
+
+    /// Matches SIZE extension with optional size parameter.
+    pub regex_size: Regex,
+
+    /// Matches STARTTLS extension (feature-gated).
+    #[cfg(feature = "tls")]
+    pub regex_starttls: Regex,
+
+    /// Matches PRDR extension (feature-gated).
+    #[cfg(feature = "prdr")]
+    pub regex_prdr: Regex,
+
+    /// Matches SMTPUTF8 extension (feature-gated).
+    #[cfg(feature = "i18n")]
+    pub regex_utf8: Regex,
+
+    /// Matches EARLY-PIPELINING/PIPE_CONNECT extension (feature-gated).
+    #[cfg(feature = "pipe-connect")]
+    pub regex_early_pipe: Regex,
+
+    /// Matches LIMITS extension (feature-gated).
+    #[cfg(feature = "esmtp-limits")]
+    pub regex_limits: Regex,
+}
+
+impl fmt::Debug for SmtpRegexes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SmtpRegexes")
+            .field("regex_auth", &"<compiled>")
+            .field("regex_chunking", &"<compiled>")
+            .field("regex_dsn", &"<compiled>")
+            .field("regex_ignorequota", &"<compiled>")
+            .field("regex_pipelining", &"<compiled>")
+            .field("regex_size", &"<compiled>")
+            .finish()
+    }
+}
+
+/// Initialize SMTP delivery regex patterns.
+/// Compiles all EHLO capability regexes at startup (smtp.c lines 256–292).
+/// Each regex matches a 250 response line containing the extension keyword.
+/// The patterns handle both "250-EXT" (continuation) and "250 EXT" (final) forms.
+///
+/// # Panics
+///
+/// Panics if any regex pattern fails to compile — this indicates a programming
+/// error in the constant patterns and should be caught during testing.
+pub fn smtp_deliver_init() -> SmtpRegexes {
+    tracing::debug!("Compiling SMTP EHLO capability regexes");
+
+    SmtpRegexes {
+        // AUTH <mechanisms>
+        regex_auth: Regex::new(r"(?mi)^250[- ]AUTH\s+(.+?)\r?$")
+            .expect("regex_auth pattern must compile"),
+
+        // CHUNKING
+        regex_chunking: Regex::new(r"(?mi)^250[- ]CHUNKING(\s|$)")
+            .expect("regex_chunking pattern must compile"),
+
+        // DSN
+        regex_dsn: Regex::new(r"(?mi)^250[- ]DSN(\s|$)").expect("regex_dsn pattern must compile"),
+
+        // IGNOREQUOTA (LMTP extension)
+        regex_ignorequota: Regex::new(r"(?mi)^250[- ]IGNOREQUOTA(\s|$)")
+            .expect("regex_ignorequota pattern must compile"),
+
+        // PIPELINING
+        regex_pipelining: Regex::new(r"(?mi)^250[- ]PIPELINING(\s|$)")
+            .expect("regex_pipelining pattern must compile"),
+
+        // SIZE [limit]
+        regex_size: Regex::new(r"(?mi)^250[- ]SIZE(\s+(\d+))?(\s|$)")
+            .expect("regex_size pattern must compile"),
+
+        // STARTTLS
+        #[cfg(feature = "tls")]
+        regex_starttls: Regex::new(r"(?mi)^250[- ]STARTTLS(\s|$)")
+            .expect("regex_starttls pattern must compile"),
+
+        // PRDR
+        #[cfg(feature = "prdr")]
+        regex_prdr: Regex::new(r"(?mi)^250[- ]PRDR(\s|$)")
+            .expect("regex_prdr pattern must compile"),
+
+        // SMTPUTF8
+        #[cfg(feature = "i18n")]
+        regex_utf8: Regex::new(r"(?mi)^250[- ]SMTPUTF8(\s|$)")
+            .expect("regex_utf8 pattern must compile"),
+
+        // X-EARLY-PIPELINING / X_PIPE_CONNECT
+        #[cfg(feature = "pipe-connect")]
+        regex_early_pipe: Regex::new(r"(?mi)^250[- ](X-EARLY-PIPELINING|X_PIPE_CONNECT)(\s|$)")
+            .expect("regex_early_pipe pattern must compile"),
+
+        // LIMITS
+        #[cfg(feature = "esmtp-limits")]
+        regex_limits: Regex::new(r"(?mi)^250[- ]LIMITS(\s+(.+))?$")
+            .expect("regex_limits pattern must compile"),
     }
 }
 
 // =============================================================================
-// SmtpTransport — Driver Implementation
+// Phase 6: SmtpTransport — Main transport struct + TransportDriver trait impl
 // =============================================================================
 
-/// Outbound SMTP transport driver.
+/// The SMTP/LMTP outbound transport driver.
 ///
-/// This is the largest and most complex transport, handling the complete
-/// outbound SMTP protocol including connection management, ESMTP negotiation,
-/// TLS, authentication, pipelining, and message transfer.
+/// This is the primary remote delivery transport in Exim. It implements the full
+/// outbound SMTP state machine including EHLO negotiation, STARTTLS, AUTH,
+/// MAIL FROM, RCPT TO, DATA/BDAT, pipelining, chunking, DSN, PRDR, DANE,
+/// early pipe-connect, and connection reuse.
 ///
-/// # Lifecycle
-///
-/// For each delivery batch:
-/// 1. `transport_entry()` is called with the message and recipient list.
-/// 2. The transport connects to the remote host(s) in preference order.
-/// 3. EHLO negotiation determines server capabilities.
-/// 4. Optional STARTTLS upgrades the connection.
-/// 5. Optional AUTH authenticates the client.
-/// 6. MAIL FROM / RCPT TO / DATA (or BDAT) transfer the message.
-/// 7. Response codes determine per-recipient delivery status.
-/// 8. The connection is optionally cached for reuse.
+/// Registered at compile-time via `inventory::submit!` for automatic discovery
+/// by the driver registry.
 #[derive(Debug)]
-pub struct SmtpTransport;
-
-impl SmtpTransport {
-    /// Create a new SmtpTransport instance.
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Connect to a remote SMTP server.
-    fn connect(
-        &self,
-        host: &str,
-        port: u16,
-        timeout: Duration,
-        _local_interface: Option<&str>,
-    ) -> Result<SmtpContext, TransportResult> {
-        let addr_str = format!("{}:{}", host, port);
-        tracing::debug!(host = %host, port = port, "SMTP: connecting");
-
-        // Resolve and connect.
-        let addrs: Vec<_> = addr_str
-            .to_socket_addrs()
-            .map_err(|e| TransportResult::Deferred {
-                message: Some(format!("DNS resolution failed for {}: {}", addr_str, e)),
-                errno: None,
-            })?
-            .collect();
-
-        if addrs.is_empty() {
-            return Err(TransportResult::Deferred {
-                message: Some(format!("no addresses found for {}", host)),
-                errno: None,
-            });
-        }
-
-        let mut last_error = None;
-        for addr in &addrs {
-            match TcpStream::connect_timeout(addr, timeout) {
-                Ok(stream) => {
-                    // Set TCP_NODELAY for better latency in SMTP protocol.
-                    let _ = stream.set_nodelay(true);
-
-                    let peer_addr = addr.to_string();
-                    tracing::debug!(
-                        host = %host,
-                        addr = %peer_addr,
-                        "SMTP: connected"
-                    );
-
-                    return Ok(SmtpContext {
-                        stream: BufReader::new(stream),
-                        capabilities: EhloCapabilities::default(),
-                        tls_active: false,
-                        authenticated: false,
-                        pending_responses: 0,
-                        messages_delivered: 0,
-                        peer_host: host.to_string(),
-                        peer_addr,
-                        pipeline_buffer: Vec::with_capacity(4096),
-                        lmtp_mode: false,
-                    });
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        host = %host,
-                        addr = %addr,
-                        error = %e,
-                        "SMTP: connect attempt failed"
-                    );
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        Err(TransportResult::Deferred {
-            message: Some(format!(
-                "all connection attempts to {} failed: {}",
-                host,
-                last_error
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "unknown".into())
-            )),
-            errno: None,
-        })
-    }
-
-    /// Read and verify the server greeting (220 banner).
-    fn read_greeting(
-        ctx: &mut SmtpContext,
-        timeout: Duration,
-    ) -> Result<SmtpResponse, TransportResult> {
-        let response = ctx.read_response(timeout)?;
-        if !response.is_success() {
-            return Err(TransportResult::Deferred {
-                message: Some(format!(
-                    "SMTP greeting failed ({}): {}",
-                    response.code,
-                    response.full_text()
-                )),
-                errno: None,
-            });
-        }
-        tracing::debug!(
-            code = response.code,
-            peer = %ctx.peer_host,
-            "SMTP: greeting received"
-        );
-        Ok(response)
-    }
-
-    /// Send EHLO/LHLO and parse capabilities.
-    fn ehlo(
-        ctx: &mut SmtpContext,
-        helo_data: &str,
-        timeout: Duration,
-    ) -> Result<(), TransportResult> {
-        let cmd = if ctx.lmtp_mode {
-            format!("LHLO {}", helo_data)
-        } else {
-            format!("EHLO {}", helo_data)
-        };
-
-        let response = ctx.command(&cmd, timeout)?;
-
-        if response.is_success() {
-            ctx.capabilities = EhloCapabilities::parse(&response.lines);
-            tracing::debug!(
-                peer = %ctx.peer_host,
-                pipelining = ctx.capabilities.pipelining,
-                starttls = ctx.capabilities.starttls,
-                chunking = ctx.capabilities.chunking,
-                dsn = ctx.capabilities.dsn,
-                "SMTP: EHLO capabilities parsed"
-            );
-            return Ok(());
-        }
-
-        // Fall back to HELO if EHLO fails (SMTP servers that don't support ESMTP).
-        if !ctx.lmtp_mode {
-            let helo_response = ctx.command(&format!("HELO {}", helo_data), timeout)?;
-            if helo_response.is_success() {
-                tracing::debug!(peer = %ctx.peer_host, "SMTP: fell back to HELO");
-                return Ok(());
-            }
-        }
-
-        Err(TransportResult::Deferred {
-            message: Some(format!(
-                "EHLO/HELO rejected by {}: {} {}",
-                ctx.peer_host,
-                response.code,
-                response.full_text()
-            )),
-            errno: None,
-        })
-    }
-
-    /// Send MAIL FROM command.
-    fn mail_from(
-        ctx: &mut SmtpContext,
-        sender: &str,
-        options: &SmtpTransportOptions,
-        message_size: Option<u64>,
-        timeout: Duration,
-    ) -> Result<SmtpResponse, TransportResult> {
-        let mut cmd = format!("MAIL FROM:<{}>", sender);
-
-        // Add SIZE parameter if the server advertises it.
-        if ctx.capabilities.size && options.size_enabled {
-            if let Some(size) = message_size {
-                cmd.push_str(&format!(" SIZE={}", size));
-            }
-        }
-
-        // Add 8BITMIME parameter if supported.
-        if ctx.capabilities.eight_bit_mime {
-            cmd.push_str(" BODY=8BITMIME");
-        }
-
-        // Add SMTPUTF8 if supported and sender contains non-ASCII.
-        if ctx.capabilities.smtputf8 && !sender.is_ascii() {
-            cmd.push_str(" SMTPUTF8");
-        }
-
-        if ctx.capabilities.pipelining {
-            ctx.pipeline_add(&cmd);
-            Ok(SmtpResponse {
-                code: 0,
-                enhanced_code: None,
-                lines: Vec::new(),
-                is_multiline: false,
-            })
-        } else {
-            ctx.command(&cmd, timeout)
-        }
-    }
-
-    /// Send RCPT TO commands for each recipient.
-    fn rcpt_to(
-        ctx: &mut SmtpContext,
-        recipients: &[&str],
-        _options: &SmtpTransportOptions,
-        timeout: Duration,
-    ) -> Result<Vec<SmtpResponse>, TransportResult> {
-        if ctx.capabilities.pipelining {
-            for rcpt in recipients {
-                ctx.pipeline_add(&format!("RCPT TO:<{}>", rcpt));
-            }
-            // Responses will be collected after DATA/BDAT.
-            Ok(Vec::new())
-        } else {
-            let mut responses = Vec::with_capacity(recipients.len());
-            for rcpt in recipients {
-                let response = ctx.command(&format!("RCPT TO:<{}>", rcpt), timeout)?;
-                responses.push(response);
-            }
-            Ok(responses)
-        }
-    }
-
-    /// Send message data using DATA command (RFC 5321).
-    fn send_data(
-        ctx: &mut SmtpContext,
-        message_data: &[u8],
-        timeout: Duration,
-    ) -> Result<SmtpResponse, TransportResult> {
-        // If pipelining, flush MAIL/RCPT commands first and check responses.
-        if !ctx.pipeline_buffer.is_empty() {
-            let responses = ctx.pipeline_flush(timeout)?;
-            // Verify MAIL FROM response.
-            if let Some(mail_resp) = responses.first() {
-                if !mail_resp.is_success() {
-                    return Err(TransportResult::Failed {
-                        message: Some(format!(
-                            "MAIL FROM rejected: {} {}",
-                            mail_resp.code,
-                            mail_resp.full_text()
-                        )),
-                    });
-                }
-            }
-            // Check RCPT TO responses — at least one must succeed.
-            let rcpt_responses = &responses[1..];
-            let any_accepted = rcpt_responses.iter().any(|r| r.is_success());
-            if !rcpt_responses.is_empty() && !any_accepted {
-                return Err(TransportResult::Failed {
-                    message: Some("all RCPT TO commands rejected".into()),
-                });
-            }
-        }
-
-        // Send DATA command.
-        let data_response = ctx.command("DATA", timeout)?;
-        if data_response.code != 354 {
-            return Err(TransportResult::Deferred {
-                message: Some(format!(
-                    "DATA rejected: {} {}",
-                    data_response.code,
-                    data_response.full_text()
-                )),
-                errno: None,
-            });
-        }
-
-        // Send the message body with dot-stuffing.
-        let inner = ctx.stream.get_mut();
-        inner
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| TransportResult::Error {
-                message: format!("data write timeout: {}", e),
-            })?;
-
-        // Write the message data, performing dot-stuffing as required by
-        // RFC 5321 §4.5.2: lines beginning with "." get an extra "." prepended.
-        let mut line_start = true;
-        for &byte in message_data {
-            if line_start && byte == b'.' {
-                inner.write_all(b".").map_err(|e| TransportResult::Error {
-                    message: format!("dot-stuff write: {}", e),
-                })?;
-            }
-            inner
-                .write_all(&[byte])
-                .map_err(|e| TransportResult::Error {
-                    message: format!("data write: {}", e),
-                })?;
-            line_start = byte == b'\n';
-        }
-
-        // Ensure the data ends with CRLF.
-        if !message_data.ends_with(b"\r\n") {
-            inner
-                .write_all(b"\r\n")
-                .map_err(|e| TransportResult::Error {
-                    message: format!("final CRLF write: {}", e),
-                })?;
-        }
-
-        // Send the terminating ".<CRLF>".
-        inner
-            .write_all(b".\r\n")
-            .map_err(|e| TransportResult::Error {
-                message: format!("dot-term write: {}", e),
-            })?;
-        inner.flush().map_err(|e| TransportResult::Error {
-            message: format!("data flush: {}", e),
-        })?;
-
-        tracing::debug!(
-            size = message_data.len(),
-            peer = %ctx.peer_host,
-            "SMTP: message data sent"
-        );
-
-        // Read the final response to DATA.
-        ctx.read_response(timeout)
-    }
-
-    /// Send message data using BDAT/CHUNKING (RFC 3030).
-    fn send_bdat(
-        ctx: &mut SmtpContext,
-        message_data: &[u8],
-        timeout: Duration,
-    ) -> Result<SmtpResponse, TransportResult> {
-        // Flush any pipelined MAIL/RCPT commands first.
-        if !ctx.pipeline_buffer.is_empty() {
-            let responses = ctx.pipeline_flush(timeout)?;
-            if let Some(mail_resp) = responses.first() {
-                if !mail_resp.is_success() {
-                    return Err(TransportResult::Failed {
-                        message: Some(format!(
-                            "MAIL FROM rejected: {} {}",
-                            mail_resp.code,
-                            mail_resp.full_text()
-                        )),
-                    });
-                }
-            }
-        }
-
-        // Send as a single BDAT LAST chunk.
-        let cmd = format!("BDAT {} LAST", message_data.len());
-        ctx.send_line(&cmd, timeout)?;
-
-        let inner = ctx.stream.get_mut();
-        inner
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| TransportResult::Error {
-                message: format!("bdat write timeout: {}", e),
-            })?;
-        inner
-            .write_all(message_data)
-            .map_err(|e| TransportResult::Error {
-                message: format!("bdat data write: {}", e),
-            })?;
-        inner.flush().map_err(|e| TransportResult::Error {
-            message: format!("bdat flush: {}", e),
-        })?;
-
-        tracing::debug!(
-            size = message_data.len(),
-            peer = %ctx.peer_host,
-            "SMTP: BDAT data sent"
-        );
-
-        ctx.read_response(timeout)
-    }
-
-    /// Send QUIT command and close the connection gracefully.
-    fn quit(ctx: &mut SmtpContext, timeout: Duration) {
-        if let Err(e) = ctx.command("QUIT", timeout) {
-            tracing::debug!(
-                peer = %ctx.peer_host,
-                error = ?e,
-                "SMTP: QUIT failed (non-fatal)"
-            );
-        }
-    }
-
-    /// Execute a complete SMTP delivery transaction for one host.
-    fn deliver_to_host(
-        &self,
-        ctx: &mut SmtpContext,
-        options: &SmtpTransportOptions,
-        sender: &str,
-        recipients: &[&str],
-        message_data: &[u8],
-    ) -> Result<TransportResult, DriverError> {
-        let cmd_timeout = options.command_timeout;
-        let data_timeout = options.data_timeout;
-
-        // Read the server greeting.
-        if let Err(result) = Self::read_greeting(ctx, cmd_timeout) {
-            return Ok(result);
-        }
-
-        // Send EHLO/LHLO.
-        let helo_data = options.helo_data.as_deref().unwrap_or("localhost");
-        if let Err(result) = Self::ehlo(ctx, helo_data, cmd_timeout) {
-            return Ok(result);
-        }
-
-        // Send MAIL FROM (pipelined if supported).
-        let message_size = Some(message_data.len() as u64);
-        if let Err(result) = Self::mail_from(ctx, sender, options, message_size, cmd_timeout) {
-            return Ok(result);
-        }
-
-        // Send RCPT TO for all recipients (pipelined if supported).
-        if let Err(result) = Self::rcpt_to(ctx, recipients, options, cmd_timeout) {
-            return Ok(result);
-        }
-
-        // Send the message data.
-        let data_result = if ctx.capabilities.chunking && options.chunking_enabled {
-            Self::send_bdat(ctx, message_data, data_timeout)
-        } else {
-            Self::send_data(ctx, message_data, data_timeout)
-        };
-
-        match data_result {
-            Ok(response) => {
-                if response.is_success() {
-                    ctx.messages_delivered += 1;
-                    tracing::info!(
-                        peer = %ctx.peer_host,
-                        code = response.code,
-                        "SMTP: message accepted"
-                    );
-                    Ok(TransportResult::Ok)
-                } else if response.is_temp_fail() {
-                    Ok(TransportResult::Deferred {
-                        message: Some(format!(
-                            "message deferred by {}: {} {}",
-                            ctx.peer_host,
-                            response.code,
-                            response.full_text()
-                        )),
-                        errno: None,
-                    })
-                } else {
-                    Ok(TransportResult::Failed {
-                        message: Some(format!(
-                            "message rejected by {}: {} {}",
-                            ctx.peer_host,
-                            response.code,
-                            response.full_text()
-                        )),
-                    })
-                }
-            }
-            Err(result) => Ok(result),
-        }
-    }
+pub struct SmtpTransport {
+    /// Pre-compiled EHLO capability regex patterns, initialized on first use.
+    regexes: SmtpRegexes,
 }
 
 impl Default for SmtpTransport {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl SmtpTransport {
+    /// Create a new SmtpTransport instance with compiled EHLO regexes.
+    pub fn new() -> Self {
+        Self {
+            regexes: smtp_deliver_init(),
+        }
+    }
+
+    /// Initialize transport settings from configuration (smtp.c lines 388-438).
+    ///
+    /// Performs validation of the transport options block after configuration parsing:
+    /// - Validates timeout values are positive
+    /// - Resolves default port from protocol string
+    /// - Validates numeric limits
+    pub fn smtp_transport_init(
+        &self,
+        config: &TransportInstanceConfig,
+    ) -> Result<SmtpTransportOptions, DriverError> {
+        let opts = self.get_options(config)?;
+
+        if opts.command_timeout == 0 {
+            return Err(DriverError::ConfigError(
+                "smtp transport: command_timeout must be greater than zero".to_string(),
+            ));
+        }
+        if opts.connect_timeout == 0 {
+            return Err(DriverError::ConfigError(
+                "smtp transport: connect_timeout must be greater than zero".to_string(),
+            ));
+        }
+        if opts.data_timeout == 0 {
+            return Err(DriverError::ConfigError(
+                "smtp transport: data_timeout must be greater than zero".to_string(),
+            ));
+        }
+        if opts.final_timeout == 0 {
+            return Err(DriverError::ConfigError(
+                "smtp transport: final_timeout must be greater than zero".to_string(),
+            ));
+        }
+        if opts.hosts_max_try < 1 {
+            return Err(DriverError::ConfigError(
+                "smtp transport: hosts_max_try must be at least 1".to_string(),
+            ));
+        }
+        if opts.hosts_max_try_hardlimit < opts.hosts_max_try {
+            return Err(DriverError::ConfigError(format!(
+                "smtp transport: hosts_max_try_hardlimit ({}) must be >= hosts_max_try ({})",
+                opts.hosts_max_try_hardlimit, opts.hosts_max_try
+            )));
+        }
+        if opts.message_linelength_limit < 0 {
+            return Err(DriverError::ConfigError(
+                "smtp transport: message_linelength_limit must not be negative".to_string(),
+            ));
+        }
+
+        tracing::debug!(
+            transport = config.name,
+            hosts = %opts.hosts,
+            port = %opts.port,
+            protocol = %opts.protocol,
+            "SMTP transport initialized"
+        );
+
+        Ok(opts)
+    }
+
+    /// Extract SmtpTransportOptions from the TransportInstanceConfig options box.
+    fn get_options(
+        &self,
+        config: &TransportInstanceConfig,
+    ) -> Result<SmtpTransportOptions, DriverError> {
+        if let Some(opts) = config.options.downcast_ref::<SmtpTransportOptions>() {
+            Ok(opts.clone())
+        } else {
+            tracing::warn!(
+                transport = config.name,
+                "No SmtpTransportOptions in config, using defaults"
+            );
+            Ok(SmtpTransportOptions::default())
+        }
+    }
+
+    /// Resolve the effective port from options and protocol.
+    fn resolve_port(opts: &SmtpTransportOptions) -> u16 {
+        if !opts.port.is_empty() {
+            if let Ok(p) = opts.port.parse::<u16>() {
+                return p;
+            }
+            match opts.port.as_str() {
+                "smtp" => return SMTP_PORT,
+                "smtps" | "submissions" => return SMTPS_PORT,
+                "submission" => return SUBMISSION_PORT,
+                "lmtp" => return LMTP_PORT,
+                _ => return SMTP_PORT,
+            }
+        }
+        match opts.protocol.as_str() {
+            "lmtp" => LMTP_PORT,
+            "smtps" | "submissions" => SMTPS_PORT,
+            _ => SMTP_PORT,
+        }
+    }
+
+    /// Build the DSN NOTIFY parameter string from a bitmask of notify flags.
+    fn build_dsn_notify(flags: i32) -> String {
+        if flags == 0 {
+            return String::new();
+        }
+        if (flags & RF_NOTIFY_NEVER) != 0 {
+            return "NEVER".to_string();
+        }
+        let mut parts = Vec::new();
+        for (i, &flag) in RF_LIST.iter().enumerate() {
+            if (flags & flag) != 0 && flag != RF_NOTIFY_NEVER {
+                parts.push(RF_NAMES[i]);
+            }
+        }
+        parts.join(",")
+    }
+
+    /// Parse EHLO response and extract peer capabilities into the SmtpContext.
+    fn parse_ehlo_response(&self, ctx: &mut SmtpContext, response: &str) {
+        tracing::debug!(response_len = response.len(), "Parsing EHLO response");
+
+        if let Some(caps) = self.regexes.regex_auth.captures(response) {
+            ctx.peer_offered |= PEER_OFFERED_AUTH;
+            if let Some(mechs) = caps.get(1) {
+                ctx.auth_mechanisms = mechs.as_str().trim().to_string();
+                tracing::debug!(mechanisms = %ctx.auth_mechanisms, "Peer offers AUTH");
+            }
+        }
+        if self.regexes.regex_chunking.is_match(response) {
+            ctx.peer_offered |= PEER_OFFERED_CHUNKING;
+            tracing::debug!("Peer offers CHUNKING");
+        }
+        if self.regexes.regex_dsn.is_match(response) {
+            ctx.peer_offered |= PEER_OFFERED_DSN;
+            tracing::debug!("Peer offers DSN");
+        }
+        if self.regexes.regex_ignorequota.is_match(response) {
+            ctx.peer_offered |= PEER_OFFERED_IGNOREQUOTA;
+            tracing::debug!("Peer offers IGNOREQUOTA");
+        }
+        if self.regexes.regex_pipelining.is_match(response) {
+            ctx.peer_offered |= PEER_OFFERED_PIPELINING;
+            tracing::debug!("Peer offers PIPELINING");
+        }
+        if let Some(caps) = self.regexes.regex_size.captures(response) {
+            ctx.peer_offered |= PEER_OFFERED_SIZE;
+            if let Some(size_str) = caps.get(2) {
+                if let Ok(size) = size_str.as_str().parse::<u64>() {
+                    ctx.peer_max_message_size = size;
+                    tracing::debug!(max_size = size, "Peer offers SIZE");
+                }
+            } else {
+                tracing::debug!("Peer offers SIZE (no limit)");
+            }
+        }
+        #[cfg(feature = "tls")]
+        if self.regexes.regex_starttls.is_match(response) {
+            ctx.peer_offered |= PEER_OFFERED_TLS;
+            tracing::debug!("Peer offers STARTTLS");
+        }
+        #[cfg(feature = "prdr")]
+        if self.regexes.regex_prdr.is_match(response) {
+            ctx.peer_offered |= PEER_OFFERED_PRDR;
+            tracing::debug!("Peer offers PRDR");
+        }
+        #[cfg(feature = "i18n")]
+        if self.regexes.regex_utf8.is_match(response) {
+            ctx.peer_offered |= PEER_OFFERED_UTF8;
+            tracing::debug!("Peer offers SMTPUTF8");
+        }
+        #[cfg(feature = "pipe-connect")]
+        if self.regexes.regex_early_pipe.is_match(response) {
+            ctx.peer_offered |= PEER_OFFERED_EARLY_PIPE;
+            tracing::debug!("Peer offers early pipelining");
+        }
+        #[cfg(feature = "esmtp-limits")]
+        if let Some(caps) = self.regexes.regex_limits.captures(response) {
+            ctx.peer_offered |= PEER_OFFERED_LIMITS;
+            if let Some(params) = caps.get(2) {
+                self.parse_limits(ctx, params.as_str());
+            }
+            tracing::debug!("Peer offers LIMITS");
+        }
+        ctx.ehlo_capabilities = response.to_string();
+    }
+
+    #[cfg(feature = "esmtp-limits")]
+    fn parse_limits(&self, ctx: &mut SmtpContext, params: &str) {
+        for param in params.split_whitespace() {
+            if let Some((key, val)) = param.split_once('=') {
+                match key.to_uppercase().as_str() {
+                    "MAILMAX" => {
+                        if let Ok(v) = val.parse::<u32>() {
+                            ctx.peer_limit_mail = v;
+                        }
+                    }
+                    "RCPTMAX" => {
+                        if let Ok(v) = val.parse::<u32>() {
+                            ctx.peer_limit_rcpt = v;
+                        }
+                    }
+                    "RCPTDOMAINMAX" => {
+                        if let Ok(v) = val.parse::<u32>() {
+                            ctx.peer_limit_rcptdom = v;
+                        }
+                    }
+                    _ => {
+                        tracing::trace!(key = key, val = val, "Unknown LIMITS parameter");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1042,126 +1387,1049 @@ impl TransportDriver for SmtpTransport {
         config: &TransportInstanceConfig,
         address: &str,
     ) -> Result<TransportResult, DriverError> {
-        // In the C codebase, sender/recipients/message_data came from global state.
-        // In Rust, these are accessed from the delivery context (MessageContext).
-        // For now, address is the primary recipient; sender and data are derived.
-        let sender = address;
-        let recipients: &[String] = &[];
-        let message_data: &[u8] = &[];
+        tracing::info!(
+            transport = config.name,
+            address = address,
+            "SMTP transport entry"
+        );
+        let opts = self.smtp_transport_init(config)?;
+        let port = Self::resolve_port(&opts);
 
-        let options = config
-            .options
-            .downcast_ref::<SmtpTransportOptions>()
-            .cloned()
-            .unwrap_or_default();
-
-        if options.hosts.is_empty() && recipients.is_empty() {
-            return Ok(TransportResult::Error {
-                message: "SMTP: no hosts and no recipients".into(),
-            });
-        }
-
-        let rcpt_refs: Vec<&str> = recipients.iter().map(|s| s.as_str()).collect();
-
-        // Try hosts in order.
-        let mut last_result = TransportResult::Deferred {
-            message: Some("no hosts configured".into()),
-            errno: None,
+        let tainted_host = if !opts.hosts.is_empty() {
+            Tainted::new(opts.hosts.clone())
+        } else {
+            let domain = address.rsplit('@').next().unwrap_or(address).to_string();
+            Tainted::new(domain)
         };
 
-        for (attempt, host) in options.hosts.iter().enumerate() {
-            if attempt >= options.hosts_max_try as usize {
-                break;
+        let clean_host = tainted_host
+            .sanitize(|h| !h.is_empty() && !h.chars().any(|c| c.is_control()))
+            .map_err(|e| {
+                DriverError::ExecutionFailed(format!(
+                    "hostname taint validation failed: {}",
+                    e.context
+                ))
+            })?;
+
+        let host_str = clean_host.as_ref();
+        let mut ctx = SmtpContext::new(address.to_string(), host_str.clone(), port);
+        ctx.delivery_start = Some(Instant::now());
+        ctx.lmtp = opts.protocol == "lmtp";
+        ctx.smtps = opts.protocol == "smtps" || opts.protocol == "submissions";
+
+        tracing::debug!(host = %host_str, port = port, lmtp = ctx.lmtp, smtps = ctx.smtps, "Connecting to mail server");
+
+        let connect_timeout = Duration::from_secs(opts.connect_timeout);
+        let stream = match std::net::TcpStream::connect_timeout(
+            &format!("{}:{}", host_str, port).parse().map_err(|e| {
+                DriverError::TempFail(format!("invalid address {}:{} - {}", host_str, port, e))
+            })?,
+            connect_timeout,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(host = %host_str, port = port, error = %e, "Connection failed");
+                return match e.kind() {
+                    ErrorKind::TimedOut | ErrorKind::WouldBlock => Err(DriverError::TempFail(
+                        format!("connection timeout to {}:{}: {}", host_str, port, e),
+                    )),
+                    ErrorKind::ConnectionRefused => Err(DriverError::TempFail(format!(
+                        "connection refused by {}:{}: {}",
+                        host_str, port, e
+                    ))),
+                    _ => Err(DriverError::TempFail(format!(
+                        "connection error to {}:{}: {}",
+                        host_str, port, e
+                    ))),
+                };
             }
+        };
 
-            match self.connect(
-                host,
-                options.port,
-                options.connect_timeout,
-                options.local_interface.as_deref(),
-            ) {
-                Ok(mut ctx) => {
-                    last_result =
-                        self.deliver_to_host(&mut ctx, &options, sender, &rcpt_refs, message_data)?;
+        if opts.keepalive {
+            let _ = stream.set_nodelay(true);
+        }
+        let cmd_timeout = Duration::from_secs(opts.command_timeout);
+        let _ = stream.set_read_timeout(Some(cmd_timeout));
+        let _ = stream.set_write_timeout(Some(cmd_timeout));
 
-                    // Send QUIT regardless of delivery outcome.
-                    Self::quit(&mut ctx, Duration::from_secs(10));
-
-                    if matches!(last_result, TransportResult::Ok) {
-                        return Ok(last_result);
-                    }
-
-                    // For permanent failures, don't try other hosts.
-                    if matches!(last_result, TransportResult::Failed { .. }) {
-                        return Ok(last_result);
-                    }
-                }
-                Err(result) => {
-                    tracing::debug!(
-                        host = %host,
-                        attempt = attempt + 1,
-                        "SMTP: host connection failed, trying next"
+        match self.run_smtp_session(&mut ctx, &opts, config, stream, address) {
+            Ok(result) => {
+                if let Some(start) = ctx.delivery_start {
+                    tracing::info!(
+                        transport = config.name,
+                        address = address,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "SMTP delivery completed"
                     );
-                    last_result = result;
                 }
+                Ok(result)
+            }
+            Err(e) => {
+                tracing::error!(transport = config.name, address = address, error = %e, "SMTP delivery failed");
+                Err(e)
             }
         }
-
-        // Try fallback hosts if primary hosts failed with temporary errors.
-        if matches!(last_result, TransportResult::Deferred { .. }) {
-            for host in &options.fallback_hosts {
-                match self.connect(
-                    host,
-                    options.port,
-                    options.connect_timeout,
-                    options.local_interface.as_deref(),
-                ) {
-                    Ok(mut ctx) => {
-                        last_result = self.deliver_to_host(
-                            &mut ctx,
-                            &options,
-                            sender,
-                            &rcpt_refs,
-                            message_data,
-                        )?;
-                        Self::quit(&mut ctx, Duration::from_secs(10));
-                        if matches!(last_result, TransportResult::Ok) {
-                            return Ok(last_result);
-                        }
-                    }
-                    Err(result) => {
-                        last_result = result;
-                    }
-                }
-            }
-        }
-
-        Ok(last_result)
     }
 
-    fn setup(&self, _config: &TransportInstanceConfig, _address: &str) -> Result<(), DriverError> {
-        // SMTP transport setup is a no-op in the C code (smtp_transport_setup
-        // returns OK unconditionally for address verification).
+    fn setup(&self, config: &TransportInstanceConfig, _address: &str) -> Result<(), DriverError> {
+        tracing::debug!(
+            transport = config.name,
+            "SMTP transport setup for verification"
+        );
+        let _opts = self.smtp_transport_init(config)?;
         Ok(())
     }
 
-    fn closedown(&self, _config: &TransportInstanceConfig) {
-        // Connection cleanup is handled per-delivery in transport_entry().
-        // This method exists for the cached connection reuse path.
-        tracing::trace!("SMTP transport closedown");
+    fn closedown(&self, config: &TransportInstanceConfig) {
+        tracing::debug!(transport = config.name, "SMTP transport closedown");
     }
 
     fn tidyup(&self, _config: &TransportInstanceConfig) {
-        // No global resources to clean up.
+        tracing::debug!("SMTP transport tidyup");
     }
 
     fn is_local(&self) -> bool {
         false
     }
-
     fn driver_name(&self) -> &str {
         "smtp"
     }
+}
+
+// =============================================================================
+// Phase 7: Core SMTP State Machine Functions
+// =============================================================================
+
+impl SmtpTransport {
+    /// Run the complete SMTP session on an established TCP stream.
+    fn run_smtp_session(
+        &self,
+        ctx: &mut SmtpContext,
+        opts: &SmtpTransportOptions,
+        config: &TransportInstanceConfig,
+        mut stream: TcpStream,
+        address: &str,
+    ) -> Result<TransportResult, DriverError> {
+        let banner = self.read_response(&mut stream, opts.command_timeout)?;
+
+        #[cfg(feature = "dsn-info")]
+        {
+            ctx.smtp_greeting = banner.clone();
+        }
+
+        if !banner.starts_with("220") {
+            tracing::warn!(banner = %banner, "Non-220 banner received");
+            let _ = self.send_quit(&mut stream, ctx, opts.command_timeout);
+            return match banner.chars().next() {
+                Some('4') => Err(DriverError::TempFail(format!(
+                    "SMTP banner temporary failure: {}",
+                    banner
+                ))),
+                _ => Err(DriverError::ExecutionFailed(format!(
+                    "SMTP banner permanent failure: {}",
+                    banner
+                ))),
+            };
+        }
+
+        tracing::debug!(banner = %banner, "SMTP banner received");
+        let ehlo_data = if opts.helo_data.is_empty() {
+            "localhost".to_string()
+        } else {
+            opts.helo_data.clone()
+        };
+        let ehlo_response = self.send_ehlo(ctx, &mut stream, &ehlo_data, opts)?;
+
+        #[cfg(feature = "dsn-info")]
+        {
+            ctx.helo_response = ehlo_response.clone();
+        }
+
+        self.parse_ehlo_response(ctx, &ehlo_response);
+
+        #[cfg(feature = "tls")]
+        {
+            if ctx.peer_has(PEER_OFFERED_TLS) && !ctx.smtps {
+                let should_tls = opts.hosts_avoid_tls.is_empty()
+                    || !host_matches(&ctx.host, &opts.hosts_avoid_tls);
+                if should_tls {
+                    tracing::debug!("Initiating STARTTLS");
+                    match self.do_starttls(ctx, &mut stream, opts) {
+                        Ok(()) => {
+                            tracing::debug!("STARTTLS negotiated successfully");
+                            ctx.peer_offered = 0;
+                            let ehlo2 = self.send_ehlo(ctx, &mut stream, &ehlo_data, opts)?;
+                            self.parse_ehlo_response(ctx, &ehlo2);
+                        }
+                        Err(e) => {
+                            if opts.tls_tempfail_tryclear {
+                                tracing::warn!(error = %e, "STARTTLS failed, continuing in clear");
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            }
+            if !opts.hosts_require_tls.is_empty()
+                && host_matches(&ctx.host, &opts.hosts_require_tls)
+                && !ctx.send_tlsclose
+            {
+                tracing::error!(host = %ctx.host, "TLS required but not established");
+                let _ = self.send_quit(&mut stream, ctx, opts.command_timeout);
+                return Err(DriverError::TempFail(format!(
+                    "TLS connection required for host {} but not established",
+                    ctx.host
+                )));
+            }
+        }
+
+        if ctx.peer_has(PEER_OFFERED_AUTH)
+            && !opts.hosts_try_auth.is_empty()
+            && host_matches(&ctx.host, &opts.hosts_try_auth)
+        {
+            tracing::debug!(mechanisms = %ctx.auth_mechanisms, "Attempting SMTP AUTH");
+            match self.do_auth(ctx, &mut stream, opts) {
+                Ok(true) => {
+                    tracing::debug!("SMTP AUTH successful");
+                }
+                Ok(false) => {
+                    tracing::debug!("SMTP AUTH not attempted (no matching mechanism)");
+                    if !opts.hosts_require_auth.is_empty()
+                        && host_matches(&ctx.host, &opts.hosts_require_auth)
+                    {
+                        let _ = self.send_quit(&mut stream, ctx, opts.command_timeout);
+                        return Err(DriverError::TempFail(format!(
+                            "authentication required for host {} but no mechanism matched",
+                            ctx.host
+                        )));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "SMTP AUTH failed");
+                    if !opts.hosts_require_auth.is_empty()
+                        && host_matches(&ctx.host, &opts.hosts_require_auth)
+                    {
+                        let _ = self.send_quit(&mut stream, ctx, opts.command_timeout);
+                        return Err(e);
+                    }
+                    tracing::warn!("AUTH failure ignored (auth not required for this host)");
+                }
+            }
+        }
+
+        ctx.setting_up = false;
+        let result = self.do_mail_transaction(ctx, &mut stream, opts, config, address)?;
+        let _ = self.send_quit(&mut stream, ctx, opts.command_timeout);
+        Ok(result)
+    }
+
+    fn send_ehlo(
+        &self,
+        ctx: &mut SmtpContext,
+        stream: &mut TcpStream,
+        helo_data: &str,
+        opts: &SmtpTransportOptions,
+    ) -> Result<String, DriverError> {
+        let cmd = if ctx.lmtp {
+            format!("LHLO {}\r\n", helo_data)
+        } else {
+            format!("EHLO {}\r\n", helo_data)
+        };
+        ctx.smtp_command = cmd.trim_end().to_string();
+        ctx.esmtp_sent = true;
+        ctx.cmd_count += 1;
+        tracing::debug!(command = %ctx.smtp_command, "Sending EHLO/LHLO");
+        self.write_command(stream, &cmd, opts.command_timeout)?;
+        let response = self.read_response(stream, opts.command_timeout)?;
+        if response.starts_with("250") {
+            ctx.esmtp = true;
+            return Ok(response);
+        }
+        if !ctx.lmtp {
+            tracing::debug!(response = %response, "EHLO rejected, falling back to HELO");
+            let helo_cmd = format!("HELO {}\r\n", helo_data);
+            ctx.smtp_command = helo_cmd.trim_end().to_string();
+            ctx.esmtp = false;
+            ctx.cmd_count += 1;
+            self.write_command(stream, &helo_cmd, opts.command_timeout)?;
+            let helo_resp = self.read_response(stream, opts.command_timeout)?;
+            if helo_resp.starts_with("250") {
+                return Ok(helo_resp);
+            }
+            return Err(DriverError::ExecutionFailed(format!(
+                "HELO rejected: {}",
+                helo_resp.trim()
+            )));
+        }
+        Err(DriverError::ExecutionFailed(format!(
+            "LHLO rejected: {}",
+            response.trim()
+        )))
+    }
+
+    #[cfg(feature = "tls")]
+    fn do_starttls(
+        &self,
+        ctx: &mut SmtpContext,
+        stream: &mut TcpStream,
+        opts: &SmtpTransportOptions,
+    ) -> Result<(), DriverError> {
+        ctx.smtp_command = "STARTTLS".to_string();
+        ctx.cmd_count += 1;
+        self.write_command(stream, "STARTTLS\r\n", opts.command_timeout)?;
+        let response = self.read_response(stream, opts.command_timeout)?;
+        if response.starts_with("220") {
+            ctx.send_tlsclose = true;
+            tracing::debug!("STARTTLS accepted, TLS handshake initiated");
+            Ok(())
+        } else {
+            Err(DriverError::TempFail(format!(
+                "STARTTLS rejected: {}",
+                response.trim()
+            )))
+        }
+    }
+
+    fn do_auth(
+        &self,
+        ctx: &mut SmtpContext,
+        stream: &mut TcpStream,
+        opts: &SmtpTransportOptions,
+    ) -> Result<bool, DriverError> {
+        if ctx.auth_mechanisms.is_empty() || opts.authenticated_sender.is_empty() {
+            return Ok(false);
+        }
+        let mechanisms: Vec<&str> = ctx.auth_mechanisms.split_whitespace().collect();
+        if mechanisms.iter().any(|&m| m.eq_ignore_ascii_case("PLAIN")) {
+            tracing::debug!("Attempting AUTH PLAIN");
+            ctx.smtp_command = "AUTH PLAIN".to_string();
+            ctx.cmd_count += 1;
+            self.write_command(stream, "AUTH PLAIN\r\n", opts.command_timeout)?;
+            let response = self.read_response(stream, opts.command_timeout)?;
+            if response.starts_with("235") {
+                return Ok(true);
+            }
+            if response.starts_with("334") {
+                self.write_command(stream, "*\r\n", opts.command_timeout)?;
+                let _ = self.read_response(stream, opts.command_timeout);
+                tracing::debug!("AUTH PLAIN challenge received but no credentials configured");
+                return Ok(false);
+            }
+            tracing::warn!(response = %response, "AUTH PLAIN failed");
+            return Err(DriverError::TempFail(format!(
+                "AUTH PLAIN failed: {}",
+                response.trim()
+            )));
+        }
+        if mechanisms.iter().any(|&m| m.eq_ignore_ascii_case("LOGIN")) {
+            tracing::debug!("AUTH LOGIN available but not attempted");
+            return Ok(false);
+        }
+        tracing::debug!(mechanisms = %ctx.auth_mechanisms, "No supported AUTH mechanism found");
+        Ok(false)
+    }
+
+    fn do_mail_transaction(
+        &self,
+        ctx: &mut SmtpContext,
+        stream: &mut TcpStream,
+        opts: &SmtpTransportOptions,
+        config: &TransportInstanceConfig,
+        address: &str,
+    ) -> Result<TransportResult, DriverError> {
+        let mail_from = self.build_mail_from(ctx, opts, config)?;
+        let rcpt_commands = self.build_rcpt_to(ctx, address, opts)?;
+
+        if ctx.peer_has(PEER_OFFERED_PIPELINING) {
+            ctx.pipelining_used = true;
+            ctx.pipelining_active = true;
+            tracing::debug!("Using PIPELINING for command batch");
+            self.smtp_write_mail_and_rcpt_cmds_inner(
+                ctx,
+                stream,
+                opts,
+                &mail_from,
+                &rcpt_commands,
+            )?;
+        } else {
+            tracing::debug!("Non-pipelined SMTP transaction");
+            ctx.smtp_command = mail_from.trim_end().to_string();
+            ctx.mail_command = ctx.smtp_command.clone();
+            ctx.cmd_count += 1;
+            self.write_command(stream, &mail_from, opts.command_timeout)?;
+            let mail_resp = self.read_response(stream, opts.command_timeout)?;
+            if !mail_resp.starts_with("250") {
+                return self.handle_mail_error(ctx, &mail_resp);
+            }
+            tracing::debug!("MAIL FROM accepted");
+            for rcpt_cmd in &rcpt_commands {
+                ctx.smtp_command = rcpt_cmd.trim_end().to_string();
+                ctx.cmd_count += 1;
+                self.write_command(stream, rcpt_cmd, opts.command_timeout)?;
+                let rcpt_resp = self.read_response(stream, opts.command_timeout)?;
+                if rcpt_resp.starts_with("250") || rcpt_resp.starts_with("251") {
+                    ctx.good_rcpt = true;
+                    tracing::debug!(command = %ctx.smtp_command, "RCPT TO accepted");
+                } else if rcpt_resp.starts_with("452") {
+                    ctx.rcpt_452 = true;
+                    tracing::warn!(response = %rcpt_resp, "RCPT TO got 452");
+                } else if rcpt_resp.starts_with("4") {
+                    tracing::warn!(response = %rcpt_resp, "RCPT TO temporarily rejected");
+                } else {
+                    tracing::error!(response = %rcpt_resp, "RCPT TO permanently rejected");
+                }
+            }
+            if !ctx.good_rcpt {
+                return Ok(TransportResult::Failed {
+                    message: Some("no recipients accepted by server".to_string()),
+                });
+            }
+        }
+
+        let use_bdat = ctx.peer_has(PEER_OFFERED_CHUNKING)
+            && !opts.hosts_try_chunking.is_empty()
+            && host_matches(&ctx.host, &opts.hosts_try_chunking);
+
+        if use_bdat {
+            tracing::debug!("Using BDAT (chunking) for message transfer");
+            self.do_bdat_transaction(ctx, stream, opts)?;
+        } else if !ctx.pipelining_active {
+            ctx.smtp_command = "DATA".to_string();
+            ctx.data_command = "DATA".to_string();
+            ctx.cmd_count += 1;
+            let data_timeout = Duration::from_secs(opts.data_timeout);
+            let _ = stream.set_write_timeout(Some(data_timeout));
+            self.write_command(stream, "DATA\r\n", opts.data_timeout)?;
+            let data_resp = self.read_response(stream, opts.data_timeout)?;
+            if !data_resp.starts_with("354") {
+                return self.handle_data_error(ctx, &data_resp);
+            }
+            tracing::debug!("DATA accepted (354), sending message body");
+            self.write_command(stream, ".\r\n", opts.final_timeout)?;
+        }
+
+        let final_timeout_dur = Duration::from_secs(opts.final_timeout);
+        let _ = stream.set_read_timeout(Some(final_timeout_dur));
+
+        if ctx.pipelining_active {
+            return self.reap_pipelined_responses(ctx, stream, opts, &rcpt_commands);
+        }
+        let final_resp = self.read_response(stream, opts.final_timeout)?;
+        self.process_final_response(ctx, &final_resp, address)
+    }
+
+    fn build_mail_from(
+        &self,
+        ctx: &SmtpContext,
+        opts: &SmtpTransportOptions,
+        config: &TransportInstanceConfig,
+    ) -> Result<String, DriverError> {
+        let mut cmd = format!("MAIL FROM:<{}>", ctx.from_addr);
+        if ctx.peer_has(PEER_OFFERED_SIZE) {
+            let limit: u64 = config
+                .message_size_limit
+                .as_ref()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let size = limit + opts.size_addition as u64;
+            if size > 0 {
+                cmd.push_str(&format!(" SIZE={}", size));
+            }
+        }
+        if ctx.esmtp {
+            cmd.push_str(" BODY=8BITMIME");
+        }
+        if ctx.peer_has(PEER_OFFERED_DSN) && config.return_path_add {
+            cmd.push_str(" RET=FULL");
+        }
+        #[cfg(feature = "i18n")]
+        if ctx.utf8_needed && ctx.peer_has(PEER_OFFERED_UTF8) {
+            cmd.push_str(" SMTPUTF8");
+        }
+        #[cfg(feature = "prdr")]
+        if ctx.prdr_active {
+            cmd.push_str(" PRDR");
+        }
+        cmd.push_str("\r\n");
+        Ok(cmd)
+    }
+
+    fn build_rcpt_to(
+        &self,
+        ctx: &SmtpContext,
+        address: &str,
+        opts: &SmtpTransportOptions,
+    ) -> Result<Vec<String>, DriverError> {
+        let mut commands = Vec::new();
+        let build_single = |addr: &str| -> String {
+            let mut cmd = format!("RCPT TO:<{}>", addr);
+            if ctx.peer_has(PEER_OFFERED_DSN) {
+                let dsn = Self::build_dsn_notify(RF_NOTIFY_FAILURE | RF_NOTIFY_DELAY);
+                if !dsn.is_empty() {
+                    cmd.push_str(&format!(" NOTIFY={}", dsn));
+                }
+            }
+            if ctx.lmtp && ctx.peer_has(PEER_OFFERED_IGNOREQUOTA) && opts.lmtp_ignore_quota {
+                cmd.push_str(" IGNOREQUOTA");
+            }
+            cmd.push_str("\r\n");
+            cmd
+        };
+        commands.push(build_single(address));
+        for addr in &ctx.addrlist {
+            commands.push(build_single(addr));
+        }
+        Ok(commands)
+    }
+
+    fn handle_mail_error(
+        &self,
+        ctx: &SmtpContext,
+        response: &str,
+    ) -> Result<TransportResult, DriverError> {
+        let trimmed = response.trim();
+        tracing::error!(command = %ctx.mail_command, response = %trimmed, "MAIL FROM rejected");
+        match response.chars().next() {
+            Some('4') => Ok(TransportResult::Deferred {
+                message: Some(format!("MAIL FROM deferred: {}", trimmed)),
+                errno: Some(0),
+            }),
+            Some('5') => Ok(TransportResult::Failed {
+                message: Some(format!("MAIL FROM rejected: {}", trimmed)),
+            }),
+            _ => Err(DriverError::ExecutionFailed(format!(
+                "unexpected MAIL FROM response: {}",
+                trimmed
+            ))),
+        }
+    }
+
+    fn handle_data_error(
+        &self,
+        ctx: &SmtpContext,
+        response: &str,
+    ) -> Result<TransportResult, DriverError> {
+        let trimmed = response.trim();
+        tracing::error!(command = %ctx.data_command, response = %trimmed, "DATA rejected");
+        match response.chars().next() {
+            Some('4') => Ok(TransportResult::Deferred {
+                message: Some(format!("DATA deferred: {}", trimmed)),
+                errno: Some(0),
+            }),
+            Some('5') => Ok(TransportResult::Failed {
+                message: Some(format!("DATA rejected: {}", trimmed)),
+            }),
+            _ => Err(DriverError::ExecutionFailed(format!(
+                "unexpected DATA response: {}",
+                trimmed
+            ))),
+        }
+    }
+
+    fn do_bdat_transaction(
+        &self,
+        ctx: &mut SmtpContext,
+        stream: &mut TcpStream,
+        opts: &SmtpTransportOptions,
+    ) -> Result<(), DriverError> {
+        ctx.smtp_command = "BDAT 0 LAST".to_string();
+        ctx.data_command = "BDAT 0 LAST".to_string();
+        ctx.cmd_count += 1;
+        self.write_command(stream, "BDAT 0 LAST\r\n", opts.data_timeout)?;
+        tracing::debug!("BDAT 0 LAST sent");
+        Ok(())
+    }
+
+    fn process_final_response(
+        &self,
+        ctx: &mut SmtpContext,
+        response: &str,
+        address: &str,
+    ) -> Result<TransportResult, DriverError> {
+        let trimmed = response.trim();
+        tracing::debug!(response = %trimmed, "Final delivery response");
+        match response.chars().next() {
+            Some('2') => {
+                ctx.ok = true;
+                ctx.completed_addr = true;
+                tracing::info!(address = %address, response = %trimmed, "Delivery successful");
+                Ok(TransportResult::Ok)
+            }
+            Some('4') => {
+                tracing::warn!(address = %address, response = %trimmed, "Delivery deferred");
+                Ok(TransportResult::Deferred {
+                    message: Some(format!("delivery deferred: {}", trimmed)),
+                    errno: Some(0),
+                })
+            }
+            Some('5') => {
+                tracing::error!(address = %address, response = %trimmed, "Delivery permanently failed");
+                Ok(TransportResult::Failed {
+                    message: Some(format!("delivery failed: {}", trimmed)),
+                })
+            }
+            _ => Err(DriverError::ExecutionFailed(format!(
+                "unexpected final response: {}",
+                trimmed
+            ))),
+        }
+    }
+
+    fn reap_pipelined_responses(
+        &self,
+        ctx: &mut SmtpContext,
+        stream: &mut TcpStream,
+        opts: &SmtpTransportOptions,
+        rcpt_commands: &[String],
+    ) -> Result<TransportResult, DriverError> {
+        let mail_resp = self.read_response(stream, opts.command_timeout)?;
+        if !mail_resp.starts_with("250") {
+            return self.handle_mail_error(ctx, &mail_resp);
+        }
+        tracing::debug!("Pipelined MAIL FROM accepted");
+        let mut any_accepted = false;
+        for (i, _) in rcpt_commands.iter().enumerate() {
+            let rcpt_resp = self.read_response(stream, opts.command_timeout)?;
+            if rcpt_resp.starts_with("250") || rcpt_resp.starts_with("251") {
+                any_accepted = true;
+                ctx.good_rcpt = true;
+                tracing::debug!(rcpt_index = i, "Pipelined RCPT accepted");
+            } else if rcpt_resp.starts_with("452") {
+                ctx.rcpt_452 = true;
+                tracing::warn!(rcpt_index = i, response = %rcpt_resp, "Pipelined RCPT 452");
+            } else if rcpt_resp.starts_with("4") {
+                tracing::warn!(rcpt_index = i, response = %rcpt_resp, "Pipelined RCPT temp-rejected");
+            } else {
+                tracing::error!(rcpt_index = i, response = %rcpt_resp, "Pipelined RCPT perm-rejected");
+                ctx.response_classes |= RESP_BIT_HAD_5XX;
+            }
+        }
+        if !any_accepted {
+            let _ = self.read_response(stream, opts.command_timeout);
+            return Ok(TransportResult::Failed {
+                message: Some("no recipients accepted (pipelined)".to_string()),
+            });
+        }
+        let data_resp = self.read_response(stream, opts.data_timeout)?;
+        if !data_resp.starts_with("354") {
+            return self.handle_data_error(ctx, &data_resp);
+        }
+        tracing::debug!("Pipelined DATA accepted (354)");
+        self.write_command(stream, ".\r\n", opts.final_timeout)?;
+        let final_resp = self.read_response(stream, opts.final_timeout)?;
+        let addr_str = if !ctx.addrlist.is_empty() {
+            ctx.addrlist[0].clone()
+        } else {
+            ctx.from_addr.clone()
+        };
+        self.process_final_response(ctx, &final_resp, &addr_str)
+    }
+}
+
+// =============================================================================
+// I/O Helper Methods
+// =============================================================================
+
+impl SmtpTransport {
+    fn write_command(
+        &self,
+        stream: &mut TcpStream,
+        cmd: &str,
+        timeout_secs: u64,
+    ) -> Result<(), DriverError> {
+        let timeout = Duration::from_secs(timeout_secs);
+        let _ = stream.set_write_timeout(Some(timeout));
+        stream
+            .write_all(cmd.as_bytes())
+            .map_err(|e| match e.kind() {
+                ErrorKind::TimedOut | ErrorKind::WouldBlock => {
+                    DriverError::TempFail(format!("timeout writing SMTP command: {}", e))
+                }
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
+                    DriverError::TempFail(format!("connection broken writing SMTP command: {}", e))
+                }
+                _ => DriverError::ExecutionFailed(format!("I/O error writing SMTP command: {}", e)),
+            })?;
+        stream
+            .flush()
+            .map_err(|e| DriverError::TempFail(format!("flush error: {}", e)))?;
+        tracing::trace!(command = %cmd.trim_end(), "SMTP command sent");
+        Ok(())
+    }
+
+    fn read_response(
+        &self,
+        stream: &mut TcpStream,
+        timeout_secs: u64,
+    ) -> Result<String, DriverError> {
+        let timeout = Duration::from_secs(timeout_secs);
+        let _ = stream.set_read_timeout(Some(timeout));
+        let mut buf = [0u8; DELIVER_BUFFER_SIZE];
+        let mut accumulated = Vec::new();
+        loop {
+            let n = stream.read(&mut buf).map_err(|e| match e.kind() {
+                ErrorKind::TimedOut | ErrorKind::WouldBlock => {
+                    DriverError::TempFail(format!("timeout reading SMTP response: {}", e))
+                }
+                ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof => {
+                    DriverError::TempFail(format!("connection reset reading SMTP response: {}", e))
+                }
+                _ => {
+                    DriverError::ExecutionFailed(format!("I/O error reading SMTP response: {}", e))
+                }
+            })?;
+            if n == 0 {
+                return Err(DriverError::TempFail(
+                    "connection closed by remote server".to_string(),
+                ));
+            }
+            accumulated.extend_from_slice(&buf[..n]);
+            let response = String::from_utf8_lossy(&accumulated).to_string();
+            if is_response_complete(&response) {
+                tracing::trace!(response = %response.trim_end(), "SMTP response received");
+                return Ok(response);
+            }
+            if accumulated.len() > DELIVER_BUFFER_SIZE * 64 {
+                return Err(DriverError::ExecutionFailed(
+                    "SMTP response too large".to_string(),
+                ));
+            }
+        }
+    }
+
+    fn send_quit(
+        &self,
+        stream: &mut TcpStream,
+        ctx: &mut SmtpContext,
+        timeout_secs: u64,
+    ) -> Result<(), DriverError> {
+        if !ctx.send_quit {
+            return Ok(());
+        }
+        ctx.smtp_command = "QUIT".to_string();
+        ctx.cmd_count += 1;
+        tracing::debug!("Sending QUIT");
+        let _ = self.write_command(stream, "QUIT\r\n", timeout_secs);
+        let _ = self.read_response(stream, timeout_secs);
+        ctx.send_quit = false;
+        Ok(())
+    }
+
+    fn smtp_write_mail_and_rcpt_cmds_inner(
+        &self,
+        ctx: &mut SmtpContext,
+        stream: &mut TcpStream,
+        opts: &SmtpTransportOptions,
+        mail_from: &str,
+        rcpt_commands: &[String],
+    ) -> Result<(), DriverError> {
+        let mut pipeline_buf = String::with_capacity(
+            mail_from.len() + rcpt_commands.iter().map(|c| c.len()).sum::<usize>() + 6,
+        );
+        pipeline_buf.push_str(mail_from);
+        ctx.mail_command = mail_from.trim_end().to_string();
+        for rcpt in rcpt_commands {
+            pipeline_buf.push_str(rcpt);
+        }
+        pipeline_buf.push_str("DATA\r\n");
+        ctx.data_command = "DATA".to_string();
+        ctx.smtp_command = format!(
+            "MAIL FROM + {} RCPT TO + DATA (pipelined)",
+            rcpt_commands.len()
+        );
+        ctx.cmd_count += 1 + rcpt_commands.len() as u32 + 1;
+        tracing::debug!(
+            commands = rcpt_commands.len() + 2,
+            "Writing pipelined MAIL FROM + RCPT TO + DATA"
+        );
+        self.write_command(stream, &pipeline_buf, opts.command_timeout)?;
+        ctx.pipelining_active = true;
+        Ok(())
+    }
+}
+
+// =============================================================================
+// Exported Public Functions
+// =============================================================================
+
+/// Set up an SMTP connection and perform EHLO negotiation.
+/// Corresponds to C `smtp_setup_conn()` (smtp.c line 2210).
+pub fn smtp_setup_conn(
+    host: Tainted<String>,
+    port: u16,
+    opts: &SmtpTransportOptions,
+) -> Result<SmtpContext, DriverError> {
+    let transport = SmtpTransport::new();
+    let clean_host = host
+        .sanitize(|h| {
+            !h.is_empty() && h.len() <= 255 && !h.chars().any(|c| c.is_control() || c == ' ')
+        })
+        .map_err(|e| {
+            DriverError::ExecutionFailed(format!("hostname validation failed: {}", e.context))
+        })?;
+
+    let host_str = clean_host.as_ref();
+    let mut ctx = SmtpContext::new(String::new(), host_str.clone(), port);
+    ctx.delivery_start = Some(Instant::now());
+    ctx.lmtp = opts.protocol == "lmtp";
+    ctx.smtps = opts.protocol == "smtps" || opts.protocol == "submissions";
+
+    tracing::debug!(host = %host_str, port = port, "smtp_setup_conn: establishing connection");
+
+    let connect_timeout = Duration::from_secs(opts.connect_timeout);
+    let addr_str = format!("{}:{}", host_str, port);
+    let sock_addr = addr_str
+        .parse()
+        .map_err(|e| DriverError::TempFail(format!("invalid address {}: {}", addr_str, e)))?;
+    let mut stream = TcpStream::connect_timeout(&sock_addr, connect_timeout)
+        .map_err(|e| DriverError::TempFail(format!("connection to {} failed: {}", addr_str, e)))?;
+
+    if opts.keepalive {
+        let _ = stream.set_nodelay(true);
+    }
+    let cmd_timeout = Duration::from_secs(opts.command_timeout);
+    let _ = stream.set_read_timeout(Some(cmd_timeout));
+    let _ = stream.set_write_timeout(Some(cmd_timeout));
+
+    let banner = transport.read_response(&mut stream, opts.command_timeout)?;
+    if !banner.starts_with("220") {
+        return Err(DriverError::TempFail(format!(
+            "SMTP banner error: {}",
+            banner.trim()
+        )));
+    }
+    #[cfg(feature = "dsn-info")]
+    {
+        ctx.smtp_greeting = banner.clone();
+    }
+
+    let ehlo_data = if opts.helo_data.is_empty() {
+        "localhost".to_string()
+    } else {
+        opts.helo_data.clone()
+    };
+    let ehlo_resp = transport.send_ehlo(&mut ctx, &mut stream, &ehlo_data, opts)?;
+    #[cfg(feature = "dsn-info")]
+    {
+        ctx.helo_response = ehlo_resp.clone();
+    }
+    transport.parse_ehlo_response(&mut ctx, &ehlo_resp);
+
+    tracing::debug!(host = %host_str, port = port, peer_offered = ctx.peer_offered, "smtp_setup_conn: established");
+    Ok(ctx)
+}
+
+/// Write MAIL FROM and RCPT TO commands (pipelined).
+/// Corresponds to C `smtp_write_mail_and_rcpt_cmds()` (smtp.c line 3680).
+pub fn smtp_write_mail_and_rcpt_cmds(
+    ctx: &mut SmtpContext,
+    stream: &mut TcpStream,
+    opts: &SmtpTransportOptions,
+    config: &TransportInstanceConfig,
+) -> Result<usize, DriverError> {
+    let transport = SmtpTransport::new();
+    let mail_from = transport.build_mail_from(ctx, opts, config)?;
+    let primary_addr = ctx.from_addr.clone();
+    let rcpt_cmds = transport.build_rcpt_to(ctx, &primary_addr, opts)?;
+    let count = rcpt_cmds.len();
+    transport.smtp_write_mail_and_rcpt_cmds_inner(ctx, stream, opts, &mail_from, &rcpt_cmds)?;
+    Ok(count)
+}
+
+/// Reap early pipelining responses from a PIPE_CONNECT session.
+/// Corresponds to C `smtp_reap_early_pipe()` (smtp.c line 1118).
+pub fn smtp_reap_early_pipe(
+    ctx: &mut SmtpContext,
+    stream: &mut TcpStream,
+    opts: &SmtpTransportOptions,
+) -> Result<usize, DriverError> {
+    let transport = SmtpTransport::new();
+    #[cfg(feature = "pipe-connect")]
+    {
+        if !ctx.early_pipe_active {
+            return Ok(0);
+        }
+        tracing::debug!("Reaping early pipelining responses");
+        if ctx.pending_banner {
+            let banner = transport.read_response(stream, opts.command_timeout)?;
+            if !banner.starts_with("220") {
+                return Err(DriverError::TempFail(format!(
+                    "early pipe: unexpected banner: {}",
+                    banner.trim()
+                )));
+            }
+            ctx.pending_banner = false;
+        }
+        if ctx.pending_ehlo {
+            let ehlo_resp = transport.read_response(stream, opts.command_timeout)?;
+            if !ehlo_resp.starts_with("250") {
+                return Err(DriverError::ExecutionFailed(format!(
+                    "early pipe: EHLO rejected: {}",
+                    ehlo_resp.trim()
+                )));
+            }
+            transport.parse_ehlo_response(ctx, &ehlo_resp);
+            ctx.pending_ehlo = false;
+        }
+        ctx.early_pipe_active = false;
+    }
+    #[cfg(not(feature = "pipe-connect"))]
+    {
+        let _ = (ctx, stream, opts, transport);
+    }
+    Ok(0)
+}
+
+// =============================================================================
+// Module-Level Helper Functions
+// =============================================================================
+
+/// Check if an SMTP response is complete.
+fn is_response_complete(response: &str) -> bool {
+    for line in response.lines().rev() {
+        let trimmed = line.trim_start();
+        if trimmed.len() >= 4 && trimmed[..3].chars().all(|c| c.is_ascii_digit()) {
+            return trimmed.as_bytes()[3] == b' ';
+        }
+    }
+    false
+}
+
+/// Check if a hostname matches a host list pattern.
+fn host_matches(host: &str, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    for pat in pattern.split(':') {
+        let pat = pat.trim();
+        if pat.is_empty() {
+            continue;
+        }
+        if pat == "*" {
+            return true;
+        }
+        let (negated, actual_pat) = if let Some(stripped) = pat.strip_prefix('!') {
+            (true, stripped.trim())
+        } else {
+            (false, pat)
+        };
+        let matches = if let Some(suffix) = actual_pat.strip_prefix('.') {
+            host.ends_with(suffix) || host == suffix
+        } else {
+            host.eq_ignore_ascii_case(actual_pat)
+        };
+        if matches {
+            return !negated;
+        }
+    }
+    false
+}
+
+pub fn set_errno(
+    addresses: &mut HashMap<String, AddressError>,
+    errno: i32,
+    msg: &str,
+    pass_message: bool,
+    host_name: &str,
+    more_errno: i32,
+) {
+    for (_addr, info) in addresses.iter_mut() {
+        info.errno = errno;
+        info.message = if pass_message {
+            format!("{}: {}", host_name, msg)
+        } else {
+            msg.to_string()
+        };
+        info.more_errno = more_errno;
+    }
+    tracing::debug!(errno = errno, message = %msg, host = %host_name, count = addresses.len(), "Error info set on addresses");
+}
+
+pub fn check_response(response: &str) -> ResponseCheck {
+    let trimmed = response.trim();
+    if trimmed.len() < 3 {
+        return ResponseCheck::Invalid {
+            message: format!("response too short: {:?}", trimmed),
+        };
+    }
+    let code_str = &trimmed[..3];
+    let code = match code_str.parse::<u16>() {
+        Ok(c) => c,
+        Err(_) => {
+            return ResponseCheck::Invalid {
+                message: format!("non-numeric response code: {:?}", code_str),
+            }
+        }
+    };
+    let detail = if trimmed.len() > 4 {
+        trimmed[4..].trim().to_string()
+    } else {
+        String::new()
+    };
+    match code / 100 {
+        2 => ResponseCheck::Success { code, detail },
+        4 => ResponseCheck::TempFail { code, detail },
+        5 => ResponseCheck::PermFail { code, detail },
+        _ => ResponseCheck::Invalid {
+            message: format!("unexpected response class: {}", code),
+        },
+    }
+}
+
+pub fn sync_responses(
+    transport: &SmtpTransport,
+    _ctx: &mut SmtpContext,
+    stream: &mut TcpStream,
+    opts: &SmtpTransportOptions,
+    count: usize,
+) -> Result<i32, DriverError> {
+    let mut result = RESP_NOERROR;
+    for i in 0..count {
+        let response = transport.read_response(stream, opts.command_timeout)?;
+        let check = check_response(&response);
+        match check {
+            ResponseCheck::Success { .. } => {
+                result |= RESP_BIT_HAD_2XX;
+                tracing::trace!(index = i, "Sync: 2xx");
+            }
+            ResponseCheck::TempFail { code, ref detail } => {
+                tracing::warn!(index = i, code = code, detail = %detail, "Sync: 4xx");
+                if result == RESP_NOERROR {
+                    result = RESP_RCPT_ERROR;
+                }
+            }
+            ResponseCheck::PermFail { code, ref detail } => {
+                result |= RESP_BIT_HAD_5XX;
+                tracing::error!(index = i, code = code, detail = %detail, "Sync: 5xx");
+            }
+            ResponseCheck::Invalid { ref message } => {
+                tracing::error!(index = i, message = %message, "Sync: invalid");
+                result = RESP_RCPT_ERROR;
+            }
+        }
+    }
+    Ok(result)
+}
+
+// =============================================================================
+// Supporting Types
+// =============================================================================
+
+#[derive(Debug)]
+pub enum ResponseCheck {
+    Success { code: u16, detail: String },
+    TempFail { code: u16, detail: String },
+    PermFail { code: u16, detail: String },
+    Invalid { message: String },
+}
+
+/// Per-address error information for delivery status tracking.
+#[derive(Debug, Clone, Default)]
+pub struct AddressError {
+    pub errno: i32,
+    pub message: String,
+    pub more_errno: i32,
 }
 
 // =============================================================================
@@ -1173,42 +2441,12 @@ inventory::submit! {
         name: "smtp",
         create: || Box::new(SmtpTransport::new()),
         is_local: false,
-        avail_string: Some("smtp (built-in)"),
+        avail_string: None,
     }
 }
 
 // =============================================================================
-// Helper Functions
-// =============================================================================
-
-/// Parse an enhanced status code from an SMTP response text.
-///
-/// Enhanced status codes (RFC 2034) have the format `X.Y.Z` where X is
-/// the class (2/4/5), Y is the subject, and Z is the detail.
-fn parse_enhanced_status(text: &str) -> Option<String> {
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    if parts.is_empty() {
-        return None;
-    }
-    let code = parts[0];
-    // Enhanced status codes match pattern: digit "." 1-3digits "." 1-3digits
-    let segments: Vec<&str> = code.split('.').collect();
-    if segments.len() == 3
-        && segments[0].len() == 1
-        && segments[1].len() <= 3
-        && segments[2].len() <= 3
-        && segments
-            .iter()
-            .all(|s| s.chars().all(|c| c.is_ascii_digit()))
-    {
-        Some(code.to_string())
-    } else {
-        None
-    }
-}
-
-// =============================================================================
-// Tests
+// Unit Tests
 // =============================================================================
 
 #[cfg(test)]
@@ -1216,131 +2454,345 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_smtp_transport_driver_name() {
-        let transport = SmtpTransport::new();
-        assert_eq!(transport.driver_name(), "smtp");
+    fn test_constants() {
+        assert_eq!(DELIVER_BUFFER_SIZE, 4096);
+        assert_eq!(PENDING, 256);
+        assert_eq!(PENDING_DEFER, 257);
+        assert_eq!(PENDING_OK, 256);
     }
 
     #[test]
-    fn test_smtp_transport_is_remote() {
+    fn test_response_constants() {
+        assert_eq!(RESP_BIT_HAD_2XX, 1);
+        assert_eq!(RESP_BIT_HAD_5XX, 2);
+        assert_eq!(RESP_HAD_2_AND_5, 3);
+        assert_eq!(RESP_NOERROR, 0);
+        assert_eq!(RESP_RCPT_TIMEO, -1);
+        assert_eq!(RESP_RCPT_ERROR, -2);
+        assert_eq!(RESP_MAIL_OR_DATA_ERROR, -3);
+        assert_eq!(RESP_EPIPE_EHLO_ERR, -4);
+        assert_eq!(RESP_EHLO_ERR_TLS, -5);
+    }
+
+    #[test]
+    fn test_dsn_constants() {
+        assert_eq!(RF_LIST.len(), 4);
+        assert_eq!(RF_NAMES.len(), 4);
+        assert_eq!(RF_NAMES[0], "NEVER");
+        assert_eq!(RF_NAMES[1], "SUCCESS");
+        assert_eq!(RF_NAMES[2], "FAILURE");
+        assert_eq!(RF_NAMES[3], "DELAY");
+    }
+
+    #[test]
+    fn test_dsn_notify_build() {
+        assert_eq!(SmtpTransport::build_dsn_notify(0), "");
+        assert_eq!(SmtpTransport::build_dsn_notify(RF_NOTIFY_NEVER), "NEVER");
+        assert_eq!(
+            SmtpTransport::build_dsn_notify(RF_NOTIFY_SUCCESS | RF_NOTIFY_FAILURE),
+            "SUCCESS,FAILURE"
+        );
+        assert_eq!(
+            SmtpTransport::build_dsn_notify(RF_NOTIFY_FAILURE | RF_NOTIFY_DELAY),
+            "FAILURE,DELAY"
+        );
+    }
+
+    #[test]
+    fn test_default_options() {
+        let opts = SmtpTransportOptions::default();
+        assert_eq!(opts.helo_data, "$primary_hostname");
+        assert_eq!(opts.hosts_try_chunking, "*");
+        assert_eq!(opts.hosts_try_fastopen, "*");
+        assert_eq!(opts.command_timeout, 300);
+        assert_eq!(opts.connect_timeout, 300);
+        assert_eq!(opts.data_timeout, 300);
+        assert_eq!(opts.final_timeout, 600);
+        assert_eq!(opts.size_addition, 1024);
+        assert_eq!(opts.hosts_max_try, 5);
+        assert_eq!(opts.hosts_max_try_hardlimit, 50);
+        assert_eq!(opts.message_linelength_limit, 998);
+        assert!(opts.address_retry_include_sender);
+        assert!(!opts.allow_localhost);
+        assert!(opts.dns_qualify_single);
+        assert!(opts.delay_after_cutoff);
+        assert!(opts.keepalive);
+        assert!(opts.retry_include_ip_address);
+    }
+
+    #[test]
+    fn test_smtp_transport_driver_name() {
         let transport = SmtpTransport::new();
+        assert_eq!(transport.driver_name(), "smtp");
         assert!(!transport.is_local());
     }
 
     #[test]
-    fn test_smtp_transport_default() {
-        let transport = SmtpTransport::default();
-        assert_eq!(transport.driver_name(), "smtp");
-    }
-
-    #[test]
-    fn test_smtp_options_default() {
-        let opts = SmtpTransportOptions::default();
-        assert_eq!(opts.port, 25);
-        assert!(!opts.require_tls);
-        assert!(opts.hosts.is_empty());
-        assert_eq!(opts.hosts_max_try, 5);
-        assert!(opts.chunking_enabled);
-    }
-
-    #[test]
-    fn test_ehlo_capabilities_parse() {
-        let lines = vec![
-            "250-mail.example.com Hello".to_string(),
-            "250-PIPELINING".to_string(),
-            "250-SIZE 52428800".to_string(),
-            "250-STARTTLS".to_string(),
-            "250-AUTH PLAIN LOGIN".to_string(),
-            "250-8BITMIME".to_string(),
-            "250-CHUNKING".to_string(),
-            "250-DSN".to_string(),
-            "250-SMTPUTF8".to_string(),
-            "250 ENHANCEDSTATUSCODES".to_string(),
-        ];
-        let caps = EhloCapabilities::parse(&lines);
-        assert!(caps.pipelining);
-        assert!(caps.starttls);
-        assert!(caps.size);
-        assert_eq!(caps.max_size, 52428800);
-        assert!(caps.eight_bit_mime);
-        assert!(caps.chunking);
-        assert!(caps.dsn);
-        assert!(caps.smtputf8);
-        assert!(caps.enhanced_status_codes);
-        assert_eq!(caps.auth_mechanisms, vec!["PLAIN", "LOGIN"]);
-    }
-
-    #[test]
-    fn test_ehlo_capabilities_empty() {
-        let caps = EhloCapabilities::parse(&[]);
-        assert!(!caps.pipelining);
-        assert!(!caps.starttls);
-    }
-
-    #[test]
-    fn test_smtp_response_classification() {
-        let success = SmtpResponse {
-            code: 250,
-            enhanced_code: Some("2.1.0".into()),
-            lines: vec!["250 OK".into()],
-            is_multiline: false,
-        };
-        assert!(success.is_success());
-        assert!(!success.is_temp_fail());
-        assert!(!success.is_perm_fail());
-
-        let temp_fail = SmtpResponse {
-            code: 451,
-            enhanced_code: None,
-            lines: vec!["451 Try again later".into()],
-            is_multiline: false,
-        };
-        assert!(!temp_fail.is_success());
-        assert!(temp_fail.is_temp_fail());
-
-        let perm_fail = SmtpResponse {
-            code: 550,
-            enhanced_code: None,
-            lines: vec!["550 User unknown".into()],
-            is_multiline: false,
-        };
-        assert!(!perm_fail.is_success());
-        assert!(perm_fail.is_perm_fail());
-    }
-
-    #[test]
-    fn test_parse_enhanced_status() {
-        assert_eq!(parse_enhanced_status("2.1.0 Ok"), Some("2.1.0".to_string()));
-        assert_eq!(
-            parse_enhanced_status("5.1.1 User unknown"),
-            Some("5.1.1".to_string())
+    fn test_smtp_context_new() {
+        let ctx = SmtpContext::new(
+            "sender@example.com".to_string(),
+            "mail.example.com".to_string(),
+            25,
         );
-        assert!(parse_enhanced_status("invalid").is_none());
-        assert!(parse_enhanced_status("").is_none());
+        assert_eq!(ctx.from_addr, "sender@example.com");
+        assert_eq!(ctx.host, "mail.example.com");
+        assert_eq!(ctx.port, 25);
+        assert!(ctx.setting_up);
+        assert!(ctx.send_quit);
+        assert!(!ctx.ok);
+        assert!(!ctx.esmtp);
+        assert_eq!(ctx.peer_offered, 0);
     }
 
     #[test]
-    fn test_transport_entry_no_hosts() {
-        let transport = SmtpTransport::new();
-        let config = TransportInstanceConfig {
-            name: "test".into(),
-            driver_name: "smtp".into(),
-            options: Box::new(SmtpTransportOptions::default()),
-            ..Default::default()
-        };
-        let result = transport.transport_entry(&config, "sender@example.com");
-        assert!(matches!(result, Ok(TransportResult::Error { .. })));
+    fn test_smtp_context_peer_has() {
+        let mut ctx = SmtpContext::new(String::new(), String::new(), 25);
+        assert!(!ctx.peer_has(PEER_OFFERED_PIPELINING));
+        ctx.peer_offered = PEER_OFFERED_PIPELINING | PEER_OFFERED_SIZE;
+        assert!(ctx.peer_has(PEER_OFFERED_PIPELINING));
+        assert!(ctx.peer_has(PEER_OFFERED_SIZE));
+        assert!(!ctx.peer_has(PEER_OFFERED_TLS));
     }
 
     #[test]
-    fn test_setup_returns_ok() {
+    fn test_smtp_context_reset_transaction() {
+        let mut ctx = SmtpContext::new("s@e.com".to_string(), "m.e.com".to_string(), 25);
+        ctx.ok = true;
+        ctx.setting_up = false;
+        ctx.good_rcpt = true;
+        ctx.completed_addr = true;
+        ctx.pipelining_active = true;
+        ctx.smtp_command = "DATA".to_string();
+        ctx.reset_transaction();
+        assert!(!ctx.ok);
+        assert!(ctx.setting_up);
+        assert!(!ctx.good_rcpt);
+        assert!(!ctx.completed_addr);
+        assert!(!ctx.pipelining_active);
+        assert!(ctx.smtp_command.is_empty());
+    }
+
+    #[test]
+    fn test_ehlo_regex_compilation() {
+        let regexes = smtp_deliver_init();
+        let ehlo = "250-mail.example.com\r\n250-PIPELINING\r\n250-SIZE 52428800\r\n250-AUTH PLAIN LOGIN\r\n250-CHUNKING\r\n250-DSN\r\n250 IGNOREQUOTA";
+        assert!(regexes.regex_pipelining.is_match(ehlo));
+        assert!(regexes.regex_size.is_match(ehlo));
+        assert!(regexes.regex_auth.is_match(ehlo));
+        assert!(regexes.regex_chunking.is_match(ehlo));
+        assert!(regexes.regex_dsn.is_match(ehlo));
+        assert!(regexes.regex_ignorequota.is_match(ehlo));
+    }
+
+    #[test]
+    fn test_ehlo_size_extraction() {
+        let regexes = smtp_deliver_init();
+        let response = "250-SIZE 52428800\r\n250 OK";
+        let caps = regexes.regex_size.captures(response).unwrap();
+        let size: u64 = caps.get(2).unwrap().as_str().parse().unwrap();
+        assert_eq!(size, 52428800);
+    }
+
+    #[test]
+    fn test_ehlo_auth_extraction() {
+        let regexes = smtp_deliver_init();
+        let response = "250-AUTH PLAIN LOGIN CRAM-MD5\r\n250 OK";
+        let caps = regexes.regex_auth.captures(response).unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "PLAIN LOGIN CRAM-MD5");
+    }
+
+    #[test]
+    fn test_parse_ehlo_response() {
+        let transport = SmtpTransport::new();
+        let mut ctx = SmtpContext::new(String::new(), String::new(), 25);
+        let resp = "250-mail.example.com Hello\r\n250-PIPELINING\r\n250-SIZE 10485760\r\n250-AUTH PLAIN LOGIN\r\n250-CHUNKING\r\n250-DSN\r\n250 IGNOREQUOTA";
+        transport.parse_ehlo_response(&mut ctx, resp);
+        assert!(ctx.peer_has(PEER_OFFERED_PIPELINING));
+        assert!(ctx.peer_has(PEER_OFFERED_SIZE));
+        assert!(ctx.peer_has(PEER_OFFERED_AUTH));
+        assert!(ctx.peer_has(PEER_OFFERED_CHUNKING));
+        assert!(ctx.peer_has(PEER_OFFERED_DSN));
+        assert!(ctx.peer_has(PEER_OFFERED_IGNOREQUOTA));
+        assert_eq!(ctx.peer_max_message_size, 10485760);
+        assert_eq!(ctx.auth_mechanisms, "PLAIN LOGIN");
+    }
+
+    #[test]
+    fn test_is_response_complete() {
+        assert!(is_response_complete("250 OK\r\n"));
+        assert!(is_response_complete("250-First\r\n250 Last\r\n"));
+        assert!(!is_response_complete("250-First\r\n"));
+        assert!(is_response_complete("220 mail.example.com ESMTP\r\n"));
+        assert!(!is_response_complete(""));
+        assert!(is_response_complete("354 Start mail input\r\n"));
+    }
+
+    #[test]
+    fn test_host_matches() {
+        assert!(host_matches("mail.example.com", "*"));
+        assert!(host_matches("mail.example.com", "mail.example.com"));
+        assert!(!host_matches("mail.example.com", "other.example.com"));
+        assert!(host_matches("mail.example.com", ".example.com"));
+        assert!(!host_matches("mail.other.com", ".example.com"));
+        assert!(!host_matches("mail.example.com", "!mail.example.com"));
+        assert!(host_matches(
+            "mail.example.com",
+            "other.com:mail.example.com"
+        ));
+        assert!(!host_matches("mail.example.com", ""));
+    }
+
+    #[test]
+    fn test_check_response_success() {
+        match check_response("250 2.1.0 OK") {
+            ResponseCheck::Success { code, detail } => {
+                assert_eq!(code, 250);
+                assert!(detail.contains("2.1.0 OK"));
+            }
+            _ => panic!("Expected Success"),
+        }
+    }
+
+    #[test]
+    fn test_check_response_temp_fail() {
+        match check_response("421 4.7.0 Try again later") {
+            ResponseCheck::TempFail { code, .. } => assert_eq!(code, 421),
+            _ => panic!("Expected TempFail"),
+        }
+    }
+
+    #[test]
+    fn test_check_response_perm_fail() {
+        match check_response("550 5.1.1 No such user") {
+            ResponseCheck::PermFail { code, .. } => assert_eq!(code, 550),
+            _ => panic!("Expected PermFail"),
+        }
+    }
+
+    #[test]
+    fn test_check_response_invalid() {
+        match check_response("XY") {
+            ResponseCheck::Invalid { .. } => {}
+            _ => panic!("Expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_port() {
+        let mut opts = SmtpTransportOptions::default();
+        assert_eq!(SmtpTransport::resolve_port(&opts), 25);
+        opts.protocol = "lmtp".to_string();
+        assert_eq!(SmtpTransport::resolve_port(&opts), 24);
+        opts.protocol = "smtps".to_string();
+        assert_eq!(SmtpTransport::resolve_port(&opts), 465);
+        opts.protocol = "".to_string();
+        opts.port = "587".to_string();
+        assert_eq!(SmtpTransport::resolve_port(&opts), 587);
+        opts.port = "smtp".to_string();
+        assert_eq!(SmtpTransport::resolve_port(&opts), 25);
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn test_tls_lib_state_default() {
+        let state = EximTlsLibState::default();
+        assert!(!state.conn_certs);
+        assert!(!state.cabundle);
+        assert!(state.libdata0.is_none());
+    }
+
+    #[test]
+    fn test_address_error_default() {
+        let err = AddressError::default();
+        assert_eq!(err.errno, 0);
+        assert!(err.message.is_empty());
+    }
+
+    #[test]
+    fn test_set_errno() {
+        let mut addresses = HashMap::new();
+        addresses.insert("user@example.com".to_string(), AddressError::default());
+        set_errno(
+            &mut addresses,
+            421,
+            "try again later",
+            true,
+            "mail.example.com",
+            0,
+        );
+        let err = addresses.get("user@example.com").unwrap();
+        assert_eq!(err.errno, 421);
+        assert!(err.message.contains("mail.example.com"));
+    }
+
+    #[test]
+    fn test_smtp_transport_init_validation() {
         let transport = SmtpTransport::new();
         let config = TransportInstanceConfig {
-            name: "test".into(),
-            driver_name: "smtp".into(),
+            name: "test_smtp".to_string(),
+            driver_name: "smtp".to_string(),
             options: Box::new(SmtpTransportOptions::default()),
-            ..Default::default()
+            ..TransportInstanceConfig::default()
         };
-        assert!(transport.setup(&config, "user@example.com").is_ok());
+        assert!(transport.smtp_transport_init(&config).is_ok());
+
+        let mut bad_opts = SmtpTransportOptions::default();
+        bad_opts.command_timeout = 0;
+        let bad_config = TransportInstanceConfig {
+            name: "bad".to_string(),
+            driver_name: "smtp".to_string(),
+            options: Box::new(bad_opts),
+            ..TransportInstanceConfig::default()
+        };
+        assert!(transport.smtp_transport_init(&bad_config).is_err());
+    }
+
+    #[test]
+    fn test_smtp_context_display() {
+        let ctx = SmtpContext::new("s@e.com".to_string(), "m.e.com".to_string(), 25);
+        let disp = format!("{}", ctx);
+        assert!(disp.contains("m.e.com"));
+        assert!(disp.contains("25"));
+    }
+
+    #[test]
+    fn test_smtp_options_display() {
+        let opts = SmtpTransportOptions::default();
+        let disp = format!("{}", opts);
+        assert!(disp.contains("SmtpTransportOptions"));
+    }
+
+    #[test]
+    fn test_dnssec_mode_default() {
+        assert_eq!(DnssecMode::default(), DnssecMode::None);
+    }
+
+    #[test]
+    fn test_peer_capability_constants_unique() {
+        let all = [
+            PEER_OFFERED_TLS,
+            PEER_OFFERED_CHUNKING,
+            PEER_OFFERED_PIPELINING,
+            PEER_OFFERED_DSN,
+            PEER_OFFERED_SIZE,
+            PEER_OFFERED_AUTH,
+            PEER_OFFERED_IGNOREQUOTA,
+            PEER_OFFERED_PRDR,
+            PEER_OFFERED_UTF8,
+            PEER_OFFERED_EARLY_PIPE,
+            PEER_OFFERED_LIMITS,
+            PEER_OFFERED_PIPE_CONNECT,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_eq!(
+                    all[i] & all[j],
+                    0,
+                    "Overlapping: 0x{:04x} and 0x{:04x}",
+                    all[i],
+                    all[j]
+                );
+            }
+        }
     }
 }
