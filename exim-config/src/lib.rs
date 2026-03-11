@@ -13,6 +13,7 @@
 //! translating `readconf_handle_option()`, `find_option()`, and the
 //! `optionlist_config[]` table from C `readconf.c`.
 
+pub mod driver_init;
 pub mod macros;
 pub mod options;
 pub mod types;
