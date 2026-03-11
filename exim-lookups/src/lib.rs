@@ -40,5 +40,8 @@ pub mod psl;
 #[cfg(feature = "lookup-passwd")]
 pub mod passwd;
 
+#[cfg(feature = "lookup-dsearch")]
+pub mod dsearch;
+
 #[cfg(feature = "lookup-testdb")]
 pub mod testdb;
