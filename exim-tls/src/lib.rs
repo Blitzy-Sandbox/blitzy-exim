@@ -31,3 +31,8 @@ pub mod ocsp;
 /// Feature-gated behind `tls-resume` (replaces C `#ifndef DISABLE_TLS_RESUME`).
 #[cfg(feature = "tls-resume")]
 pub mod session_cache;
+
+/// OpenSSL TLS backend — optional backend using the `openssl` 0.10.75 crate.
+/// Feature-gated behind `tls-openssl` (replaces C `#ifdef USE_OPENSSL`).
+#[cfg(feature = "tls-openssl")]
+pub mod openssl_backend;
