@@ -108,3 +108,8 @@ pub mod nisplus;
 /// NOT to be confused with libgsasl (GNU SASL) which is wrapped in `gsasl.rs`.
 #[cfg(feature = "ffi-cyrus-sasl")]
 pub mod cyrus_sasl;
+
+/// Hints database abstraction layer — common trait and backend implementations.
+/// The `hintsdb` module is always available; individual backends are feature-gated
+/// internally (hintsdb-tdb, hintsdb-gdbm, hintsdb-ndbm, hintsdb-bdb).
+pub mod hintsdb;
