@@ -8,3 +8,4 @@
 //! `spool_mbox.c`.
 
 pub mod format;
+pub mod message_id;
