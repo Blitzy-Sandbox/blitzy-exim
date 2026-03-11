@@ -17,6 +17,11 @@ pub mod sni;
 /// regardless of TLS backend selection.
 pub mod client_cert;
 
+/// DANE/TLSA Support — RFC 6698/7672 TLSA record processing and certificate
+/// verification. Feature-gated behind `dane` (replaces C `#ifdef SUPPORT_DANE`).
+#[cfg(feature = "dane")]
+pub mod dane;
+
 /// OCSP stapling — server-side response loading and client-side verification.
 /// Feature-gated behind `ocsp` (replaces C `#ifndef DISABLE_OCSP`).
 #[cfg(feature = "ocsp")]

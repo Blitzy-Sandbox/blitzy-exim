@@ -81,7 +81,7 @@ tls-rustls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
 tls-openssl = ["dep:openssl"]
 
 # Optional TLS capabilities — each replaces a C preprocessor conditional.
-dane = []                                   # DANE/TLSA support (C: SUPPORT_DANE)
+dane = ["dep:sha2"]                         # DANE/TLSA support (C: SUPPORT_DANE)
 ocsp = []                                   # OCSP stapling (C: !DISABLE_OCSP)
 tls-resume = ["dep:sha2", "dep:getrandom"]  # Session resumption (C: !DISABLE_TLS_RESUME)
 
