@@ -50,7 +50,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::unistd::alarm;
 
 // ===========================================================================
@@ -218,12 +218,12 @@ extern "C" fn sigalrm_handler(_sig: libc::c_int) {
 ///
 /// ## Safety Note
 ///
-/// This function uses `unsafe` blocks to call `nix::sys::signal::sigaction()`,
-/// which requires `unsafe` because the caller must guarantee that the provided
-/// handler functions are async-signal-safe. All four handlers in this module
-/// satisfy this requirement — they perform only a single atomic store to a
-/// static `AtomicBool`, which is trivially async-signal-safe. The `SIG_IGN`
-/// disposition for SIGPIPE is a kernel-level constant with no user-space code.
+/// Signal installation delegates to [`exim_ffi::signal::install_signal_action`]
+/// which centralises the `unsafe` boundary in the `exim-ffi` crate per
+/// AAP §0.7.2.  All four handlers in this module are async-signal-safe:
+/// they perform only a single atomic store to a static `AtomicBool`, which
+/// is trivially async-signal-safe. The `SIG_IGN` disposition for SIGPIPE
+/// is a kernel-level constant with no user-space code.
 pub fn install_daemon_signals() {
     let empty_mask = SigSet::empty();
 
@@ -273,7 +273,7 @@ pub fn install_daemon_signals() {
         empty_mask,
     );
 
-    // SAFETY: All signal handler functions (sighup_handler, sigchld_handler,
+    // All signal handler functions (sighup_handler, sigchld_handler,
     // sigterm_handler, sigalrm_handler) are async-signal-safe. Each handler
     // performs exactly one operation: AtomicBool::store(true, Ordering::SeqCst),
     // which compiles to a single atomic store instruction with a memory fence.
@@ -283,14 +283,14 @@ pub fn install_daemon_signals() {
     //
     // The sigaction() calls are installed in the same order as the C daemon.c
     // setup sequence (lines 2383, 2415, 2418-2419) for behavioral parity.
-    unsafe {
-        let _ = sigaction(Signal::SIGHUP, &sighup_action);
-        let _ = sigaction(Signal::SIGCHLD, &sigchld_action);
-        let _ = sigaction(Signal::SIGTERM, &sigterm_action);
-        let _ = sigaction(Signal::SIGINT, &sigterm_action);
-        let _ = sigaction(Signal::SIGPIPE, &sigpipe_action);
-        let _ = sigaction(Signal::SIGALRM, &sigalrm_action);
-    }
+    //
+    // The unsafe boundary is centralised in exim_ffi::signal per AAP §0.7.2.
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGHUP, &sighup_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGCHLD, &sigchld_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGTERM, &sigterm_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGINT, &sigterm_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGPIPE, &sigpipe_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGALRM, &sigalrm_action);
 }
 
 /// Install signal handlers for child processes after `fork()`.
@@ -321,20 +321,20 @@ pub fn install_child_signals() {
 
     let ignore_action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), empty_mask);
 
-    // SAFETY: SigHandler::SigDfl and SigHandler::SigIgn are kernel-level
-    // signal dispositions that do not involve any user-space handler code.
-    // They are inherently safe — SIG_DFL restores the default kernel action,
-    // and SIG_IGN tells the kernel to discard the signal silently.
-    unsafe {
-        let _ = sigaction(Signal::SIGHUP, &default_action);
-        let _ = sigaction(Signal::SIGTERM, &default_action);
-        let _ = sigaction(Signal::SIGCHLD, &default_action);
-        let _ = sigaction(Signal::SIGINT, &default_action);
-        let _ = sigaction(Signal::SIGALRM, &default_action);
-        // Keep SIGPIPE ignored — child processes also need protection
-        // against broken-pipe crashes during SMTP disconnect handling.
-        let _ = sigaction(Signal::SIGPIPE, &ignore_action);
-    }
+    // SigHandler::SigDfl and SigHandler::SigIgn are kernel-level signal
+    // dispositions that do not involve any user-space handler code. They are
+    // inherently safe — SIG_DFL restores the default kernel action, and
+    // SIG_IGN tells the kernel to discard the signal silently.
+    //
+    // The unsafe boundary is centralised in exim_ffi::signal per AAP §0.7.2.
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGHUP, &default_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGTERM, &default_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGCHLD, &default_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGINT, &default_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGALRM, &default_action);
+    // Keep SIGPIPE ignored — child processes also need protection
+    // against broken-pipe crashes during SMTP disconnect handling.
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGPIPE, &ignore_action);
 }
 
 /// Install signal handlers for delivery subprocesses.
@@ -374,18 +374,18 @@ pub fn install_delivery_signals() {
         empty_mask,
     );
 
-    // SAFETY: SigHandler::SigDfl and SigHandler::SigIgn are kernel-level
-    // signal dispositions with no user-space handler code. The sigalrm_handler
-    // is async-signal-safe — it performs only a single AtomicBool::store()
+    // SigHandler::SigDfl and SigHandler::SigIgn are kernel-level signal
+    // dispositions with no user-space handler code. The sigalrm_handler is
+    // async-signal-safe — it performs only a single AtomicBool::store()
     // operation (see handler documentation above for full safety analysis).
-    unsafe {
-        let _ = sigaction(Signal::SIGHUP, &default_action);
-        let _ = sigaction(Signal::SIGTERM, &default_action);
-        let _ = sigaction(Signal::SIGCHLD, &default_action);
-        let _ = sigaction(Signal::SIGINT, &default_action);
-        let _ = sigaction(Signal::SIGPIPE, &ignore_action);
-        let _ = sigaction(Signal::SIGALRM, &sigalrm_action);
-    }
+    //
+    // The unsafe boundary is centralised in exim_ffi::signal per AAP §0.7.2.
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGHUP, &default_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGTERM, &default_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGCHLD, &default_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGINT, &default_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGPIPE, &ignore_action);
+    let _ = exim_ffi::signal::install_signal_action(Signal::SIGALRM, &sigalrm_action);
 }
 
 // ===========================================================================

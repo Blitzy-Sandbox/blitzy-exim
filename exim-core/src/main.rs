@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 // exim-core — Main binary crate for Exim Mail Transfer Agent (Rust rewrite)
 //
 // This is the entry point. Modules will be expanded as implementation proceeds.

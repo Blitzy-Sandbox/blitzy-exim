@@ -97,6 +97,12 @@ tls-resume = ["dep:sha2", "dep:getrandom"]  # Session resumption (C: !DISABLE_TL
 # primitives for per-message TLS state.
 exim-store = { path = "../exim-store" }
 
+# exim-ffi provides safe wrappers for inherently-unsafe POSIX operations.
+# Used here for fd::tcp_stream_from_raw_fd() — converting raw socket
+# descriptors from accept()/connect() into TcpStream for TLS handshake.
+# This keeps ALL unsafe code in the exim-ffi crate per AAP §0.7.2.
+exim-ffi = { path = "../exim-ffi" }
+
 # ── Workspace-shared dependencies ────────────────────────────────────────────
 # These reference versions pinned in the root Cargo.toml [workspace.dependencies]
 # to guarantee version consistency across all 18 workspace crates.

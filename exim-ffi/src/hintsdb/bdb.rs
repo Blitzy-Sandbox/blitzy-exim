@@ -413,13 +413,11 @@ impl BdbHintsDb {
 
         if db_open_rc != 0 {
             // Clean up DB + ENV on failure (lines 126-129)
-            // SAFETY: db_ptr is valid. DB->close releases the DB handle resources.
+            // SAFETY: db_ptr is a valid DB handle and env_ptr is a valid DB_ENV handle.
+            // DB->close releases the DB handle, DB_ENV->close releases environment resources.
             unsafe {
                 let db_close_fn = (*db_ptr).close.expect("DB->close function pointer is null");
                 db_close_fn(db_ptr, 0);
-            }
-            // SAFETY: env_ptr is valid and open. close releases all ENV resources.
-            unsafe {
                 let env_close_fn = (*env_ptr)
                     .close
                     .expect("DB_ENV->close function pointer is null");

@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 // exim-tls — TLS abstraction crate for Exim MTA
 //
 // This crate provides a unified TLS abstraction layer with pluggable backends

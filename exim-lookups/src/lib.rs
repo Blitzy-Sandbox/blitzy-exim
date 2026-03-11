@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 //! Lookup module implementations for the Exim MTA.
 //!
 //! This crate replaces the entire `src/src/lookups/` directory from the C

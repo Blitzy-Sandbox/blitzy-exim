@@ -7,5 +7,9 @@
 //! This crate replaces the C modules `spool_in.c`, `spool_out.c`, and
 //! `spool_mbox.c`.
 
+#![deny(unsafe_code)]
+
+pub mod data_file;
 pub mod format;
+pub mod header_file;
 pub mod message_id;

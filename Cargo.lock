@@ -813,6 +813,7 @@ dependencies = [
  "cc",
  "libc",
  "libloading 0.9.0",
+ "nix",
  "pkg-config",
  "tracing",
 ]
@@ -926,6 +927,7 @@ dependencies = [
 name = "exim-tls"
 version = "0.1.0"
 dependencies = [
+ "exim-ffi",
  "exim-store",
  "getrandom 0.2.17",
  "log",

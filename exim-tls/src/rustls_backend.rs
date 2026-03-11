@@ -18,16 +18,16 @@
 //!
 //! # Safety
 //!
-//! This module contains a single `unsafe` block in [`tcp_stream_from_fd`]
-//! for converting a raw POSIX file descriptor to a `TcpStream`. This is
-//! inherent to the fork-per-connection model and is documented with a
-//! detailed safety justification. All other code is safe Rust.
+//! This module contains **zero** `unsafe` blocks.  The raw file descriptor
+//! conversion in [`tcp_stream_from_fd`] delegates to the safe wrapper
+//! [`exim_ffi::fd::tcp_stream_from_raw_fd`], which centralises the `unsafe`
+//! boundary in the `exim-ffi` crate per AAP §0.7.2.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -1255,18 +1255,18 @@ fn protocol_version_str(v: rustls::ProtocolVersion) -> String {
 
 /// Constructs a `TcpStream` from a raw POSIX file descriptor.
 ///
-/// # Safety
+/// Delegates to [`exim_ffi::fd::tcp_stream_from_raw_fd`] which centralises
+/// the single necessary `unsafe` block in the `exim-ffi` crate — the ONLY
+/// crate permitted to contain `unsafe` code (AAP §0.7.2).
 ///
-/// This function contains an `unsafe` block because `TcpStream::from_raw_fd`
-/// requires the caller to guarantee that the file descriptor is valid, open,
-/// and exclusively owned. In the Exim fork-per-connection model these
-/// invariants hold because the fd comes from accept()/connect() and is
-/// solely owned by the forked child / delivery process.
+/// # Preconditions
+///
+/// The caller (server_start / client_start) must guarantee that `fd` is a
+/// valid, exclusively-owned TCP socket descriptor from `accept()` or
+/// `connect()`.  The returned `TcpStream` takes ownership and will close
+/// the fd on drop.
 fn tcp_stream_from_fd(fd: RawFd) -> TcpStream {
-    // SAFETY: The caller (server_start / client_start) guarantees that `fd`
-    // is a valid, exclusively-owned TCP socket descriptor from accept() or
-    // connect(). The TcpStream takes ownership and will close the fd on drop.
-    unsafe { TcpStream::from_raw_fd(fd) }
+    exim_ffi::fd::tcp_stream_from_raw_fd(fd)
 }
 
 // ===========================================================================

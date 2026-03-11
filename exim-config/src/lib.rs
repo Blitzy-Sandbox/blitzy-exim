@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 //! Exim configuration parser crate.
 //!
 //! This crate provides the configuration file parser, option processing,

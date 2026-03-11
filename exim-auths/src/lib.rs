@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 //! # exim-auths — Authentication Driver Implementations for Exim MTA

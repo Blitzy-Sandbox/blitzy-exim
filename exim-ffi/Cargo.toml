@@ -104,6 +104,13 @@ libloading = { workspace = true }
 # Version pinned via workspace (0.1.44 per AAP §0.6.1).
 tracing = { workspace = true }
 
+# Safe POSIX API wrappers — required for the `signal` module which provides
+# safe wrappers around nix::sys::signal::sigaction(). The nix crate exposes
+# sigaction as unsafe because callers must guarantee async-signal-safety of
+# handlers; this crate centralises that unsafe boundary per AAP §0.7.2.
+# Version pinned via workspace (0.31.2 per AAP §0.6.1).
+nix = { workspace = true }
+
 # =============================================================================
 # Build Dependencies
 # =============================================================================

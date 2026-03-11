@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::path::Path;
 
 use openssl::dh::Dh;
@@ -1288,27 +1288,19 @@ impl OpensslBackend {
 
 /// Convert a raw POSIX file descriptor into a `TcpStream`.
 ///
-/// This is a thin wrapper around `FromRawFd` to isolate the single necessary
-/// `unsafe` usage in this module.  The Rust standard library requires unsafe
-/// here because it cannot statically verify that the file descriptor is open,
-/// valid, and not shared.
+/// Constructs a `TcpStream` from a raw POSIX file descriptor.
 ///
-/// # Safety justification
+/// Delegates to [`exim_ffi::fd::tcp_stream_from_raw_fd`] which centralises
+/// the single necessary `unsafe` block in the `exim-ffi` crate — the ONLY
+/// crate permitted to contain `unsafe` code (AAP §0.7.2).
 ///
-/// The raw file descriptor comes from the Exim daemon's `accept()` system
-/// call (in `exim-core`), which guarantees:
-/// - The descriptor is open and valid.
-/// - It represents a connected TCP socket.
-/// - Ownership is transferred to this function (no other code will close it).
+/// # Preconditions
 ///
-/// The `unsafe` block is the minimal possible scope: exactly one
-/// `TcpStream::from_raw_fd()` call.  If stricter `unsafe` isolation is
-/// required, this helper can be relocated to the `exim-ffi` crate.
+/// The caller must guarantee that `fd` is a valid, exclusively-owned TCP
+/// socket descriptor from `accept()` or `connect()`.  The returned
+/// `TcpStream` takes ownership and will close the fd on drop.
 fn tcp_stream_from_fd(fd: RawFd) -> TcpStream {
-    // SAFETY: See function-level documentation above.  The caller (exim-core
-    // daemon) guarantees `fd` is a valid, open TCP socket file descriptor
-    // obtained from accept() with exclusive ownership transferred here.
-    unsafe { TcpStream::from_raw_fd(fd) }
+    exim_ffi::fd::tcp_stream_from_raw_fd(fd)
 }
 
 /// Look up an OpenSSL option name and return the corresponding `SslOptions`

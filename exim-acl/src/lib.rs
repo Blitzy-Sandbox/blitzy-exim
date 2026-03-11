@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 // Copyright (c) The Exim Maintainers 2020 - 2025
 // Copyright (c) University of Cambridge 1995 - 2018
 // SPDX-License-Identifier: GPL-2.0-or-later
