@@ -33,3 +33,6 @@ pub mod nmh;
 
 #[cfg(feature = "lookup-psl")]
 pub mod psl;
+
+#[cfg(feature = "lookup-testdb")]
+pub mod testdb;
