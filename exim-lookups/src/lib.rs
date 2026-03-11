@@ -15,3 +15,6 @@ pub mod lmdb;
 
 #[cfg(feature = "lookup-pgsql")]
 pub mod pgsql;
+
+#[cfg(feature = "lookup-ldap")]
+pub mod ldap;
