@@ -730,13 +730,20 @@ dependencies = [
 name = "exim-deliver"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "exim-config",
  "exim-drivers",
+ "exim-expand",
+ "exim-ffi",
  "exim-routers",
  "exim-spool",
  "exim-store",
  "exim-transports",
  "libc",
+ "log",
  "nix",
+ "regex",
+ "serde",
  "thiserror 2.0.18",
  "tracing",
 ]

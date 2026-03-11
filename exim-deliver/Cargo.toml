@@ -1,15 +1,253 @@
+# =============================================================================
+# exim-deliver — Delivery Orchestration Crate for Exim MTA
+# =============================================================================
+#
+# This crate replaces the C delivery orchestration subsystem:
+#
+#   src/src/deliver.c  (9,104 lines) — Main delivery engine: deliver_message()
+#     orchestrator, do_local_deliveries(), do_remote_deliveries(), parallel
+#     subprocess pool (par_wait/par_read_pipe), journal file management, and
+#     bounce/warning message construction (send_bounce_message, send_warning).
+#
+#   src/src/route.c    (2,098 lines) — Router chain evaluation: route_init(),
+#     route_check_prefix()/route_check_suffix(), router option tables, and
+#     router chain orchestration for per-recipient address resolution.
+#
+#   src/src/retry.c    (1,032 lines) — Retry scheduling: retry_check_address(),
+#     retry_find_config(), retry_update(), retry_ultimate_address_timeout().
+#     Integrates with the hints database (BDB/GDBM/NDBM/TDB) via exim-ffi.
+#
+#   src/src/moan.c       (885 lines) — Bounce/DSN/warning message generation:
+#     moan_send_message(), moan_to_sender(), moan_tell_someone(),
+#     moan_write_from(), moan_write_references(), moan_check_errorcopy(),
+#     moan_skipped_syntax_errors().
+#
+# Per AAP §0.4.1, §0.5.1, and §0.6.1 — this crate is part of the 18-crate
+# Cargo workspace producing a single `exim` binary.
+#
+# Source modules:
+#   src/lib.rs                — Public API: deliver_message(), retry_check()
+#   src/orchestrator.rs       — Per-recipient router chain → transport dispatch
+#   src/routing.rs            — Router chain evaluation + preconditions
+#   src/transport_dispatch.rs — Transport selection and execution
+#   src/parallel.rs           — Subprocess pool for parallel remote delivery
+#   src/retry.rs              — Retry scheduling + hints DB integration
+#   src/bounce.rs             — Bounce/DSN/warning message generation
+#   src/journal.rs            — Journal file management + crash recovery
+#
+# Build commands:
+#   cargo check -p exim-deliver                          # Type-check with defaults
+#   cargo check -p exim-deliver --all-features           # Check all features
+#   cargo check -p exim-deliver --features "dane,dkim"   # Check specific features
+# =============================================================================
+
 [package]
 name = "exim-deliver"
 version = "0.1.0"
 edition = "2021"
+description = "Delivery orchestration crate for Exim MTA — per-recipient routing chain, transport dispatch, parallel remote delivery, retry scheduling, bounce/DSN generation, and journal crash recovery"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Cargo feature flags replace ALL C preprocessor conditionals found in
+# deliver.c, route.c, retry.c, and moan.c (per AAP §0.7.3).
+#
+# Preprocessor conditional mapping (C → Cargo feature):
+#
+#   C Macro                   Rust Feature      Sense     Occurrences
+#   ────────────────────────  ────────────────  ────────  ───────────
+#   (DSN support)             dsn               positive  DSN envelope/header handling
+#   #ifndef DISABLE_TLS       tls               negated   17 sites in deliver.c
+#   #ifdef WITH_CONTENT_SCAN  content-scan      positive  bounce content scanning
+#   #ifdef SUPPORT_I18N       i18n              positive  6 sites in deliver.c
+#   #ifndef DISABLE_DKIM      dkim              negated   3 sites in deliver.c
+#   #ifdef MEASURE_TIMING     measure-timing    positive  2 sites in deliver.c
+#   #ifdef SUPPORT_DANE       dane              positive  8 sites in deliver.c
+#   #ifndef DISABLE_PRDR      prdr              negated   3 sites in deliver.c
+#
+# "Negated" sense means the C code uses #ifndef DISABLE_X to enable a feature,
+# so the Rust feature flag enables it when present (matching the common case
+# where the feature is NOT disabled).
+#
+# Default features enable the options that are compiled into a standard Exim
+# build (DSN, TLS, and content scanning are standard).
+
+[features]
+default = ["dsn", "tls", "content-scan"]
+
+# DSN (Delivery Status Notification) support — enables RFC 3461 envelope
+# extensions (ENVID, RET, NOTIFY, ORCPT) in delivery processing, bounce
+# message DSN MIME structure, and per-recipient DSN parameter propagation
+# through the router/transport chain.
+dsn = []
+
+# TLS support in delivery context — enables TLS-related delivery processing
+# including STARTTLS negotiation tracking, TLS cipher/certificate logging in
+# delivery reports, DANE verification status propagation, and TLS session
+# resumption handling during outbound delivery. Replaces the 17 occurrences
+# of #ifndef DISABLE_TLS across deliver.c.
+tls = []
+
+# Content scanning in bounce messages — enables content scanning integration
+# for bounce message generation in moan.c, where bounce messages may include
+# original message content subject to scanning policies.
+# Replaces #ifdef WITH_CONTENT_SCAN conditionals.
+content-scan = []
+
+# Internationalization (EAI/SMTPUTF8) support — enables UTF-8 address handling
+# in delivery processing, SMTPUTF8 parameter propagation, and internationalized
+# domain name conversion during routing and transport dispatch.
+# Replaces 6 occurrences of #ifdef SUPPORT_I18N in deliver.c.
+i18n = []
+
+# DKIM signing in delivery — enables DKIM signing integration during outbound
+# delivery, propagating DKIM parameters through the transport dispatch chain.
+# Replaces 3 occurrences of #ifndef DISABLE_DKIM in deliver.c.
+dkim = []
+
+# Delivery timing measurement — enables timing instrumentation around delivery
+# operations for performance profiling. Measures wall-clock time for message
+# delivery orchestration and individual transport execution.
+# Replaces 2 occurrences of #ifdef MEASURE_TIMING in deliver.c.
+measure-timing = []
+
+# DANE/TLSA support in delivery — enables DNS-based Authentication of Named
+# Entities for outbound delivery, including TLSA record lookup integration
+# and DANE verification status tracking through the delivery pipeline.
+# Replaces 8 occurrences of #ifdef SUPPORT_DANE in deliver.c.
+dane = []
+
+# Per-Recipient Data Response (PRDR) — enables PRDR extension support in
+# delivery processing, allowing per-recipient accept/reject decisions to be
+# propagated through the delivery pipeline.
+# Replaces 3 occurrences of #ifndef DISABLE_PRDR in deliver.c.
+prdr = []
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+#
+# Per AAP §0.5.1 and §0.6.1. All workspace-shared dependencies are referenced
+# via `workspace = true` to guarantee version consistency with the root
+# Cargo.toml [workspace.dependencies].
 
 [dependencies]
+
+# ── Workspace-internal crate dependencies ────────────────────────────────────
+
+# exim-routers: Router chain evaluation via the RouterDriver trait. The
+# routing.rs module calls into router implementations to resolve recipient
+# addresses through the configured router chain (accept, dnslookup, ipliteral,
+# manualroute, redirect, queryprogram, iplookup).
+# Replaces: #include "routers/*.h" and router_run() calls in route.c.
 exim-routers = { path = "../exim-routers" }
+
+# exim-transports: Transport execution via the TransportDriver trait. The
+# transport_dispatch.rs and orchestrator.rs modules dispatch resolved addresses
+# to their assigned transport (smtp, appendfile, pipe, lmtp, autoreply,
+# queuefile) for final delivery.
+# Replaces: #include "transports/smtp.h" and transport->info->code() calls.
 exim-transports = { path = "../exim-transports" }
+
+# exim-store: Tainted<T>/Clean<T> newtypes for compile-time taint tracking,
+# MessageArena (bumpalo::Bump) for per-message allocations during delivery
+# processing, and Arc<Config> for accessing frozen configuration state.
+# Replaces: store_get()/store_mark()/store_reset() and taint checking calls
+# throughout deliver.c (is_tainted(), store_get_perm()).
 exim-store = { path = "../exim-store" }
+
+# exim-drivers: RouterDriver, TransportDriver trait definitions and the
+# inventory-based DriverRegistry for runtime driver resolution by name from
+# configuration. Used by orchestrator.rs and routing.rs to access driver
+# instances created during config parsing.
+# Replaces: driver_info struct casts and drtables.c registry lookups.
 exim-drivers = { path = "../exim-drivers" }
+
+# exim-spool: Spool file I/O for journal file management (journal.rs) and
+# spool header writes. The journal module records delivery progress to enable
+# crash recovery, and the orchestrator updates spool headers after delivery
+# completion.
+# Replaces: spool_write_header() and journal file operations in deliver.c.
 exim-spool = { path = "../exim-spool" }
+
+# exim-expand: String expansion engine for expanding transport/router option
+# strings at delivery time. Many delivery options (e.g., transport_filter,
+# return_path, headers_add/remove) contain ${...} expansion expressions that
+# must be evaluated in the delivery context.
+# Replaces: expand_string() calls throughout deliver.c and route.c.
+exim-expand = { path = "../exim-expand" }
+
+# exim-config: ConfigContext for parsed configuration access — retry rules,
+# bounce options, delivery settings, queue configuration, and frozen config
+# data consumed by the delivery orchestrator and retry scheduler.
+# Replaces: config-related global variable access in deliver.c.
+exim-config = { path = "../exim-config" }
+
+# exim-ffi: Hints database abstraction for retry record storage and retrieval.
+# retry.rs uses the HintsDb trait, HintsDbDatum, HintsDbError, OpenFlags, and
+# EXIM_DB_RLIMIT from exim-ffi::hintsdb to read/write retry records and check
+# timeout status. Provides safe wrappers over the BDB/GDBM/NDBM/TDB C backends.
+# Replaces: dbfn_open()/dbfn_read()/dbfn_write()/dbfn_close() calls in retry.c.
+exim-ffi = { path = "../exim-ffi" }
+
+# ── Workspace-shared external dependencies ───────────────────────────────────
+# All versions inherited from root Cargo.toml [workspace.dependencies].
+
+# serde: Serialization framework for delivery state structures. Enables
+# structured serialization of retry records, delivery status data, and
+# parallel delivery pipe protocol messages between parent and child processes.
+serde = { workspace = true }
+
+# thiserror: Error type derivation for delivery-specific error types:
+# DeliveryError (orchestrator failures), RetryError (retry scheduling failures),
+# BounceError (bounce generation failures), JournalError (journal I/O failures).
+# Provides ergonomic Display/Error trait implementations for each error domain.
 thiserror = { workspace = true }
+
+# tracing: Structured logging and debugging infrastructure replacing the C
+# DEBUG(D_deliver), DEBUG(D_retry), DEBUG(D_transport), and debug_printf()
+# calls used extensively throughout deliver.c (~200 debug sites), retry.c
+# (~30 debug sites), and route.c (~50 debug sites). Events are emitted through
+# tracing spans matching Exim's -d debug selector system.
 tracing = { workspace = true }
+
+# log: Logging facade for compatibility with crates that use the log API
+# instead of tracing. The tracing-log bridge in exim-core ensures all
+# log::info!() etc. calls are captured by the tracing subscriber.
+log = { workspace = true }
+
+# libc: C type definitions and POSIX system call bindings required for the
+# parallel delivery subprocess pool. Used for fork(), pipe(), poll(), waitpid(),
+# and signal-related operations that manage the parent-child IPC during
+# parallel remote delivery (par_wait, par_read_pipe in deliver.c).
 libc = { workspace = true }
+
+# nix: Safe POSIX API wrappers for fork/exec, signal handling (SIGCHLD for
+# child process reaping, SIGTERM for graceful shutdown), pipe operations for
+# parent-child communication in parallel delivery, and uid/gid management
+# for privilege operations during local delivery.
+# Version pinned to 0.31.2 via workspace (AAP §0.6.1).
 nix = { workspace = true }
+
+# anyhow: Application-level error handling in the delivery orchestrator.
+# Used for propagating errors through the complex delivery pipeline where
+# multiple error sources (routing, transport, retry, spool I/O) converge
+# in the top-level deliver_message() orchestrator.
+anyhow = { workspace = true }
+
+# regex: Rust-native regular expression library used for domain list matching
+# in sort_remote_deliveries() (grouping addresses by destination for parallel
+# delivery), retry key pattern matching in retry_find_config(), and address
+# pattern matching in routing precondition evaluation.
+regex = { workspace = true }
+
+# =============================================================================
+# Library Target
+# =============================================================================
+# Pure library crate consumed by exim-core (for top-level message delivery
+# dispatch) and exim-smtp (for SMTP delivery integration). No binary targets.
+# Crate name in Rust code: exim_deliver (hyphen → underscore per Rust convention).
