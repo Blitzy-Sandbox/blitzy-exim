@@ -16,5 +16,13 @@ pub mod resolver;
 
 // Re-export primary types for convenience.
 pub use dnsbl::{DnsblChecker, DnsblResult, DnsblSpec};
-pub use resolver::{DnsError, DnsResolver, DnsResolverConfig, DnsResultCode};
-pub use resolver::{HostEntry, MxRecord, SrvRecord, TlsaRecord, TxtRecord};
+pub use resolver::{
+    DnsError, DnsRecord, DnsRecordData, DnsRecordIterator, DnsRecordType, DnsResolver, DnsResponse,
+    DnsResult, DnsResultCode, DnssecDomains, DnssecStatus, HostFindFlags, HostFindResult, HostItem,
+    HostLookupMethod, HostNameResult, MxRecord, NegativeCache, NegativeCacheEntry, ResolverConfig,
+    SpecialDnsType, SrvRecord, TlsaRecord, TxtRecord,
+};
+
+// Backward-compatible aliases
+pub use resolver::DnsSection;
+pub use resolver::{reverse_ipv4, reverse_ipv6};
