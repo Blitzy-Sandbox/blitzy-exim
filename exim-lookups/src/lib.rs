@@ -7,6 +7,9 @@
 
 pub mod helpers;
 
+#[cfg(feature = "lookup-cdb")]
+pub mod cdb;
+
 #[cfg(feature = "lookup-lsearch")]
 pub mod lsearch;
 
