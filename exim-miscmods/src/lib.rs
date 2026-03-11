@@ -229,8 +229,8 @@ pub use arc::{
 
 #[cfg(feature = "spf")]
 pub use spf::{
-    spf_close, spf_conn_init, spf_find, spf_process, spf_reset, spf_version_report, SpfError,
-    SpfResult, SpfState,
+    authres_spf, spf_close, spf_conn_init, spf_find, spf_get_results, spf_process, spf_reset,
+    spf_version_report, SpfError, SpfResult, SpfState,
 };
 
 // ── DMARC re-exports ─────────────────────────────────────────────────────────
