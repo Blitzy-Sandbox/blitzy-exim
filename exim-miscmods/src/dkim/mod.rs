@@ -4,6 +4,7 @@
 //! Full implementation pending from dedicated agent.
 
 pub mod pdkim;
+pub mod transport;
 
 use std::fmt;
 
