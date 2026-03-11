@@ -36,6 +36,16 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS");
     println!("cargo:rerun-if-env-changed=EXIM_PERL_BIN");
 
+    // Emit cargo:rustc-check-cfg directives for ALL custom cfg attributes
+    // used across any feature-gated module. These must be emitted unconditionally
+    // so the check-cfg lint doesn't fire regardless of which features are active.
+    println!("cargo::rustc-check-cfg=cfg(gsasl_have_scram_sha_256)");
+    println!("cargo::rustc-check-cfg=cfg(gsasl_scram_s_key)");
+    println!("cargo::rustc-check-cfg=cfg(gsasl_have_exporter)");
+    println!("cargo::rustc-check-cfg=cfg(gsasl_channelbind_hack)");
+    println!("cargo::rustc-check-cfg=cfg(radius_lib_radlib)");
+    println!("cargo::rustc-check-cfg=cfg(radius_lib_radiusclient)");
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set by Cargo"));
 
     // Write active feature manifest for build diagnostics and to ensure
@@ -347,6 +357,12 @@ fn generate_radius_bindings(out_dir: &Path) {
     let radiusclient_hdr = PathBuf::from("/usr/include/radiusclient.h");
     let radlib_hdr = PathBuf::from("/usr/include/radlib.h");
 
+    // Also check for radcli (modern fork of radiusclient-ng / freeradius-client).
+    // radcli installs its header at /usr/include/radcli/radcli.h and provides
+    // pkg-config name "radcli" with library "-lradcli".  Our compatibility shim
+    // at /usr/include/radiusclient.h includes <radcli/radcli.h>.
+    let radcli_hdr = PathBuf::from("/usr/include/radcli/radcli.h");
+
     let (header_content, pkg_name, fallback_lib, is_radlib) = if freeradius_hdr.exists() {
         (
             "#include <freeradius-client.h>\n",
@@ -354,6 +370,10 @@ fn generate_radius_bindings(out_dir: &Path) {
             "freeradius-client",
             false,
         )
+    } else if radcli_hdr.exists() {
+        // radcli is the modern fork — use its pkg-config name and library name.
+        // The radiusclient.h shim (if present) just includes <radcli/radcli.h>.
+        ("#include <radcli/radcli.h>\n", "radcli", "radcli", false)
     } else if radiusclient_hdr.exists() {
         (
             "#include <radiusclient.h>\n",
@@ -412,6 +432,11 @@ fn generate_radius_bindings(out_dir: &Path) {
             .allowlist_function("rc_conf_str")
             .allowlist_type("rc_handle")
             .allowlist_type("VALUE_PAIR")
+            // Allow the enum types that contain the PW_* constants
+            // (radcli/radiusclient define these as enum variants, not macros)
+            .allowlist_type("rc_attr_id")
+            .allowlist_type("rc_service_type")
+            .allowlist_type("rc_result_codes")
             .allowlist_var("PW_USER_NAME")
             .allowlist_var("PW_USER_PASSWORD")
             .allowlist_var("PW_SERVICE_TYPE")
@@ -643,13 +668,6 @@ SV* exim_ffi_ERRSV(pTHX);
 #[cfg(feature = "ffi-gsasl")]
 fn generate_gsasl_bindings(out_dir: &Path) {
     let (include_paths, _link_paths) = probe_library("libgsasl", "gsasl");
-
-    // Emit cargo:rustc-check-cfg directives so the compiler knows about
-    // our custom cfg attributes (required for -D warnings / check-cfg lint).
-    println!("cargo::rustc-check-cfg=cfg(gsasl_have_scram_sha_256)");
-    println!("cargo::rustc-check-cfg=cfg(gsasl_scram_s_key)");
-    println!("cargo::rustc-check-cfg=cfg(gsasl_have_exporter)");
-    println!("cargo::rustc-check-cfg=cfg(gsasl_channelbind_hack)");
 
     // Detect GSASL version and emit cfg attributes for version-dependent
     // features (matching the C preprocessor gating in gsasl.c lines 43-71).
