@@ -27,3 +27,6 @@ pub mod json;
 
 #[cfg(feature = "lookup-sqlite")]
 pub mod sqlite;
+
+#[cfg(feature = "lookup-nmh")]
+pub mod nmh;
