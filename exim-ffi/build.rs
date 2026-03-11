@@ -1067,6 +1067,12 @@ fn generate_bdb_bindings(out_dir: &Path) {
         );
     }
 
+    // Declare custom cfg flags so that `cargo check` with `-D warnings`
+    // does not emit `unexpected_cfgs` errors (Rust 1.80+ check-cfg lint).
+    println!("cargo::rustc-check-cfg=cfg(bdb_3_plus)");
+    println!("cargo::rustc-check-cfg=cfg(bdb_41_plus)");
+    println!("cargo::rustc-check-cfg=cfg(bdb_43_plus)");
+
     // Emit cfg attributes for version-dependent API branching
     if major >= 3 {
         println!("cargo:rustc-cfg=bdb_3_plus");
@@ -1100,16 +1106,21 @@ fn generate_bdb_bindings(out_dir: &Path) {
         .allowlist_type("DBT")
         .allowlist_type("DB_LOCK")
         .allowlist_type("DB_TXN")
-        // Flag constants
+        // Flag constants — open/env/general flags
         .allowlist_var("DB_CREATE")
         .allowlist_var("DB_RDONLY")
         .allowlist_var("DB_TRUNCATE")
-        .allowlist_var("DB_BTREE")
-        .allowlist_var("DB_HASH")
+        .allowlist_var("DB_PRIVATE")
         .allowlist_var("DB_INIT_.*")
+        .allowlist_var("DB_FORCESYNC")
+        // Flag constants — put operation flags
+        .allowlist_var("DB_NOOVERWRITE")
+        // Flag constants — cursor operation flags
+        .allowlist_var("DB_FIRST")
+        .allowlist_var("DB_NEXT")
+        // Return code constants
         .allowlist_var("DB_NOTFOUND")
         .allowlist_var("DB_KEYEXIST")
-        .allowlist_var("DB_FORCESYNC")
         // Version constants (for runtime checks)
         .allowlist_var("DB_VERSION_MAJOR")
         .allowlist_var("DB_VERSION_MINOR")
