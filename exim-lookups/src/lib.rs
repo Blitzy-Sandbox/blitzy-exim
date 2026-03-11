@@ -34,5 +34,8 @@ pub mod nmh;
 #[cfg(feature = "lookup-psl")]
 pub mod psl;
 
+#[cfg(feature = "lookup-passwd")]
+pub mod passwd;
+
 #[cfg(feature = "lookup-testdb")]
 pub mod testdb;

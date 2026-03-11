@@ -834,6 +834,7 @@ dependencies = [
  "libc",
  "log",
  "mysql_async",
+ "nix",
  "publicsuffix",
  "redis",
  "regex",

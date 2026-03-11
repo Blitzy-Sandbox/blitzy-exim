@@ -76,8 +76,12 @@ log = { workspace = true }
 # Pattern matching for wildlsearch/nwildlsearch in lsearch.rs
 regex = { workspace = true }
 
-# System interfaces: getpwnam() for passwd lookup, stat/fstat in check_file
+# System interfaces: stat/fstat in check_file helpers
 libc = { workspace = true }
+
+# Safe POSIX wrappers — User::from_name() for passwd lookup (wraps getpwnam_r)
+# OPTIONAL: only pulled in when lookup-passwd feature is enabled
+nix = { workspace = true, optional = true }
 
 # Compile-time driver registration via inventory::submit! macro
 inventory = { workspace = true }
@@ -203,8 +207,8 @@ lookup-nmh = []
 # Oracle OCI SQL lookup via FFI
 lookup-oracle = ["dep:exim-ffi"]
 
-# System passwd database lookup (pure Rust via libc getpwnam)
-lookup-passwd = []
+# System passwd database lookup (pure Rust via nix User::from_name — safe getpwnam_r)
+lookup-passwd = ["dep:nix"]
 
 # PostgreSQL SQL lookup via tokio-postgres + connection pooling (async, bridged)
 lookup-pgsql = ["dep:tokio-postgres", "dep:deadpool-postgres", "async-lookups"]
