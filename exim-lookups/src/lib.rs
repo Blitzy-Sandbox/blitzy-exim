@@ -18,3 +18,6 @@ pub mod pgsql;
 
 #[cfg(feature = "lookup-ldap")]
 pub mod ldap;
+
+#[cfg(feature = "lookup-redis")]
+pub mod redis;
