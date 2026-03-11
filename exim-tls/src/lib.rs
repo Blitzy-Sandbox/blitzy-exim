@@ -4,6 +4,12 @@
 // (rustls default, openssl optional), DANE/TLSA, OCSP, SNI, client cert
 // verification, and TLS session resumption.
 
+/// Server Name Indication (SNI) support for TLS virtual hosting.
+///
+/// Enables different TLS certificates, keys, and OCSP responses per server
+/// name. Always compiled regardless of TLS backend selection.
+pub mod sni;
+
 /// Client certificate extraction and verification.
 ///
 /// Implements X.509 client certificate verification for TLS connections,
