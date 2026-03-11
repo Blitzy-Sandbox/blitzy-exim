@@ -153,6 +153,12 @@ pub mod nisplus;
 #[cfg(feature = "ffi-cyrus-sasl")]
 pub mod cyrus_sasl;
 
+/// LMDB environment safe wrapper — centralises the `unsafe` heed::EnvOpenOptions::open()
+/// call so that exim-lookups/src/lmdb.rs remains 100% safe Rust (per AAP §0.7.2).
+/// Provides [`lmdb::open_env_readonly`] for opening LMDB databases in read-only mode.
+#[cfg(feature = "ffi-lmdb")]
+pub mod lmdb;
+
 /// Hints database abstraction layer — common trait and backend implementations.
 /// The `hintsdb` module is always available; individual backends are feature-gated
 /// internally (hintsdb-tdb, hintsdb-gdbm, hintsdb-ndbm, hintsdb-bdb).

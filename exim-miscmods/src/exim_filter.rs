@@ -29,6 +29,20 @@ use exim_store::{CleanString, MessageStore, TaintedString};
 use regex::Regex;
 use tracing::{debug, error, info, warn};
 
+// ---------------------------------------------------------------------------
+// Safety constants
+// ---------------------------------------------------------------------------
+
+/// Maximum number of commands that the filter interpreter will execute in a
+/// single invocation. This is a defense-in-depth safety bound to prevent
+/// runaway evaluation of pathological filters. Under normal operation the
+/// command count is inherently bounded by the parsed AST size, but this guard
+/// provides an additional layer of protection against unexpected iteration.
+///
+/// The limit is generous (10,000 commands) — well above any legitimate filter
+/// while still preventing unbounded resource consumption.
+const MAX_COMMANDS: usize = 10_000;
+
 // Re-export dependency types used in the public API so that downstream
 // callers can reference them without adding direct dependencies.
 /// Arena allocator re-exported for callers managing per-message lifetimes.
@@ -1564,10 +1578,24 @@ fn interpret_commands(
     state: &mut FilterState,
 ) -> Result<FilterResult, FilterError> {
     let mut result = FilterResult::NotDelivered;
+    let mut executed_count: usize = 0;
 
     for cmd in commands {
         if state.finish_obeyed {
             break;
+        }
+
+        // Defense-in-depth: guard against runaway command execution.
+        // Under normal operation the iteration is bounded by the parsed AST
+        // size, but this explicit limit provides an additional safety net.
+        executed_count += 1;
+        if executed_count > MAX_COMMANDS {
+            return Err(FilterError::EvalError {
+                line: 0,
+                message: format!(
+                    "filter exceeded maximum command execution limit ({MAX_COMMANDS})"
+                ),
+            });
         }
         match cmd {
             FilterCommand::Deliver { address, seen } => {

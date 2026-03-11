@@ -23,6 +23,19 @@
 //   - SQL quoting via single-quote doubling (C lines 138-159)
 //   - Busy timeout to handle database lock contention (C line 47)
 //
+// ## SQL Injection Safety Note
+//
+// Query strings are executed as raw SQL via `rusqlite::Connection::prepare()`,
+// matching the C implementation's behavior of passing pre-expanded strings
+// to `sqlite3_exec()`. SQL safety relies on Exim's string expansion engine
+// (`exim-expand`) which applies taint checking at the call site (via
+// `Tainted<T>`/`Clean<T>` newtypes from `exim-store`). The expansion
+// engine ensures that untrusted data from SMTP envelope, headers, or other
+// tainted sources cannot be injected into lookup queries without explicit
+// administrator opt-in via `${quote_sqlite:...}` or similar sanitization.
+// This is not a regression from C behavior — the C implementation had the
+// identical SQL injection surface with identical upstream taint protections.
+//
 // Per AAP §0.7.2: This file contains ZERO `unsafe` code.
 // Per AAP §0.6.1: Uses rusqlite 0.38.0.
 

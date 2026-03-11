@@ -23,13 +23,11 @@
 //   read lock between operations.
 //
 // Safety:
-//   heed::EnvOpenOptions::open() is the sole operation requiring `unsafe`, due to
-//   LMDB's memory-mapped file architecture. This unsafety is inherent to the
-//   underlying C library (mdb_env_open uses mmap) and cannot be avoided with any
-//   Rust LMDB wrapper. We apply #[allow(unsafe_code)] with a detailed justification
-//   on the open() method only.
+//   The `unsafe` heed::EnvOpenOptions::open() call has been moved into
+//   exim-ffi/src/lmdb.rs as a safe wrapper (exim_ffi::lmdb::open_env_readonly).
+//   This file is now 100% safe Rust — zero `unsafe` blocks, per AAP §0.7.2.
 //
-// Per AAP §0.7.2: This file minimizes `unsafe` to a single documented call site.
+// Per AAP §0.7.2: Zero `unsafe` outside exim-ffi crate.
 // Per AAP §0.7.3: No tokio or async — all operations are synchronous.
 
 use std::path::Path;
@@ -107,22 +105,6 @@ impl LookupDriver for LmdbLookup {
     /// - `filename` is `None`
     /// - The LMDB environment cannot be created or opened (file not found,
     ///   permission denied, corrupt database, etc.)
-    //
-    // TECHNICAL JUSTIFICATION for #[allow(unsafe_code)]:
-    // heed::EnvOpenOptions::open() is marked `unsafe` because LMDB's
-    // memory-mapped file architecture (mdb_env_open → mmap) means that:
-    //   1. Opening the same environment from multiple processes without proper
-    //      lock file coordination can cause data corruption.
-    //   2. The mapped memory region can be invalidated by external file
-    //      modifications.
-    // We satisfy these safety requirements because:
-    //   - We open in read-only mode (MDB_RDONLY), preventing write corruption.
-    //   - Exim's fork-per-connection model ensures each process gets its own
-    //     environment handle.
-    //   - File paths come from validated Exim configuration, not user input.
-    //   - MDB_NOSUBDIR is set because Exim LMDB lookups use single-file
-    //     databases, not directory-based ones.
-    #[allow(unsafe_code)]
     fn open(&self, filename: Option<&str>) -> Result<LookupHandle, DriverError> {
         let path = filename.ok_or_else(|| {
             DriverError::ExecutionFailed(
@@ -132,21 +114,10 @@ impl LookupDriver for LmdbLookup {
 
         tracing::debug!(path = %path, "LMDB: opening environment");
 
-        // SAFETY: See TECHNICAL JUSTIFICATION above.
-        // flags() is unsafe because certain LMDB environment flags (e.g.,
-        // NO_LOCK) can introduce unsoundness; NO_SUB_DIR and READ_ONLY are
-        // safe in practice but the API is conservatively marked unsafe.
-        // open() is unsafe because LMDB uses memory-mapped I/O.
-        // We open in read-only mode with validated paths from Exim configuration.
-        let env = unsafe {
-            let mut env_options = heed::EnvOpenOptions::new();
-            // Set flags matching the C code: MDB_NOSUBDIR | MDB_RDONLY
-            // MDB_NOSUBDIR: path is the database file, not a directory
-            // MDB_RDONLY: open for reading only
-            env_options.flags(heed::EnvFlags::NO_SUB_DIR | heed::EnvFlags::READ_ONLY);
-            env_options.open(Path::new(path))
-        }
-        .map_err(|e| {
+        // Delegate the unsafe heed::EnvOpenOptions::open() call to the
+        // exim-ffi crate's safe wrapper, keeping this file 100% safe Rust
+        // per AAP §0.7.2.
+        let env = exim_ffi::lmdb::open_env_readonly(Path::new(path)).map_err(|e| {
             tracing::warn!(
                 path = %path,
                 error = %e,

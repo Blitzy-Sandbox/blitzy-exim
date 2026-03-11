@@ -75,6 +75,7 @@ ffi-whoson = []        # libwhoson — WHOSON dynamic IP tracking (replaces LOOK
 ffi-nisplus = []       # libnsl — NIS+ directory service lookups (replaces LOOKUP_NISPLUS)
 ffi-nis = []           # libnsl — NIS (YP) directory service lookups (replaces LOOKUP_NIS)
 ffi-cyrus-sasl = []   # libsasl2 — Cyrus SASL server authentication (replaces AUTH_CYRUS_SASL)
+ffi-lmdb = ["dep:heed"]  # LMDB safe open wrapper — centralises the unsafe mmap call from heed
 
 # Hints database backend features
 # These are mutually exclusive at runtime but can all be compiled simultaneously.
@@ -110,6 +111,12 @@ tracing = { workspace = true }
 # handlers; this crate centralises that unsafe boundary per AAP §0.7.2.
 # Version pinned via workspace (0.31.2 per AAP §0.6.1).
 nix = { workspace = true }
+
+# LMDB environment wrapper — heed::EnvOpenOptions::open() requires `unsafe`
+# due to LMDB's memory-mapped I/O. This crate centralises that unsafety so
+# exim-lookups/src/lmdb.rs remains 100% safe Rust.
+# Only compiled when the ffi-lmdb feature is enabled.
+heed = { version = "0.22.0", optional = true }
 
 # =============================================================================
 # Build Dependencies

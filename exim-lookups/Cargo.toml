@@ -174,8 +174,15 @@ lookup-cdb = []
 # DBM hints database glue (needs FFI for Berkeley DB/GDBM/NDBM backends)
 lookup-dbmdb = ["dep:exim-ffi"]
 
+# Hints database backend selection for DBM lookups (forwarded to exim-ffi).
+# Only one should be active at build time. These map to C build USE_* flags.
+hintsdb-tdb = ["lookup-dbmdb", "exim-ffi/hintsdb-tdb"]
+hintsdb-gdbm = ["lookup-dbmdb", "exim-ffi/hintsdb-gdbm"]
+hintsdb-ndbm = ["lookup-dbmdb", "exim-ffi/hintsdb-ndbm"]
+hintsdb-bdb = ["lookup-dbmdb", "exim-ffi/hintsdb-bdb"]
+
 # DNS query lookup via hickory-resolver (A/AAAA/MX/SRV/TLSA/PTR/TXT)
-lookup-dnsdb = ["dep:hickory-resolver"]
+lookup-dnsdb = ["dep:hickory-resolver", "async-lookups"]
 
 # Directory entry search (pure Rust, uses std::fs)
 lookup-dsearch = []
@@ -186,8 +193,10 @@ lookup-json = ["dep:serde_json"]
 # LDAP directory lookup via ldap3 crate (async, bridged via block_on)
 lookup-ldap = ["dep:ldap3", "async-lookups"]
 
-# LMDB key-value store via heed crate (typed LMDB wrapper)
-lookup-lmdb = ["dep:heed"]
+# LMDB key-value store — uses exim-ffi/src/lmdb.rs safe wrapper for env open,
+# and heed directly for read transactions and database access (all safe APIs).
+# exim-ffi/ffi-lmdb enables the safe open_env_readonly() wrapper in exim-ffi.
+lookup-lmdb = ["dep:heed", "exim-ffi/ffi-lmdb"]
 
 # Line-scan file lookup: lsearch, wildlsearch, nwildlsearch (pure Rust)
 lookup-lsearch = []

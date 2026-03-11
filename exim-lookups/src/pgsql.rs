@@ -12,6 +12,19 @@
 // Per AAP §0.7.3: The tokio runtime is scoped ONLY to lookup execution via
 //   `block_on()`. It MUST NOT be used for the main daemon event loop.
 //
+// ## SQL Injection Safety Note
+//
+// Query strings are executed as raw SQL via `client.simple_query()`,
+// matching the C implementation's behavior of passing pre-expanded strings
+// to `PQexec()`. SQL safety relies on Exim's string expansion engine
+// (`exim-expand`) which applies taint checking at the call site (via
+// `Tainted<T>`/`Clean<T>` newtypes from `exim-store`). The expansion
+// engine ensures that untrusted data from SMTP envelope, headers, or other
+// tainted sources cannot be injected into lookup queries without explicit
+// administrator opt-in via `${quote_pgsql:...}` or similar sanitization.
+// This is not a regression from C behavior — the C implementation had the
+// identical SQL injection surface with identical upstream taint protections.
+//
 // Connection spec format (matching C pgsql.c):
 //   TCP:   host:port/database/user/password
 //   Unix:  (/path/to/.s.PGSQL.5432)/database/user/password
