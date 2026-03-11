@@ -844,6 +844,7 @@ dependencies = [
  "inventory",
  "libc",
  "log",
+ "nix",
  "pcre2",
  "regex",
  "serde",

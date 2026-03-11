@@ -230,6 +230,11 @@ regex = { workspace = true }
 # exim_filter.c and sieve_filter.c which use PCRE2 regex syntax.
 pcre2 = { workspace = true }
 
+# Safe POSIX socket wrappers — used by the DSCP module for zero-unsafe
+# getsockname() (address family detection) and setsockopt() (IP_TOS /
+# IPV6_TCLASS). The "net" feature enables IpTos / Ipv6TClass socket options.
+nix = { workspace = true, features = ["net"] }
+
 # C type definitions — required for low-level operations in DSCP (setsockopt
 # with IPPROTO_IP/IPV6_TCLASS) and PROXY protocol (socket address structures).
 libc = { workspace = true }

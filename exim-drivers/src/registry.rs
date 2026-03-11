@@ -19,17 +19,21 @@ use crate::auth_driver::AuthDriverFactory;
 use crate::lookup_driver::LookupDriverFactory;
 use crate::router_driver::RouterDriverFactory;
 use crate::transport_driver::TransportDriverFactory;
+use crate::DriverInfoBase;
 
 // =============================================================================
 // Inventory Collection Declarations
 // =============================================================================
 // These macros declare compile-time collection points for each driver factory type.
 // Driver implementation crates register their factories using `inventory::submit!`.
+// DriverInfoBase is collected for misc modules (e.g., DSCP, PROXY, SOCKS) that
+// register metadata without a dedicated factory trait — per AAP §0.4.2.
 
 inventory::collect!(AuthDriverFactory);
 inventory::collect!(RouterDriverFactory);
 inventory::collect!(TransportDriverFactory);
 inventory::collect!(LookupDriverFactory);
+inventory::collect!(DriverInfoBase);
 
 // =============================================================================
 // DriverRegistry
