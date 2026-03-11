@@ -1179,13 +1179,26 @@ fn generate_gdbm_bindings(out_dir: &Path) {
 #[cfg(feature = "hintsdb-ndbm")]
 fn generate_ndbm_bindings(out_dir: &Path) {
     // NDBM header location varies by platform:
-    //   Standard:    /usr/include/ndbm.h
-    //   GDBM compat: /usr/include/gdbm-ndbm.h  (link against gdbm_compat)
+    //   Standard:    /usr/include/ndbm.h    (may be provided by libndbm-dev OR libgdbm-compat-dev)
+    //   GDBM compat: /usr/include/gdbm-ndbm.h  (always link against gdbm_compat)
+    //
+    // On most modern Linux distributions, /usr/include/ndbm.h is actually provided by
+    // libgdbm-compat-dev (it includes <gdbm.h> internally) and the NDBM functions live
+    // in libgdbm_compat.so, NOT libndbm.so. We detect this by checking whether the
+    // gdbm-compat header also exists alongside the standard ndbm.h.
     let ndbm_standard = PathBuf::from("/usr/include/ndbm.h");
     let ndbm_gdbm_compat = PathBuf::from("/usr/include/gdbm-ndbm.h");
+    let libndbm_so = PathBuf::from("/usr/lib/x86_64-linux-gnu/libndbm.so");
 
-    let (header_include, fallback_lib) = if ndbm_standard.exists() {
+    let (header_include, fallback_lib) = if ndbm_standard.exists() && libndbm_so.exists() {
+        // A real standalone libndbm is present — use it directly.
         ("#include <ndbm.h>\n", "ndbm")
+    } else if ndbm_standard.exists() && ndbm_gdbm_compat.exists() {
+        // ndbm.h is provided by gdbm-compat — link against gdbm_compat + gdbm.
+        ("#include <ndbm.h>\n", "gdbm_compat")
+    } else if ndbm_standard.exists() {
+        // ndbm.h exists but origin unclear — try gdbm_compat first (most common).
+        ("#include <ndbm.h>\n", "gdbm_compat")
     } else if ndbm_gdbm_compat.exists() {
         ("#include <gdbm-ndbm.h>\n", "gdbm_compat")
     } else {
