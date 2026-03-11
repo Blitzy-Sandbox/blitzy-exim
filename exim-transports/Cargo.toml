@@ -115,7 +115,7 @@ pcre2 = { workspace = true, optional = true }
 # signal handling) and appendfile transport (file locking via flock/fcntl,
 # chown operations, directory creation with mode). Provides safe abstractions
 # over libc without requiring unsafe blocks (AAP §0.7.2 compliance).
-nix = { workspace = true, optional = true }
+nix = { workspace = true, optional = true, features = ["fs"] }
 
 # =============================================================================
 # Feature Flags
@@ -214,7 +214,7 @@ transport-smtp = []
 # Experimental spool file copy transport. NOT in default features.
 # Replaces queuefile.c. Requires openat() support (guaranteed on Linux).
 # C guard: #ifdef EXPERIMENTAL_QUEUEFILE
-transport-queuefile = []
+transport-queuefile = ["dep:nix"]
 
 # ── Sub-feature flags for format/protocol support ────────────────────────────
 # These control sub-functionality within transport drivers, mapping to C
