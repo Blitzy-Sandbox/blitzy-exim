@@ -7,6 +7,9 @@
 
 pub mod helpers;
 
+#[cfg(feature = "lookup-lsearch")]
+pub mod lsearch;
+
 #[cfg(feature = "lookup-mysql")]
 pub mod mysql;
 
