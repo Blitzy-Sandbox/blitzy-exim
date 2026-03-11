@@ -202,7 +202,7 @@ transport-lmtp = []
 # resource limits, and timeout handling.
 # Replaces pipe.c.
 # C guard: #ifdef TRANSPORT_PIPE
-transport-pipe = []
+transport-pipe = ["dep:nix"]
 
 # Full outbound SMTP/LMTP state machine with TLS, DANE, PIPELINING, CHUNKING,
 # DKIM signing, PRDR, PIPE CONNECT early pipelining, and ESMTP extensions.
