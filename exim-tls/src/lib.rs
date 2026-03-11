@@ -36,3 +36,10 @@ pub mod session_cache;
 /// Feature-gated behind `tls-openssl` (replaces C `#ifdef USE_OPENSSL`).
 #[cfg(feature = "tls-openssl")]
 pub mod openssl_backend;
+
+/// Rustls TLS backend — default backend using the `rustls` 0.23.37 crate.
+/// Feature-gated behind `tls-rustls` (replaces C `#ifdef USE_GNUTLS`).
+/// This is the default backend per AAP §0.4.2, providing a memory-safe TLS
+/// implementation with the `ring` crypto provider.
+#[cfg(feature = "tls-rustls")]
+pub mod rustls_backend;
