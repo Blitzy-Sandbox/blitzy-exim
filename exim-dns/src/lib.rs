@@ -15,7 +15,10 @@ pub mod dnsbl;
 pub mod resolver;
 
 // Re-export primary types for convenience.
-pub use dnsbl::{DnsblChecker, DnsblResult, DnsblSpec};
+pub use dnsbl::{
+    one_check_dnsbl, reverse_ip, verify_check_dnsbl, DeferAction, DnsblCache, DnsblCacheEntry,
+    DnsblCheckResult, DnsblVerifyResult, MatchType,
+};
 pub use resolver::{
     DnsError, DnsRecord, DnsRecordData, DnsRecordIterator, DnsRecordType, DnsResolver, DnsResponse,
     DnsResult, DnsResultCode, DnssecDomains, DnssecStatus, HostFindFlags, HostFindResult, HostItem,
