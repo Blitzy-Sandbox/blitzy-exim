@@ -30,5 +30,5 @@
 pub mod ugid;
 
 // Re-export primary types from ugid for ergonomic access by router drivers.
+pub use ugid::GetUgidError;
 pub use ugid::UgidBlock;
-pub use ugid::UgidError;
