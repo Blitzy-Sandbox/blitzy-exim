@@ -129,6 +129,11 @@ exim-drivers = { path = "../exim-drivers" }
 # allocation primitives for per-message memory management.
 exim-store = { path = "../exim-store" }
 
+# String expansion engine — provides expand_string() and ExpandError used by
+# the server_condition helper (helpers/server_condition.rs) to evaluate
+# authorization conditions after SASL exchange completes.
+exim-expand = { path = "../exim-expand" }
+
 # FFI bindings for C libraries without viable Rust alternatives.
 # OPTIONAL: only compiled when an FFI-dependent auth feature is enabled.
 # Used by: auth-cyrus-sasl (libsasl2), auth-gsasl (libgsasl),

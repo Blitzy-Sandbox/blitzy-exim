@@ -669,6 +669,7 @@ dependencies = [
  "des",
  "digest",
  "exim-drivers",
+ "exim-expand",
  "exim-ffi",
  "exim-store",
  "hmac",
