@@ -6,3 +6,6 @@
 //! each backend implementing the `LookupDriver` trait from `exim-drivers`.
 
 pub mod helpers;
+
+#[cfg(feature = "lookup-pgsql")]
+pub mod pgsql;
