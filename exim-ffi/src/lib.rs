@@ -26,7 +26,7 @@
 //!   `SAFETY:` comment, null-pointer checks before dereference, and RAII
 //!   `Drop` implementations to prevent resource leaks.
 //! - **Zero `unsafe` blocks exist outside this crate** — all 16 non-FFI crates
-//!   enforce `#![deny(unsafe_code)]` or `#![forbid(unsafe_code)]`.
+//!   enforce `#![deny(unsafe_code)]`.
 //!
 //! # Feature-Gated Modules
 //!

@@ -335,7 +335,7 @@ impl DmarcLibrary {
             ..ffi::OPENDMARC_LIB_T::default()
         };
 
-        // Safety: calling opendmarc_policy_library_init with a valid, zeroed
+        // SAFETY: calling opendmarc_policy_library_init with a valid, zeroed
         // OPENDMARC_LIB_T. The struct is stack-allocated and its address is
         // valid for the duration of the call. The function writes to fields of
         // the struct and returns a status code.
@@ -361,7 +361,7 @@ impl DmarcLibrary {
     pub fn read_tld_file(&self, path: &str) -> Result<(), DmarcFfiError> {
         let c_path = to_cstring(path, "TLD file path")?;
 
-        // Safety: calling opendmarc_tld_read_file with a valid NUL-terminated
+        // SAFETY: calling opendmarc_tld_read_file with a valid NUL-terminated
         // C string. The remaining parameters are NULL (comment string, drop
         // pattern, exception pattern) matching the Exim C usage. The function
         // reads the file and populates internal TLD data structures. The
@@ -402,7 +402,7 @@ impl DmarcLibrary {
 
 impl Drop for DmarcLibrary {
     fn drop(&mut self) {
-        // Safety: calling opendmarc_policy_library_shutdown with the same
+        // SAFETY: calling opendmarc_policy_library_shutdown with the same
         // OPENDMARC_LIB_T context that was passed to library_init. The struct
         // is still valid because it is owned by self and has not been moved.
         // The function releases internal data structures allocated during init.
@@ -465,7 +465,7 @@ impl DmarcPolicyContext {
             DMARC_POLICY_IP_TYPE_IPV4 as c_int
         };
 
-        // Safety: calling opendmarc_policy_connect_init with a valid
+        // SAFETY: calling opendmarc_policy_connect_init with a valid
         // NUL-terminated C string for the IP address and a valid ip_type
         // constant. The function allocates and returns a new DMARC_POLICY_T,
         // or NULL on failure. The c_ip CString remains valid for the call.
@@ -494,7 +494,7 @@ impl DmarcPolicyContext {
     pub fn store_from_domain(&mut self, domain: &str) -> Result<(), DmarcFfiError> {
         let c_domain = to_cstring(domain, "From domain")?;
 
-        // Safety: pctx was validated non-null during construction and has not
+        // SAFETY: pctx was validated non-null during construction and has not
         // been shutdown. c_domain is a valid NUL-terminated C string. The
         // function copies the domain internally — the CString can be dropped
         // after the call returns.
@@ -532,7 +532,7 @@ impl DmarcPolicyContext {
         let c_domain = to_cstring(domain, "SPF domain")?;
         let c_human = to_cstring(human, "SPF human readable")?;
 
-        // Safety: pctx is valid non-null. c_domain and c_human are valid
+        // SAFETY: pctx is valid non-null. c_domain and c_human are valid
         // NUL-terminated C strings. result and origin are integer codes.
         // The function copies data internally.
         let status = unsafe {
@@ -577,7 +577,7 @@ impl DmarcPolicyContext {
         let c_selector = to_cstring(selector, "DKIM selector")?;
         let c_human = to_cstring(human, "DKIM human readable")?;
 
-        // Safety: pctx is valid non-null. All three CStrings are valid
+        // SAFETY: pctx is valid non-null. All three CStrings are valid
         // NUL-terminated C strings. The function copies data internally.
         let status = unsafe {
             ffi::opendmarc_policy_store_dkim(
@@ -628,7 +628,7 @@ impl DmarcPolicyContext {
             .as_ref()
             .map_or(ptr::null_mut(), |cs| cs.as_ptr() as *mut u8);
 
-        // Safety: pctx is valid non-null. c_record and c_domain are valid
+        // SAFETY: pctx is valid non-null. c_record and c_domain are valid
         // NUL-terminated C strings. org_ptr is either a valid C string or
         // NULL. The function parses the record and stores results internally.
         let status = unsafe {
@@ -659,7 +659,7 @@ impl DmarcPolicyContext {
     /// (including error states like `DMARC_POLICY_ABSENT` and
     /// `DMARC_FROM_DOMAIN_ABSENT`).
     pub fn get_policy_to_enforce(&self) -> Result<i32, DmarcFfiError> {
-        // Safety: pctx is valid non-null. The function evaluates accumulated
+        // SAFETY: pctx is valid non-null. The function evaluates accumulated
         // data and returns an OPENDMARC_STATUS_T representing the policy.
         let status = unsafe { ffi::opendmarc_get_policy_to_enforce(self.pctx) };
         Ok(status as i32)
@@ -676,7 +676,7 @@ impl DmarcPolicyContext {
     /// Returns [`DmarcFfiError`] if the fetch operation fails.
     pub fn fetch_p(&self) -> Result<i32, DmarcFfiError> {
         let mut p: c_int = 0;
-        // Safety: pctx is valid non-null. p is a valid stack-allocated int.
+        // SAFETY: pctx is valid non-null. p is a valid stack-allocated int.
         // The function writes the p= tag value to the provided pointer.
         let status = unsafe { ffi::opendmarc_policy_fetch_p(self.pctx, &mut p) };
         check_status(status, "opendmarc_policy_fetch_p")?;
@@ -694,7 +694,7 @@ impl DmarcPolicyContext {
     /// Returns [`DmarcFfiError`] if the fetch operation fails.
     pub fn fetch_sp(&self) -> Result<i32, DmarcFfiError> {
         let mut sp: c_int = 0;
-        // Safety: pctx is valid non-null. sp is a valid stack-allocated int.
+        // SAFETY: pctx is valid non-null. sp is a valid stack-allocated int.
         // The function writes the sp= tag value to the provided pointer.
         let status = unsafe { ffi::opendmarc_policy_fetch_sp(self.pctx, &mut sp) };
         check_status(status, "opendmarc_policy_fetch_sp")?;
@@ -716,7 +716,7 @@ impl DmarcPolicyContext {
         let buf_size = DMARC_MAXHOSTNAMELEN as usize;
         let mut buf: Vec<u8> = vec![0u8; buf_size];
 
-        // Safety: pctx is valid non-null. buf is a valid buffer of buf_size
+        // SAFETY: pctx is valid non-null. buf is a valid buffer of buf_size
         // bytes, all zeroed. The function writes at most (buf_size - 1) bytes
         // of the domain name into the buffer and NUL-terminates it.
         let status = unsafe {
@@ -752,7 +752,7 @@ impl DmarcPolicyContext {
         let mut dkim_align: c_int = 0;
         let mut spf_align: c_int = 0;
 
-        // Safety: pctx is valid non-null. Both alignment variables are valid
+        // SAFETY: pctx is valid non-null. Both alignment variables are valid
         // stack-allocated ints. The function writes alignment pass/fail values
         // to the provided pointers.
         let status = unsafe {
@@ -774,7 +774,7 @@ impl DmarcPolicyContext {
     ///
     /// Corresponds to `src/src/miscmods/dmarc.c` line 432.
     pub fn fetch_rua(&self) -> Vec<String> {
-        // Safety: pctx is valid non-null. Passing (NULL, 0, 1) requests that
+        // SAFETY: pctx is valid non-null. Passing (NULL, 0, 1) requests that
         // the library return a pointer to its own internal rua list without
         // copying. The returned u_char** is a NULL-terminated array of
         // NUL-terminated C strings owned by the library.
@@ -790,7 +790,7 @@ impl DmarcPolicyContext {
     ///
     /// Corresponds to `src/src/miscmods/dmarc.c` line 441.
     pub fn fetch_ruf(&self) -> Vec<String> {
-        // Safety: pctx is valid non-null. Passing (NULL, 0, 1) requests that
+        // SAFETY: pctx is valid non-null. Passing (NULL, 0, 1) requests that
         // the library return its own internal ruf list. The returned
         // u_char** is a NULL-terminated array owned by the library.
         let arr = unsafe { ffi::opendmarc_policy_fetch_ruf(self.pctx, ptr::null_mut(), 0, 1) };
@@ -808,7 +808,7 @@ impl DmarcPolicyContext {
     /// Returns [`DmarcFfiError`] if the fetch operation fails.
     pub fn fetch_pct(&self) -> Result<i32, DmarcFfiError> {
         let mut pct: c_int = 0;
-        // Safety: pctx is valid non-null. pct is a valid stack-allocated int.
+        // SAFETY: pctx is valid non-null. pct is a valid stack-allocated int.
         let status = unsafe { ffi::opendmarc_policy_fetch_pct(self.pctx, &mut pct) };
         check_status(status, "opendmarc_policy_fetch_pct")?;
         Ok(pct as i32)
@@ -827,7 +827,7 @@ impl DmarcPolicyContext {
     /// Returns [`DmarcFfiError`] if the fetch operation fails.
     pub fn fetch_adkim(&self) -> Result<i32, DmarcFfiError> {
         let mut adkim: c_int = 0;
-        // Safety: pctx is valid non-null. adkim is a valid stack-allocated int.
+        // SAFETY: pctx is valid non-null. adkim is a valid stack-allocated int.
         let status = unsafe { ffi::opendmarc_policy_fetch_adkim(self.pctx, &mut adkim) };
         check_status(status, "opendmarc_policy_fetch_adkim")?;
         Ok(adkim as i32)
@@ -846,7 +846,7 @@ impl DmarcPolicyContext {
     /// Returns [`DmarcFfiError`] if the fetch operation fails.
     pub fn fetch_aspf(&self) -> Result<i32, DmarcFfiError> {
         let mut aspf: c_int = 0;
-        // Safety: pctx is valid non-null. aspf is a valid stack-allocated int.
+        // SAFETY: pctx is valid non-null. aspf is a valid stack-allocated int.
         let status = unsafe { ffi::opendmarc_policy_fetch_aspf(self.pctx, &mut aspf) };
         check_status(status, "opendmarc_policy_fetch_aspf")?;
         Ok(aspf as i32)
@@ -856,7 +856,7 @@ impl DmarcPolicyContext {
 impl Drop for DmarcPolicyContext {
     fn drop(&mut self) {
         if !self.pctx.is_null() {
-            // Safety: calling opendmarc_policy_connect_shutdown to release the
+            // SAFETY: calling opendmarc_policy_connect_shutdown to release the
             // policy context allocated by opendmarc_policy_connect_init. The
             // pointer was validated non-null during construction. The function
             // frees all internal data and returns NULL on success or the
@@ -887,7 +887,7 @@ impl Drop for DmarcPolicyContext {
 /// assert_eq!(status_to_string(0), "DMARC_PARSE_OKAY");
 /// ```
 pub fn status_to_string(status: i32) -> String {
-    // Safety: calling opendmarc_policy_status_to_str with a plain integer
+    // SAFETY: calling opendmarc_policy_status_to_str with a plain integer
     // status code. The function returns a pointer to a static const C string
     // (string literal internal to libopendmarc). The pointer is valid for the
     // lifetime of the process. We convert it to a Rust String immediately.
@@ -895,7 +895,7 @@ pub fn status_to_string(status: i32) -> String {
     if ptr.is_null() {
         return "unknown status".to_string();
     }
-    // Safety: the pointer is non-null and points to a NUL-terminated static
+    // SAFETY: the pointer is non-null and points to a NUL-terminated static
     // C string owned by libopendmarc. CStr::from_ptr reads bytes until NUL.
     let cstr = unsafe { CStr::from_ptr(ptr) };
     cstr.to_string_lossy().into_owned()
@@ -919,7 +919,7 @@ fn collect_string_array(arr: *mut *mut ffi::u_char) -> Vec<String> {
     let mut result = Vec::new();
     let mut idx: isize = 0;
     loop {
-        // Safety: arr was returned by the library as a NULL-terminated array
+        // SAFETY: arr was returned by the library as a NULL-terminated array
         // of u_char* pointers. We advance through the array until we hit a
         // NULL sentinel. Each dereference accesses a valid pointer slot
         // because libopendmarc guarantees NULL-termination of the array.
@@ -927,7 +927,7 @@ fn collect_string_array(arr: *mut *mut ffi::u_char) -> Vec<String> {
         if entry.is_null() {
             break;
         }
-        // Safety: entry is a non-null pointer to a NUL-terminated C string
+        // SAFETY: entry is a non-null pointer to a NUL-terminated C string
         // owned by the library (when constant=1). CStr::from_ptr reads until
         // NUL. The string remains valid until the policy context is dropped.
         let cstr = unsafe { CStr::from_ptr(entry as *const c_char) };

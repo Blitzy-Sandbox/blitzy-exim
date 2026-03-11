@@ -219,7 +219,7 @@ fn collect_status_messages(status_value: u32, status_type: i32, out: &mut Vec<St
             value: ptr::null_mut(),
         };
 
-        // Safety justification: calling gss_display_status to convert a GSSAPI
+        // SAFETY: calling gss_display_status to convert a GSSAPI
         // status code into a human-readable string. All pointer arguments point
         // to valid stack-allocated variables. The output buffer is managed by
         // GSSAPI and released via gss_release_buffer below.
@@ -235,7 +235,7 @@ fn collect_status_messages(status_value: u32, status_type: i32, out: &mut Vec<St
         };
 
         if !is_gss_error(maj) && buf.length > 0 && !buf.value.is_null() {
-            // Safety justification: gss_display_status succeeded and returned
+            // SAFETY: gss_display_status succeeded and returned
             // a non-empty buffer. The value pointer is valid for `length` bytes
             // as guaranteed by the GSSAPI specification. We create a byte slice
             // from the raw pointer and length, then convert to a Rust String.
@@ -246,7 +246,7 @@ fn collect_status_messages(status_value: u32, status_type: i32, out: &mut Vec<St
 
         if buf.length > 0 && !buf.value.is_null() {
             let mut release_min: u32 = 0;
-            // Safety justification: releasing the buffer allocated by
+            // SAFETY: releasing the buffer allocated by
             // gss_display_status. The buffer descriptor is valid because
             // gss_display_status succeeded and populated it.
             unsafe {
@@ -312,7 +312,7 @@ impl GssName {
             value: c_name.as_ptr() as *mut libc::c_void,
         };
 
-        // Safety justification: calling gss_import_name with
+        // SAFETY: calling gss_import_name with
         // GSS_C_NT_HOSTBASED_SERVICE OID to create a GSSAPI name from a
         // "service@host" string. The input buffer points to valid,
         // null-terminated memory owned by `c_name` which outlives this call.
@@ -347,7 +347,7 @@ impl GssName {
         };
         let mut oid: ffi::gss_OID = ptr::null_mut();
 
-        // Safety justification: calling gss_display_name to convert the
+        // SAFETY: calling gss_display_name to convert the
         // internal GSSAPI name to a human-readable string representation.
         // `self.name` is a valid gss_name_t obtained from gss_import_name
         // or gss_accept_sec_context. The output buffer and OID are valid
@@ -361,7 +361,7 @@ impl GssName {
         // Extract the string from the GSSAPI buffer (length-delimited, not
         // necessarily null-terminated).
         let result = if buf.length > 0 && !buf.value.is_null() {
-            // Safety justification: gss_display_name succeeded and returned
+            // SAFETY: gss_display_name succeeded and returned
             // a non-empty buffer. The value pointer is valid for `length`
             // bytes as guaranteed by the GSSAPI specification.
             let bytes = unsafe { std::slice::from_raw_parts(buf.value as *const u8, buf.length) };
@@ -373,7 +373,7 @@ impl GssName {
         // Release the buffer allocated by gss_display_name.
         if buf.length > 0 && !buf.value.is_null() {
             let mut release_min: u32 = 0;
-            // Safety justification: releasing the buffer allocated by
+            // SAFETY: releasing the buffer allocated by
             // gss_display_name. The buffer descriptor is valid because
             // gss_display_name succeeded and populated it.
             unsafe {
@@ -389,7 +389,7 @@ impl Drop for GssName {
     fn drop(&mut self) {
         if !self.name.is_null() {
             let mut min_stat: u32 = 0;
-            // Safety justification: calling gss_release_name to free the
+            // SAFETY: calling gss_release_name to free the
             // GSSAPI name resources. `self.name` is a valid gss_name_t that
             // was obtained from gss_import_name, gss_accept_sec_context, or
             // gss_inquire_context and has not been released yet.
@@ -500,7 +500,7 @@ impl GssContext {
             value: input_token.as_ptr() as *mut libc::c_void,
         };
 
-        // Safety justification: calling gss_accept_sec_context to process one
+        // SAFETY: calling gss_accept_sec_context to process one
         // step of the GSSAPI server-side authentication. All pointer arguments
         // point to valid stack-allocated variables or valid handles:
         // - `self.ctx`: either GSS_C_NO_CONTEXT (first call) or a valid context
@@ -528,7 +528,7 @@ impl GssContext {
         // Release any delegated credentials we don't use.
         if !delegated_cred.is_null() {
             let mut rel_min: u32 = 0;
-            // Safety justification: releasing delegated credentials that we do
+            // SAFETY: releasing delegated credentials that we do
             // not need. The handle is valid because gss_accept_sec_context
             // returned it.
             unsafe {
@@ -541,7 +541,7 @@ impl GssContext {
             // failing, release it.
             if output_buf.length > 0 && !output_buf.value.is_null() {
                 let mut rel_min: u32 = 0;
-                // Safety justification: releasing the output buffer on error.
+                // SAFETY: releasing the output buffer on error.
                 unsafe {
                     ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
                 }
@@ -549,7 +549,7 @@ impl GssContext {
             // Release any source name allocated before the error.
             if !src_name.is_null() {
                 let mut rel_min: u32 = 0;
-                // Safety justification: releasing the source name on error.
+                // SAFETY: releasing the source name on error.
                 unsafe {
                     ffi::gss_release_name(&mut rel_min, &mut src_name);
                 }
@@ -560,7 +560,7 @@ impl GssContext {
         // Copy the output token bytes to an owned Vec before releasing the
         // GSSAPI-managed buffer.
         let output_token = if output_buf.length > 0 && !output_buf.value.is_null() {
-            // Safety justification: the output buffer was populated by
+            // SAFETY: the output buffer was populated by
             // gss_accept_sec_context on success. The value pointer is valid
             // for `length` bytes.
             let bytes = unsafe {
@@ -569,7 +569,7 @@ impl GssContext {
             let token = bytes.to_vec();
 
             let mut rel_min: u32 = 0;
-            // Safety justification: releasing the output buffer after copying
+            // SAFETY: releasing the output buffer after copying
             // its contents. The buffer descriptor is valid.
             unsafe {
                 ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
@@ -613,7 +613,7 @@ impl GssContext {
         let mut locally_initiated: i32 = 0;
         let mut open: i32 = 0;
 
-        // Safety justification: calling gss_inquire_context to retrieve the
+        // SAFETY: calling gss_inquire_context to retrieve the
         // source (client) name from a fully established security context.
         // `self.ctx` is a valid context handle populated by prior calls to
         // gss_accept_sec_context. All output pointers are valid stack-allocated
@@ -636,7 +636,7 @@ impl GssContext {
         // Release the target name — we only need the source name.
         if !targ_name.is_null() {
             let mut rel_min: u32 = 0;
-            // Safety justification: releasing the target name returned by
+            // SAFETY: releasing the target name returned by
             // gss_inquire_context that we do not need.
             unsafe {
                 ffi::gss_release_name(&mut rel_min, &mut targ_name);
@@ -647,7 +647,7 @@ impl GssContext {
             // Release source name on error if it was partially allocated.
             if !src_name.is_null() {
                 let mut rel_min: u32 = 0;
-                // Safety justification: releasing partially allocated source name.
+                // SAFETY: releasing partially allocated source name.
                 unsafe {
                     ffi::gss_release_name(&mut rel_min, &mut src_name);
                 }
@@ -671,7 +671,7 @@ impl Drop for GssContext {
     fn drop(&mut self) {
         if !self.ctx.is_null() {
             let mut min_stat: u32 = 0;
-            // Safety justification: calling gss_delete_sec_context to release
+            // SAFETY: calling gss_delete_sec_context to release
             // the GSSAPI security context resources. `self.ctx` is a valid
             // context handle that was populated by gss_accept_sec_context and
             // has not been deleted yet. Passing null for the output token
@@ -721,7 +721,7 @@ impl GssCredential {
         let mut min_stat: u32 = 0;
         let mut cred: ffi::gss_cred_id_t = ptr::null_mut();
 
-        // Safety justification: calling gss_acquire_cred with GSS_C_ACCEPT
+        // SAFETY: calling gss_acquire_cred with GSS_C_ACCEPT
         // usage to obtain server credentials for the specified service
         // principal. Arguments:
         // - `name.name`: valid gss_name_t from gss_import_name.
@@ -756,7 +756,7 @@ impl Drop for GssCredential {
     fn drop(&mut self) {
         if !self.cred.is_null() {
             let mut min_stat: u32 = 0;
-            // Safety justification: calling gss_release_cred to free the
+            // SAFETY: calling gss_release_cred to free the
             // GSSAPI credential resources. `self.cred` is a valid credential
             // handle obtained from gss_acquire_cred and not yet released.
             unsafe {
@@ -793,7 +793,7 @@ pub fn register_acceptor_identity(keytab_path: &str) -> Result<(), GssapiError> 
         message: "Keytab path contains interior NUL byte".to_string(),
     })?;
 
-    // Safety justification: calling krb5_gss_register_acceptor_identity (the
+    // SAFETY: calling krb5_gss_register_acceptor_identity (the
     // real function behind the gsskrb5_register_acceptor_identity macro) to
     // set the Kerberos keytab file path for server-side authentication. The
     // argument is a valid null-terminated C string that outlives this call.
@@ -835,7 +835,7 @@ impl Krb5Context {
     pub fn new() -> Result<Self, GssapiError> {
         let mut ctx: ffi::krb5_context = ptr::null_mut();
 
-        // Safety justification: calling krb5_init_context to initialize a
+        // SAFETY: calling krb5_init_context to initialize a
         // Kerberos library context for error message formatting and
         // diagnostics. The output pointer is a valid stack-allocated variable.
         let rc = unsafe { ffi::krb5_init_context(&mut ctx) };
@@ -863,7 +863,7 @@ impl Krb5Context {
 impl Drop for Krb5Context {
     fn drop(&mut self) {
         if !self.ctx.is_null() {
-            // Safety justification: calling krb5_free_context to release the
+            // SAFETY: calling krb5_free_context to release the
             // Kerberos library context. `self.ctx` is a valid krb5_context
             // obtained from krb5_init_context and not yet freed.
             unsafe {

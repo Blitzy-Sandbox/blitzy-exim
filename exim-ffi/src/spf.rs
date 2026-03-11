@@ -278,7 +278,7 @@ impl SpfServer {
     /// Returns [`SpfError`] if `SPF_server_new` returns a null pointer,
     /// indicating a memory allocation failure or library initialization error.
     pub fn new() -> Result<Self, SpfError> {
-        // unsafe justification: calling SPF_server_new to create an SPF server
+        // SAFETY: calling SPF_server_new to create an SPF server
         // context with DNS caching enabled. The function allocates a new
         // SPF_server_t and returns null on failure, which we check immediately.
         // SPF_DNS_CACHE is a compile-time constant from libspf2.
@@ -300,7 +300,7 @@ impl SpfServer {
     ///
     /// Returns [`SpfError`] if `SPF_request_new` returns a null pointer.
     pub fn new_request(&self) -> Result<SpfRequest, SpfError> {
-        // unsafe justification: calling SPF_request_new to allocate and
+        // SAFETY: calling SPF_request_new to allocate and
         // initialize an SPF request associated with this server. The server
         // pointer was validated non-null during SpfServer construction.
         // Returns null on allocation failure.
@@ -321,7 +321,7 @@ impl SpfServer {
         let mut major: c_int = 0;
         let mut minor: c_int = 0;
         let mut patch: c_int = 0;
-        // unsafe justification: calling SPF_get_lib_version to retrieve the
+        // SAFETY: calling SPF_get_lib_version to retrieve the
         // compile-time library version numbers. The function writes to the
         // three provided pointer locations, which are valid stack variables
         // with deterministic lifetimes.
@@ -335,7 +335,7 @@ impl SpfServer {
 impl Drop for SpfServer {
     fn drop(&mut self) {
         if !self.server.is_null() {
-            // unsafe justification: calling SPF_server_free to release all
+            // SAFETY: calling SPF_server_free to release all
             // memory and resources associated with the SPF server context.
             // The pointer was validated non-null during construction and is
             // set to null after freeing to prevent double-free.
@@ -398,7 +398,7 @@ impl SpfRequest {
     /// error code (e.g., invalid format).
     pub fn set_ipv4(&mut self, ip: &str) -> Result<(), SpfError> {
         let c_ip = to_cstring(ip, "IPv4 address")?;
-        // unsafe justification: calling SPF_request_set_ipv4_str to set the
+        // SAFETY: calling SPF_request_set_ipv4_str to set the
         // connecting client's IPv4 address for SPF evaluation. The request
         // pointer was validated non-null during construction. The CString
         // provides a valid null-terminated C string that outlives this call.
@@ -424,7 +424,7 @@ impl SpfRequest {
     /// error code.
     pub fn set_ipv6(&mut self, ip: &str) -> Result<(), SpfError> {
         let c_ip = to_cstring(ip, "IPv6 address")?;
-        // unsafe justification: calling SPF_request_set_ipv6_str to set the
+        // SAFETY: calling SPF_request_set_ipv6_str to set the
         // connecting client's IPv6 address for SPF evaluation. The request
         // pointer was validated non-null during construction.
         let rc = unsafe { ffi::SPF_request_set_ipv6_str(self.request, c_ip.as_ptr()) };
@@ -449,7 +449,7 @@ impl SpfRequest {
     /// code.
     pub fn set_helo_domain(&mut self, domain: &str) -> Result<(), SpfError> {
         let c_domain = to_cstring(domain, "HELO domain")?;
-        // unsafe justification: calling SPF_request_set_helo_dom to set the
+        // SAFETY: calling SPF_request_set_helo_dom to set the
         // HELO domain for SPF evaluation. The request pointer was validated
         // non-null during construction.
         let rc = unsafe { ffi::SPF_request_set_helo_dom(self.request, c_domain.as_ptr()) };
@@ -475,7 +475,7 @@ impl SpfRequest {
     /// or if `SPF_request_set_env_from` returns a non-zero value.
     pub fn set_env_from(&mut self, sender: &str) -> Result<(), SpfError> {
         let c_sender = to_cstring(sender, "envelope sender")?;
-        // unsafe justification: calling SPF_request_set_env_from to set the
+        // SAFETY: calling SPF_request_set_env_from to set the
         // envelope sender for SPF evaluation. This function returns int (not
         // SPF_errcode_t), with non-zero indicating an error. The request
         // pointer was validated non-null during construction.
@@ -506,7 +506,7 @@ impl SpfRequest {
     /// response pointer is null after the query completes.
     pub fn query_mailfrom(&self) -> Result<SpfResponse, SpfError> {
         let mut response: *mut ffi::SPF_response_t = ptr::null_mut();
-        // unsafe justification: calling SPF_request_query_mailfrom to perform
+        // SAFETY: calling SPF_request_query_mailfrom to perform
         // the SPF lookup and validation. The response is an output parameter
         // that receives a newly allocated SPF_response_t on success. The
         // request pointer was validated non-null during construction. The
@@ -539,7 +539,7 @@ impl SpfRequest {
     pub fn query_rcptto(&self, rcpt_to: &str) -> Result<SpfResponse, SpfError> {
         let c_rcpt = to_cstring(rcpt_to, "RCPT TO address")?;
         let mut response: *mut ffi::SPF_response_t = ptr::null_mut();
-        // unsafe justification: calling SPF_request_query_rcptto to perform
+        // SAFETY: calling SPF_request_query_rcptto to perform
         // per-recipient SPF validation. The C function takes an additional
         // rcpt_to parameter (const char*) compared to query_mailfrom. The
         // request pointer was validated non-null during construction. The
@@ -559,7 +559,7 @@ impl SpfRequest {
 impl Drop for SpfRequest {
     fn drop(&mut self) {
         if !self.request.is_null() {
-            // unsafe justification: calling SPF_request_free to release all
+            // SAFETY: calling SPF_request_free to release all
             // memory and resources associated with this SPF request. The
             // pointer was validated non-null during construction and is set
             // to null after freeing to prevent double-free.
@@ -602,7 +602,7 @@ impl SpfResponse {
     /// it to the [`SpfResult`] enum. If the result code is outside the known
     /// range (0–7), returns [`SpfResult::Invalid`] as a safe fallback.
     pub fn result(&self) -> SpfResult {
-        // unsafe justification: calling SPF_response_result to retrieve the
+        // SAFETY: calling SPF_response_result to retrieve the
         // SPF result code from the response. The response pointer was
         // validated non-null when the SpfResponse was constructed by
         // query_mailfrom or query_rcptto.
@@ -618,7 +618,7 @@ impl SpfResponse {
     ///
     /// Returns `"unknown"` if the library returns a null string pointer.
     pub fn result_str(&self) -> String {
-        // unsafe justification: calling SPF_response_result to get the numeric
+        // SAFETY: calling SPF_response_result to get the numeric
         // result code, then SPF_strresult to convert it to a human-readable
         // static C string owned by libspf2. The response pointer was validated
         // non-null during construction. SPF_strresult returns a pointer to a
@@ -642,7 +642,7 @@ impl SpfResponse {
     ///
     /// Returns `"unknown"` if the library returns a null string pointer.
     pub fn reason_str(&self) -> String {
-        // unsafe justification: calling SPF_response_reason to get the numeric
+        // SAFETY: calling SPF_response_reason to get the numeric
         // reason code, then SPF_strreason to convert it to a human-readable
         // static C string owned by libspf2. The response pointer was validated
         // non-null during construction. SPF_strreason returns a pointer to a
@@ -662,7 +662,7 @@ impl SpfResponse {
 impl Drop for SpfResponse {
     fn drop(&mut self) {
         if !self.response.is_null() {
-            // unsafe justification: calling SPF_response_free to release all
+            // SAFETY: calling SPF_response_free to release all
             // memory and resources associated with this SPF response. The
             // pointer was validated non-null when the SpfResponse was
             // constructed by query_mailfrom or query_rcptto, and is set to

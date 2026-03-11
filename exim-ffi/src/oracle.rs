@@ -460,12 +460,13 @@ impl OracleSession {
         let c_password = CString::new(password)?;
         let c_host = CString::new(host)?;
 
-        // Safety: std::mem::zeroed is valid for CdaDef because it is a
+        // SAFETY: std::mem::zeroed is valid for CdaDef because it is a
         // #[repr(C)] struct composed entirely of integer and byte-array
         // fields, all of which have a valid zero representation.
         let mut lda: Box<ffi::CdaDef> = Box::new(unsafe { std::mem::zeroed() });
         let mut hda: Box<[u8; ffi::HDA_SIZE]> = Box::new([0u8; ffi::HDA_SIZE]);
 
+        // SAFETY: calling olog to establish an Oracle connection.
         let rc = unsafe {
             // Safety: calling olog to establish an Oracle connection.
             // - `lda` is a valid heap-allocated, zero-initialized CdaDef.
@@ -488,6 +489,7 @@ impl OracleSession {
         if rc != 0 {
             let code = lda.rc as i16;
             let mut msg_buf = [0u8; MAX_ITEM_BUFFER_SIZE];
+            // SAFETY: calling oerhms to format the Oracle error message.
             unsafe {
                 // Safety: calling oerhms to format the Oracle error message.
                 // - `lda` is a valid CdaDef whose `rc` field contains the error.
@@ -517,6 +519,7 @@ impl OracleSession {
     /// session's LDA.
     pub fn error_message(&self, error_code: i16) -> String {
         let mut buf = [0u8; MAX_ITEM_BUFFER_SIZE];
+        // SAFETY: calling oerhms to retrieve an error description.
         unsafe {
             // Safety: calling oerhms to retrieve an error description.
             // - The const-to-mut cast is sound because oerhms does not modify
@@ -541,6 +544,7 @@ impl OracleSession {
 
 impl Drop for OracleSession {
     fn drop(&mut self) {
+        // SAFETY: calling ologof to cleanly disconnect from Oracle.
         unsafe {
             // Safety: calling ologof to cleanly disconnect from Oracle.
             // - `self.lda` is a valid LDA from a successful olog call.
@@ -572,9 +576,10 @@ impl OracleCursor {
     ///
     /// Returns [`OracleError`] if the OCI `oopen` call fails.
     pub fn open(session: &mut OracleSession) -> Result<Self, OracleError> {
-        // Safety: std::mem::zeroed is valid for CdaDef (see OracleSession::connect).
+        // SAFETY: std::mem::zeroed is valid for CdaDef (see OracleSession::connect).
         let mut cda: Box<ffi::CdaDef> = Box::new(unsafe { std::mem::zeroed() });
 
+        // SAFETY: calling oopen to allocate cursor resources.
         let rc = unsafe {
             // Safety: calling oopen to allocate cursor resources.
             // - `cda` is a valid, zero-initialized CdaDef.
@@ -612,6 +617,7 @@ impl OracleCursor {
     pub fn parse(&mut self, query: &str) -> Result<(), OracleError> {
         let c_query = CString::new(query)?;
 
+        // SAFETY: calling oparse to parse the SQL statement.
         let rc = unsafe {
             // Safety: calling oparse to parse the SQL statement.
             // - `self.cda` is a valid CdaDef from a successful oopen call.
@@ -659,6 +665,7 @@ impl OracleCursor {
         let mut scale: ffi::Sb2 = 0;
         let mut nullok: ffi::Sb2 = 0;
 
+        // SAFETY: calling odescr to retrieve column metadata.
         let rc = unsafe {
             // Safety: calling odescr to retrieve column metadata.
             // - `self.cda` is a valid cursor with a parsed SELECT statement.
@@ -737,6 +744,7 @@ impl OracleCursor {
         let retlen_ptr: *mut ffi::Ub2 = &mut def.meta.return_length;
         let retcode_ptr: *mut ffi::Ub2 = &mut def.meta.return_code;
 
+        // SAFETY: calling odefin to bind an output buffer for a column.
         let rc = unsafe {
             // Safety: calling odefin to bind an output buffer for a column.
             // - `self.cda` is a valid cursor with a parsed statement.
@@ -780,6 +788,7 @@ impl OracleCursor {
     ///
     /// Returns [`OracleError`] if the OCI `oexec` call fails.
     pub fn execute(&mut self) -> Result<(), OracleError> {
+        // SAFETY: calling oexec to execute the parsed statement.
         let rc = unsafe {
             // Safety: calling oexec to execute the parsed statement.
             // - `self.cda` is a valid cursor with a successfully parsed statement.
@@ -807,6 +816,7 @@ impl OracleCursor {
     ///
     /// Returns [`OracleError`] for fetch failures other than end-of-data.
     pub fn fetch(&mut self) -> Result<OracleFetchResult, OracleError> {
+        // SAFETY: calling ofetch to retrieve the next result row.
         let _ = unsafe {
             // Safety: calling ofetch to retrieve the next result row.
             // - `self.cda` is a valid cursor after a successful oexec.
@@ -840,6 +850,7 @@ impl OracleCursor {
 
 impl Drop for OracleCursor {
     fn drop(&mut self) {
+        // SAFETY: calling oclose to release cursor resources.
         unsafe {
             // Safety: calling oclose to release cursor resources.
             // - `self.cda` is a valid CdaDef from a successful oopen call.

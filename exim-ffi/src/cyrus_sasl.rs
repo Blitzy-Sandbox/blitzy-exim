@@ -250,7 +250,7 @@ impl SaslError {
     /// This is used for errors that are not associated with a specific
     /// connection (e.g., initialization failures).
     pub fn from_code(code: i32) -> Self {
-        // unsafe justification: calling sasl_errstring() to convert a numeric
+        // SAFETY: calling sasl_errstring() to convert a numeric
         // SASL error code to a human-readable static string. This is a pure
         // lookup function with no side effects. The returned pointer refers to
         // a statically allocated string within libsasl2 that remains valid for
@@ -271,7 +271,7 @@ impl SaslError {
     /// Uses `sasl_errdetail()` which provides more context than the generic
     /// `sasl_errstring()`, including mechanism-specific information.
     pub fn from_connection(conn: &SaslConnection, code: i32) -> Self {
-        // unsafe justification: calling sasl_errdetail() to retrieve
+        // SAFETY: calling sasl_errdetail() to retrieve
         // connection-specific error details. The returned pointer is valid
         // only until the next SASL call on this connection, so we immediately
         // copy it to an owned String.
@@ -465,7 +465,7 @@ unsafe extern "C" fn sasl_log_callback(
 /// are routed through the Rust tracing framework. The returned array is
 /// terminated with `SASL_CB_LIST_END` as required by the SASL API.
 fn make_log_callbacks() -> [ffi::sasl_callback_t; 2] {
-    // unsafe justification: transmuting the typed log callback function pointer
+    // SAFETY: transmuting the typed log callback function pointer
     // to the generic `int (*)(void)` signature stored in sasl_callback_t.proc_.
     // This matches the C convention where sasl_callback_t uses a generic function
     // pointer type and the library casts it back to the specific callback
@@ -539,7 +539,7 @@ impl SaslContext {
 
         let callbacks = make_log_callbacks();
 
-        // unsafe justification: calling sasl_server_init() to initialize the
+        // SAFETY: calling sasl_server_init() to initialize the
         // global SASL library state. This must be called before any other SASL
         // function. The callbacks array is stack-allocated and remains valid
         // for the duration of the call. The appname CString is valid and
@@ -557,7 +557,7 @@ impl SaslContext {
 impl Drop for SaslContext {
     fn drop(&mut self) {
         if self.initialized {
-            // unsafe justification: calling sasl_done() to clean up all global
+            // SAFETY: calling sasl_done() to clean up all global
             // SASL resources. This is the documented cleanup function that must
             // be called after all SASL connections have been disposed. The
             // initialized flag ensures we only call this if init succeeded.
@@ -627,7 +627,7 @@ impl SaslConnection {
 
         let mut conn: *mut ffi::sasl_conn_t = ptr::null_mut();
 
-        // unsafe justification: calling sasl_server_new() to create a SASL
+        // SAFETY: calling sasl_server_new() to create a SASL
         // server connection handle. All string parameters are valid CStrings
         // (null-terminated, no interior NUL). The NULL pointers for
         // iplocalport, ipremoteport, and callbacks are permitted by the API
@@ -679,7 +679,7 @@ impl SaslConnection {
         let empty = CString::new("").expect("empty string cannot fail");
         let sep = CString::new(" ").expect("single space cannot fail");
 
-        // unsafe justification: calling sasl_listmech() to query the available
+        // SAFETY: calling sasl_listmech() to query the available
         // SASL mechanisms from the library's plugin registry. The result pointer
         // is written by the library and points to memory owned by the connection
         // (valid until the connection is disposed). We copy it immediately to
@@ -705,7 +705,7 @@ impl SaslConnection {
             return Ok(String::new());
         }
 
-        // unsafe justification: reading the mechanism list string returned by
+        // SAFETY: reading the mechanism list string returned by
         // sasl_listmech(). The pointer is valid as long as the connection exists
         // (which it does — we hold &self). We copy to an owned String immediately.
         let mech_str = unsafe { CStr::from_ptr(result).to_string_lossy().into_owned() };
@@ -747,7 +747,7 @@ impl SaslConnection {
         let mut serverout: *const libc::c_char = ptr::null();
         let mut serveroutlen: libc::c_uint = 0;
 
-        // unsafe justification: calling sasl_server_start() to begin the SASL
+        // SAFETY: calling sasl_server_start() to begin the SASL
         // authentication exchange. The mechanism name is a valid CString. The
         // initial client data (if any) points to valid memory for its stated
         // length. The serverout pointer is written by the library and points
@@ -781,7 +781,7 @@ impl SaslConnection {
         let mut serverout: *const libc::c_char = ptr::null();
         let mut serveroutlen: libc::c_uint = 0;
 
-        // unsafe justification: calling sasl_server_step() to process the next
+        // SAFETY: calling sasl_server_step() to process the next
         // client token in the SASL exchange. The client_data slice is valid
         // for its stated length. The serverout pointer is written by the
         // library to library-managed memory valid until the next SASL call.
@@ -809,7 +809,7 @@ impl SaslConnection {
         let server_data = if serverout.is_null() || serveroutlen == 0 {
             Vec::new()
         } else {
-            // unsafe justification: creating a byte slice from the server output
+            // SAFETY: creating a byte slice from the server output
             // pointer returned by sasl_server_start/sasl_server_step. The pointer
             // and length are as returned by the library and are valid for the
             // duration of this function call.
@@ -838,7 +838,7 @@ impl SaslConnection {
     pub fn get_username(&self) -> Result<String, SaslError> {
         let mut value: *const libc::c_void = ptr::null();
 
-        // unsafe justification: calling sasl_getprop() with SASL_USERNAME to
+        // SAFETY: calling sasl_getprop() with SASL_USERNAME to
         // retrieve the authenticated user identity. The returned pointer
         // points to memory owned by the connection and is valid until the
         // connection is disposed. We copy it immediately to an owned String.
@@ -855,7 +855,7 @@ impl SaslConnection {
             });
         }
 
-        // unsafe justification: the value pointer for SASL_USERNAME is
+        // SAFETY: the value pointer for SASL_USERNAME is
         // documented to be a `const char *` (NUL-terminated C string).
         // We cast from void* to char* and read it as a CStr.
         let username = unsafe {
@@ -887,7 +887,7 @@ impl SaslConnection {
 
         let propnum = prop.to_c_propnum();
 
-        // unsafe justification: calling sasl_setprop() to set a connection
+        // SAFETY: calling sasl_setprop() to set a connection
         // property. The property number is a valid SASL_* constant. The value
         // is a valid CString cast to void*. For string properties (IPLOCALPORT,
         // IPREMOTEPORT), the library copies the string internally.
@@ -908,7 +908,7 @@ impl SaslConnection {
     /// for this connection. This is more informative than the generic
     /// `SaslError::from_code()` as it includes mechanism-specific context.
     pub fn error_detail(&self) -> String {
-        // unsafe justification: calling sasl_errdetail() to retrieve the
+        // SAFETY: calling sasl_errdetail() to retrieve the
         // most recent connection-specific error message. The returned pointer
         // is valid until the next SASL API call on this connection. We
         // immediately copy it to an owned String.
@@ -926,7 +926,7 @@ impl SaslConnection {
 impl Drop for SaslConnection {
     fn drop(&mut self) {
         if !self.conn.is_null() {
-            // unsafe justification: calling sasl_dispose() to release all
+            // SAFETY: calling sasl_dispose() to release all
             // resources associated with this SASL connection. The function
             // takes a pointer-to-pointer and sets the inner pointer to NULL
             // after cleanup. We check for null before calling to avoid
@@ -960,7 +960,7 @@ pub fn version_info() -> SaslVersionInfo {
     let mut step: libc::c_int = 0;
     let mut patch: libc::c_int = 0;
 
-    // unsafe justification: calling sasl_version_info() to retrieve the SASL
+    // SAFETY: calling sasl_version_info() to retrieve the SASL
     // library implementation name and version numbers. All output parameters
     // are mutable pointers to stack variables. The library writes to them
     // directly. The string pointers (implementation, version_string) point to
@@ -980,7 +980,7 @@ pub fn version_info() -> SaslVersionInfo {
     let implementation = if c_impl.is_null() {
         "unknown".to_string()
     } else {
-        // unsafe justification: reading the implementation name string returned
+        // SAFETY: reading the implementation name string returned
         // by sasl_version_info(). It points to static library memory.
         unsafe { CStr::from_ptr(c_impl).to_string_lossy().into_owned() }
     };
@@ -988,7 +988,7 @@ pub fn version_info() -> SaslVersionInfo {
     let version_string = if c_version.is_null() {
         "unknown".to_string()
     } else {
-        // unsafe justification: reading the version string returned by
+        // SAFETY: reading the version string returned by
         // sasl_version_info(). It points to static library memory.
         unsafe { CStr::from_ptr(c_version).to_string_lossy().into_owned() }
     };

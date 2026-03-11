@@ -4,6 +4,7 @@
 // This is the entry point. Modules will be expanded as implementation proceeds.
 
 pub mod cli;
+pub mod context;
 pub mod signal;
 
 fn main() {

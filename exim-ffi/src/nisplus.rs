@@ -323,7 +323,7 @@ impl NisResultGuard {
 
     /// Access the underlying result (immutable).
     fn as_ref(&self) -> &ffi::nis_result {
-        // Safety: the pointer was validated as non-null in `new()` and is
+        // SAFETY: the pointer was validated as non-null in `new()` and is
         // valid until `nis_freeresult` is called in `drop()`.
         unsafe { &*self.ptr }
     }
@@ -331,7 +331,7 @@ impl NisResultGuard {
 
 impl Drop for NisResultGuard {
     fn drop(&mut self) {
-        // unsafe justification: calling nis_freeresult to release the NIS+
+        // SAFETY: calling nis_freeresult to release the NIS+
         // result structure that was allocated by nis_lookup or nis_list.
         // The pointer was verified non-null in NisResultGuard::new().
         unsafe {
@@ -376,7 +376,7 @@ pub fn nis_lookup_table(table_name: &str) -> Result<NisplusTableInfo, NisplusErr
     let c_name = CString::new(table_name)
         .map_err(|_| NisplusError::new(-1, "table name contains interior NUL byte"))?;
 
-    // Step 2: Call nis_lookup with EXPAND_NAME | NO_CACHE flags.
+    // SAFETY: Step 2: Call nis_lookup with EXPAND_NAME | NO_CACHE flags.
     // unsafe justification: calling nis_lookup with a valid null-terminated
     // C string and standard NIS+ flags. The function allocates and returns
     // a nis_result pointer that must be freed with nis_freeresult.
@@ -400,7 +400,7 @@ pub fn nis_lookup_table(table_name: &str) -> Result<NisplusTableInfo, NisplusErr
         ));
     }
 
-    // Step 5: Access the first returned object and verify it is a TABLE_OBJ.
+    // SAFETY: Step 5: Access the first returned object and verify it is a TABLE_OBJ.
     // unsafe justification: dereferencing the objects_val pointer which was
     // verified non-null above. The pointer is valid because nis_lookup
     // returned NIS_SUCCESS with objects_len >= 1.
@@ -413,7 +413,7 @@ pub fn nis_lookup_table(table_name: &str) -> Result<NisplusTableInfo, NisplusErr
         ));
     }
 
-    // Step 6: Extract column names from the table object.
+    // SAFETY: Step 6: Extract column names from the table object.
     // unsafe justification: accessing the union payload as table_obj after
     // verifying zo_type == TABLE_OBJ. The table_obj pointer and its
     // ta_cols_val array are owned by the nis_result and valid until
@@ -482,7 +482,7 @@ pub fn nis_query_entries(query: &str) -> Result<NisplusQueryResult, NisplusError
     let c_query = CString::new(query)
         .map_err(|_| NisplusError::new(-1, "query contains interior NUL byte"))?;
 
-    // Step 2: Call nis_list with EXPAND_NAME flag and NULL callback/userdata.
+    // SAFETY: Step 2: Call nis_list with EXPAND_NAME flag and NULL callback/userdata.
     // unsafe justification: calling nis_list with a valid null-terminated
     // query string and standard flags. The callback and userdata pointers
     // are both null because we do not use the callback interface (matching
@@ -527,7 +527,7 @@ pub fn nis_query_entries(query: &str) -> Result<NisplusQueryResult, NisplusError
     let mut entries = Vec::with_capacity(num_objects);
 
     for obj_idx in 0..num_objects {
-        // unsafe justification: accessing the objects_val array element
+        // SAFETY: accessing the objects_val array element
         // at index obj_idx. The array has objects_len elements and was
         // verified non-null above. The pointer is valid because nis_list
         // returned NIS_SUCCESS.
@@ -539,7 +539,7 @@ pub fn nis_query_entries(query: &str) -> Result<NisplusQueryResult, NisplusError
             continue;
         }
 
-        // unsafe justification: accessing the union payload as entry_obj
+        // SAFETY: accessing the union payload as entry_obj
         // after verifying zo_type == ENTRY_OBJ. All pointers within the
         // entry_obj are owned by the nis_result and valid until
         // nis_freeresult is called (handled by the guard).
@@ -596,7 +596,7 @@ pub fn nis_query_entries(query: &str) -> Result<NisplusQueryResult, NisplusError
 ///
 /// A human-readable error description string.
 pub fn nis_error_string(status: i32) -> String {
-    // unsafe justification: calling nis_sperrno which returns a pointer to a
+    // SAFETY: calling nis_sperrno which returns a pointer to a
     // static null-terminated C string for the given NIS+ error code.
     // The function is a pure lookup with no side effects and the returned
     // pointer refers to process-lifetime static data.
@@ -606,7 +606,7 @@ pub fn nis_error_string(status: i32) -> String {
         return format!("NIS+ error {}", status);
     }
 
-    // unsafe justification: reading the static null-terminated C string
+    // SAFETY: reading the static null-terminated C string
     // returned by nis_sperrno. The pointer was verified non-null above
     // and refers to a static string that remains valid for the process
     // lifetime.

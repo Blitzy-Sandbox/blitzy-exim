@@ -184,7 +184,7 @@ impl PerlInterpreter {
     ///
     /// Mirrors `perl_alloc()` + `perl_construct()` in `perl.c` lines 199-200.
     pub fn new() -> Result<Self, PerlError> {
-        // Safety justification: calling perl_alloc to allocate a new Perl
+        // SAFETY: calling perl_alloc to allocate a new Perl
         // interpreter instance, then perl_construct to initialize its internal
         // structures. perl_alloc is the documented entry point for embedding
         // Perl (perlapi(1)) and returns either a valid pointer or null on
@@ -241,7 +241,7 @@ impl PerlInterpreter {
 
         let argc = c_args.len() as libc::c_int;
 
-        // Safety justification: calling perl_parse on a valid interpreter with
+        // SAFETY: calling perl_parse on a valid interpreter with
         // the xs_init_callback for DynaLoader registration. The argc/argv
         // array is built from CStrings that remain alive for the duration of
         // this call (owned by c_args Vec). The null-terminated c_ptrs array
@@ -299,7 +299,7 @@ impl PerlInterpreter {
         let c_code = CString::new(code)
             .map_err(|e| PerlError::new(format!("null byte in code string: {e}")))?;
 
-        // Safety justification: calling Perl_eval_pv to evaluate a Perl code
+        // SAFETY: calling Perl_eval_pv to evaluate a Perl code
         // string on a valid interpreter. The code is a null-terminated CString.
         // croak_on_error is 0 so errors are captured in $@ (ERRSV) rather
         // than triggering a C longjmp/croak. After evaluation, we check ERRSV
@@ -366,7 +366,7 @@ impl PerlInterpreter {
         let c_expr = CString::new(expr)
             .map_err(|e| PerlError::new(format!("null byte in expression: {e}")))?;
 
-        // Safety justification: calling Perl_eval_pv to evaluate the function
+        // SAFETY: calling Perl_eval_pv to evaluate the function
         // call expression, then checking ERRSV ($@) for errors, extracting the
         // string result via exim_ffi_SvPV, and resetting the locale to "C".
         // The interpreter pointer is valid (non-null checked above). The
@@ -439,7 +439,7 @@ impl PerlInterpreter {
 impl Drop for PerlInterpreter {
     fn drop(&mut self) {
         if !self.interp.is_null() {
-            // Safety justification: calling perl_destruct and perl_free to
+            // SAFETY: calling perl_destruct and perl_free to
             // cleanly shut down and deallocate the Perl interpreter. This is
             // the documented cleanup sequence for embedded Perl (perlembed(1))
             // and must happen exactly once per interpreter instance. The
@@ -524,7 +524,7 @@ pub(crate) fn register_dynaloader(interp: &mut PerlInterpreter) -> Result<(), Pe
         ));
     }
 
-    // Safety justification: calling Perl_newXS to register the DynaLoader
+    // SAFETY: calling Perl_newXS to register the DynaLoader
     // boot function on a valid interpreter. The interpreter pointer is
     // guaranteed non-null by the check above. The name and file byte
     // literals are compile-time constant null-terminated strings.

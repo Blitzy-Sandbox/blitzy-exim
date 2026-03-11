@@ -272,7 +272,7 @@ fn nis_error_description(code: libc::c_int) -> String {
 pub fn get_default_domain() -> Result<String, NisError> {
     let mut domain_ptr: *mut libc::c_char = ptr::null_mut();
 
-    // Safety justification: `yp_get_default_domain` is a standard NIS/YP
+    // SAFETY: `yp_get_default_domain` is a standard NIS/YP
     // client function from libnsl. It takes a single `char **` out-parameter
     // and writes a pointer to a statically-allocated, null-terminated C string
     // (the NIS domain name from the system configuration). The pointer
@@ -297,7 +297,7 @@ pub fn get_default_domain() -> Result<String, NisError> {
         ));
     }
 
-    // Safety justification: `domain_ptr` is non-null (checked above) and
+    // SAFETY: `domain_ptr` is non-null (checked above) and
     // points to a statically-allocated, null-terminated C string managed by
     // the NIS client library. This string has process lifetime and will not
     // be freed or mutated. `CStr::from_ptr` reads up to the null terminator,
@@ -372,7 +372,7 @@ pub fn yp_match_query(domain: &str, map: &str, key: &[u8]) -> Result<Vec<u8>, Ni
     let mut result_ptr: *mut libc::c_char = ptr::null_mut();
     let mut result_len: libc::c_int = 0;
 
-    // Safety justification: calling C `yp_match` from libnsl with:
+    // SAFETY: calling C `yp_match` from libnsl with:
     //   1. `c_domain.as_ptr()` — valid, non-null, null-terminated C string
     //      produced by `CString::new()`. Lifetime extends to end of this scope.
     //   2. `c_map.as_ptr()` — valid, non-null, null-terminated C string.
@@ -426,7 +426,7 @@ pub fn yp_match_query(domain: &str, map: &str, key: &[u8]) -> Result<Vec<u8>, Ni
     }
 
     if result_len < 0 {
-        // Safety justification: `result_ptr` was set by `yp_match` on a
+        // SAFETY: `result_ptr` was set by `yp_match` on a
         // success return and is non-null (checked above). It was allocated
         // via `malloc` by the NIS library, so it must be freed with `free()`.
         // Even though `result_len` is invalid, the pointer itself is still a
@@ -444,7 +444,7 @@ pub fn yp_match_query(domain: &str, map: &str, key: &[u8]) -> Result<Vec<u8>, Ni
 
     let len = result_len as usize;
 
-    // Safety justification: `result_ptr` is non-null (checked above) and
+    // SAFETY: `result_ptr` is non-null (checked above) and
     // points to a `malloc`-allocated buffer of at least `result_len` bytes,
     // as guaranteed by a successful `yp_match` return. We create a byte
     // slice view over exactly `len` bytes, copy it into an owned `Vec<u8>`,

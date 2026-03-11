@@ -149,7 +149,7 @@ pub fn wso_query(query: &str) -> Result<WhosonQueryResult, WhosonError> {
 
     let mut buffer = [0u8; WSO_BUFFER_SIZE];
 
-    // Safety justification: calling C `wso_query` with:
+    // SAFETY: calling C `wso_query` with:
     //   1. `c_query.as_ptr()` — a valid, non-null, null-terminated C string
     //      produced by `CString::new()`.
     //   2. `buffer.as_mut_ptr()` — a valid pointer to a stack-allocated byte
@@ -167,7 +167,7 @@ pub fn wso_query(query: &str) -> Result<WhosonQueryResult, WhosonError> {
 
     match rc {
         0 => {
-            // Safety justification: after a successful query (return code 0),
+            // SAFETY: after a successful query (return code 0),
             // `wso_query` has written a null-terminated string into `buffer`.
             // The buffer was zero-initialized and has size `WSO_BUFFER_SIZE`,
             // so `CStr::from_ptr` will find a null terminator within bounds.
@@ -191,7 +191,7 @@ pub fn wso_query(query: &str) -> Result<WhosonQueryResult, WhosonError> {
 /// Returns `"unknown"` if the C function returns a null pointer (defensive
 /// guard — should not occur with a correctly linked libwhoson).
 pub fn wso_version() -> String {
-    // Safety justification: calling C `wso_version()` which returns a pointer
+    // SAFETY: calling C `wso_version()` which returns a pointer
     // to a statically allocated, null-terminated C string. The pointer is
     // valid for the entire lifetime of the process and the data is immutable.
     // No arguments are passed and no mutable state is modified.
@@ -201,7 +201,7 @@ pub fn wso_version() -> String {
         return String::from("unknown");
     }
 
-    // Safety justification: the non-null pointer returned by `wso_version()`
+    // SAFETY: the non-null pointer returned by `wso_version()`
     // points to a static, null-terminated C string that lives for the entire
     // process lifetime. Reading it via `CStr::from_ptr` is sound because the
     // data will not be mutated or freed.

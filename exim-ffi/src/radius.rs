@@ -216,7 +216,7 @@ impl RadiusClient {
         let c_config = CString::new(config_file)
             .map_err(|_| RadiusError::new("config file path contains interior null byte"))?;
 
-        // Safety justification: calling rad_auth_open() to create a new radlib
+        // SAFETY: calling rad_auth_open() to create a new radlib
         // authentication handle. This is the documented entry point for the radlib
         // API. Returns null on allocation failure; we check before use.
         let h = unsafe { ffi::rad_auth_open() };
@@ -226,14 +226,14 @@ impl RadiusClient {
             ));
         }
 
-        // Safety justification: calling rad_config() to load the RADIUS configuration
+        // SAFETY: calling rad_config() to load the RADIUS configuration
         // file into a valid, non-null handle returned by rad_auth_open(). The config
         // file path is a valid null-terminated C string created by CString::new().
         // Returns 0 on success, -1 on failure.
         let rc = unsafe { ffi::rad_config(h, c_config.as_ptr()) };
         if rc != 0 {
             let err_msg = get_radlib_error(h);
-            // Safety justification: calling rad_close() to release the handle that
+            // SAFETY: calling rad_close() to release the handle that
             // was successfully allocated by rad_auth_open() but whose configuration
             // failed. This prevents resource leaks on the error path.
             unsafe {
@@ -270,7 +270,7 @@ impl RadiusClient {
         let c_password = CString::new(password)
             .map_err(|_| RadiusError::new("password contains interior null byte"))?;
 
-        // Safety justification: calling rad_create_request(), rad_put_string(), and
+        // SAFETY: calling rad_create_request(), rad_put_string(), and
         // rad_put_int() to build a RADIUS Access-Request packet on the valid handle
         // initialized in new(). All string arguments are valid null-terminated C
         // strings created by CString::new(). Each function returns 0 on success,
@@ -312,7 +312,7 @@ impl RadiusClient {
             }
         }
 
-        // Safety justification: calling rad_send_request() to send the constructed
+        // SAFETY: calling rad_send_request() to send the constructed
         // Access-Request packet and receive the response. The handle is valid and
         // the request was fully constructed above. Returns one of the RAD_ACCESS_*
         // constants on success, or -1 on send/receive failure.
@@ -334,7 +334,7 @@ impl RadiusClient {
 impl Drop for RadiusClient {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            // Safety justification: calling rad_close() to release the radlib handle
+            // SAFETY: calling rad_close() to release the radlib handle
             // that was allocated by rad_auth_open() in new(). The handle is guaranteed
             // non-null by the check above and was successfully initialized. This is
             // called exactly once via Drop, matching the C code's cleanup pattern
@@ -352,7 +352,7 @@ impl Drop for RadiusClient {
 /// an owned Rust `String`.
 #[cfg(radius_lib_radlib)]
 fn get_radlib_error(h: *mut ffi::rad_handle) -> String {
-    // Safety justification: calling rad_strerror() on a valid radlib handle to
+    // SAFETY: calling rad_strerror() on a valid radlib handle to
     // retrieve the error message for the most recent failed operation. The function
     // returns a pointer to a static or handle-owned string that is valid until the
     // next radlib call on this handle. We copy it immediately to an owned String.
@@ -360,7 +360,7 @@ fn get_radlib_error(h: *mut ffi::rad_handle) -> String {
     if ptr.is_null() {
         return String::from("unknown radlib error");
     }
-    // Safety justification: reading the null-terminated C string pointed to by
+    // SAFETY: reading the null-terminated C string pointed to by
     // the non-null pointer returned from rad_strerror(). The string is valid for
     // the duration of this call since no other radlib operations intervene.
     let cstr = unsafe { CStr::from_ptr(ptr) };
@@ -419,7 +419,7 @@ impl RadiusClient {
         let c_dictionary_key = CString::new("dictionary")
             .map_err(|_| RadiusError::new("internal error: dictionary key conversion"))?;
 
-        // Safety justification: calling rc_read_config() to parse the RADIUS client
+        // SAFETY: calling rc_read_config() to parse the RADIUS client
         // configuration file and create an rc_handle. The config_file path is a valid
         // null-terminated C string from CString::new(). Returns null on failure.
         let h = unsafe { ffi::rc_read_config(c_config.as_ptr()) };
@@ -430,7 +430,7 @@ impl RadiusClient {
             )));
         }
 
-        // Safety justification: calling rc_conf_str() to retrieve the dictionary
+        // SAFETY: calling rc_conf_str() to retrieve the dictionary
         // file path from the configuration that was just loaded into the valid,
         // non-null handle. The key "dictionary" is a standard radiusclient config
         // option. Returns a pointer to an internal config string (not owned by us).
@@ -441,7 +441,7 @@ impl RadiusClient {
             ));
         }
 
-        // Safety justification: calling rc_read_dictionary() to load the RADIUS
+        // SAFETY: calling rc_read_dictionary() to load the RADIUS
         // attribute dictionary from the path obtained above. Both the handle and
         // the dictionary path pointer are valid. Returns 0 on success.
         let rc = unsafe { ffi::rc_read_dictionary(h, dict_path) };
@@ -482,7 +482,7 @@ impl RadiusClient {
         let mut msg = [0u8; 4096];
         let service: libc::c_uint = ffi::PW_AUTHENTICATE_ONLY as libc::c_uint;
 
-        // Safety justification: calling rc_avpair_add() three times to build the
+        // SAFETY: calling rc_avpair_add() three times to build the
         // RADIUS attribute-value pair list for authentication. The handle was
         // initialized in new(), &send is a valid mutable pointer to our local
         // VALUE_PAIR pointer, and all string arguments are valid null-terminated
@@ -528,7 +528,7 @@ impl RadiusClient {
             }
         }
 
-        // Safety justification: calling rc_auth() to perform the RADIUS authentication
+        // SAFETY: calling rc_auth() to perform the RADIUS authentication
         // exchange. All arguments are valid:
         //   - self.handle: valid rc_handle from new()
         //   - 0: port number (use default)

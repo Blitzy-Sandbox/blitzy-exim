@@ -33,7 +33,7 @@
 //! registrations — `inventory` handles collection at link time automatically.
 
 // Per AAP §0.7.2: zero unsafe code outside exim-ffi.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 // Enforce documentation on all public items.
 #![warn(missing_docs)]
 

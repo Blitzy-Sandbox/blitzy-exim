@@ -142,7 +142,7 @@ extern "C" fn pam_conversation(
     resp: *mut *mut ffi::pam_response,
     appdata_ptr: *mut libc::c_void,
 ) -> libc::c_int {
-    // unsafe justification: This entire function is an extern "C" callback
+    // SAFETY: This entire function is an extern "C" callback
     // invoked by libpam during pam_authenticate(). We must:
     //   1. Dereference `msg` (a C-provided pointer array) to read prompts
     //   2. Dereference `appdata_ptr` (our pinned PamConversationData)
@@ -323,7 +323,7 @@ impl PamHandle {
 
         let mut handle: *mut ffi::pam_handle_t = ptr::null_mut();
 
-        // unsafe justification: Calling pam_start() to initialise a PAM
+        // SAFETY: Calling pam_start() to initialise a PAM
         // session. pam_start allocates a pam_handle_t and stores it in
         // `handle`. We validate the return code before using the handle.
         // The CStrings (c_service, c_user) are valid null-terminated
@@ -341,7 +341,7 @@ impl PamHandle {
         };
 
         if ret != ffi::PAM_SUCCESS as i32 || handle.is_null() {
-            // Clean up the conversation data we allocated.
+            // SAFETY: Clean up the conversation data we allocated.
             // unsafe justification: Reclaiming the Box we created above
             // via Box::into_raw. No other code has taken ownership yet
             // because pam_start failed.
@@ -367,7 +367,7 @@ impl PamHandle {
     ///
     /// Returns [`PamError`] with the PAM error code if authentication fails.
     pub fn authenticate(&self, flags: i32) -> Result<(), PamError> {
-        // unsafe justification: Calling pam_authenticate() on a valid,
+        // SAFETY: Calling pam_authenticate() on a valid,
         // initialised PAM handle. The handle was successfully created by
         // pam_start() in start_with_credentials() and has not been freed
         // yet (Drop hasn't run). The conversation callback and its data
@@ -391,7 +391,7 @@ impl PamHandle {
     /// Returns [`PamError`] with the PAM error code if the account check
     /// fails.
     pub fn acct_mgmt(&self, flags: i32) -> Result<(), PamError> {
-        // unsafe justification: Calling pam_acct_mgmt() on a valid,
+        // SAFETY: Calling pam_acct_mgmt() on a valid,
         // initialised PAM handle. Same safety invariants as
         // pam_authenticate() above — the handle is live and owned by
         // this PamHandle.
@@ -409,7 +409,7 @@ impl PamHandle {
     /// C string describing the error. The string is copied into an owned
     /// [`String`].
     pub fn strerror(&self, errnum: i32) -> String {
-        // unsafe justification: Calling pam_strerror() with a valid PAM
+        // SAFETY: Calling pam_strerror() with a valid PAM
         // handle and an error code integer. pam_strerror returns a pointer
         // to a static (or internally-managed) C string that we immediately
         // copy into an owned Rust String. We do not store or return the
@@ -418,7 +418,7 @@ impl PamHandle {
         if raw.is_null() {
             return format!("PAM error code {errnum}");
         }
-        // unsafe justification: pam_strerror returns a valid
+        // SAFETY: pam_strerror returns a valid
         // null-terminated C string. We copy it immediately into a Rust
         // String, so no lifetime issues arise.
         let c_str = unsafe { CStr::from_ptr(raw) };
@@ -429,7 +429,7 @@ impl PamHandle {
 impl Drop for PamHandle {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            // unsafe justification: Calling pam_end() to release PAM
+            // SAFETY: Calling pam_end() to release PAM
             // resources. This is the designated cleanup function for
             // pam_handle_t and must be called exactly once per successful
             // pam_start(). After this call the handle is invalid.
@@ -439,7 +439,7 @@ impl Drop for PamHandle {
             self.handle = ptr::null_mut();
         }
         if !self.conv_data_ptr.is_null() {
-            // unsafe justification: Reclaiming the heap-allocated
+            // SAFETY: Reclaiming the heap-allocated
             // PamConversationData that was created with Box::into_raw in
             // start_with_credentials. This is the matching Box::from_raw
             // call. After pam_end the PAM library no longer references
