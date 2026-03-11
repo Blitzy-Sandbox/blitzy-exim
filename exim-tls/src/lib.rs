@@ -17,6 +17,11 @@ pub mod sni;
 /// regardless of TLS backend selection.
 pub mod client_cert;
 
+/// OCSP stapling — server-side response loading and client-side verification.
+/// Feature-gated behind `ocsp` (replaces C `#ifndef DISABLE_OCSP`).
+#[cfg(feature = "ocsp")]
+pub mod ocsp;
+
 /// TLS session resumption — session ticket management and client session cache.
 /// Feature-gated behind `tls-resume` (replaces C `#ifndef DISABLE_TLS_RESUME`).
 #[cfg(feature = "tls-resume")]
