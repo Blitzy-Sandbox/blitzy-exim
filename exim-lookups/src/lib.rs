@@ -7,5 +7,8 @@
 
 pub mod helpers;
 
+#[cfg(feature = "lookup-mysql")]
+pub mod mysql;
+
 #[cfg(feature = "lookup-pgsql")]
 pub mod pgsql;
