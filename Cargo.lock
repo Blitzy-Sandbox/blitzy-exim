@@ -687,9 +687,11 @@ dependencies = [
 name = "exim-config"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "exim-drivers",
  "exim-store",
  "log",
+ "nix",
  "regex",
  "serde",
  "thiserror 2.0.18",

@@ -114,6 +114,9 @@ log = "0.4.29"
 libc = "0.2.183"
 nix = { version = "0.31.2", features = ["signal", "process", "socket", "user"] }
 
+# ── Bitflag types ─────────────────────────────────────────────────────────
+bitflags = "2.10.0"
+
 # ── Pattern matching ──────────────────────────────────────────────────────
 # regex: Rust-native regex for internal use
 # pcre2: PCRE2 bindings for Exim-compatible pattern matching in ACLs/expand

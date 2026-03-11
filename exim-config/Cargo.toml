@@ -99,6 +99,16 @@ log = { workspace = true }
 # macro name validation during .define processing.
 regex = { workspace = true }
 
+# bitflags: Provides the bitflags! macro for defining OptionFlags struct
+# managing option metadata bits (SET, SECURE, HIDDEN, REP_CON, REP_STR,
+# PUBLIC) matching the C opt_set/opt_secure/opt_hidden flag system.
+bitflags = { workspace = true }
+
+# nix: Safe POSIX API wrappers for UID/GID name resolution in option
+# parsers (opt_uid, opt_gid, opt_uidlist, opt_gidlist, opt_expand_uid,
+# opt_expand_gid). Uses getpwnam/getgrnam without unsafe code.
+nix = { workspace = true }
+
 # =============================================================================
 # Features
 # =============================================================================
