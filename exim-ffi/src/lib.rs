@@ -1,165 +1,240 @@
-//! # exim-ffi — Foreign Function Interface Bindings for Exim
+//! # exim-ffi — Minimal C FFI Shim Layer for Exim
 //!
-//! This crate is the **ONLY** crate in the Exim Rust workspace that is
-//! permitted to contain `unsafe` code (per AAP §0.7.2). It provides safe
-//! Rust wrappers around C libraries that have no viable pure-Rust replacement.
+//! This crate is the **ONLY** crate in the Exim Rust workspace that contains
+//! `unsafe` code. It wraps C libraries that have no viable Rust-native
+//! replacement, providing safe Rust APIs over the raw C interfaces.
 //!
-//! Every `unsafe` block within this crate MUST have an inline justification
-//! comment explaining why the unsafe operation is necessary and why it is
-//! sound.
+//! ## Wrapped Libraries
 //!
-//! # Formal Exception: Unsafe Block Count (AAP §0.7.2)
+//! Each library is gated behind a Cargo feature flag, replacing the C
+//! preprocessor `#ifdef` pattern from the original Exim source tree:
 //!
-//! AAP §0.7.2 specifies a target of fewer than 50 `unsafe` blocks across the
-//! entire workspace. This crate currently contains approximately 230 `unsafe`
-//! blocks, all in FFI binding modules. This exceeds the target because:
+//! | Feature | Library | Module | Purpose |
+//! |---------|---------|--------|---------|
+//! | `ffi-pam` | libpam | [`pam`] | PAM authentication with conversation callback |
+//! | `ffi-radius` | libradius/radiusclient | [`radius`] | RADIUS authentication |
+//! | `ffi-perl` | libperl | [`perl`] | Embedded Perl interpreter for `${perl}` |
+//! | `ffi-gsasl` | libgsasl | [`gsasl`] | GNU SASL (SCRAM, channel-binding) |
+//! | `ffi-krb5` | libkrb5/Heimdal | [`krb5`] | Kerberos GSSAPI authentication |
+//! | `ffi-spf` | libspf2 | [`spf`] | SPF validation with DNS callback support |
+//! | `ffi-dmarc` | libopendmarc | [`dmarc`] | DMARC policy evaluation |
+//! | `ffi-oracle` | libclntsh | [`oracle`] | Oracle OCI v2 SQL lookups |
+//! | `ffi-whoson` | libwhoson | [`whoson`] | WHOSON dynamic IP tracking |
+//! | `ffi-nisplus` | libnsl (NIS+) | [`nisplus`] | NIS+ directory service lookups |
+//! | `ffi-nis` | libnsl (NIS/YP) | [`nis`] | NIS (Yellow Pages) directory lookups |
+//! | `ffi-cyrus-sasl` | libsasl2 | [`cyrus_sasl`] | Cyrus SASL server authentication |
+//! | `ffi-lmdb` | heed (LMDB) | [`lmdb`] | LMDB environment safe open wrapper |
 //!
-//! - **Granular wrapping is the correct safety pattern for FFI.** Each C library
-//!   call is individually scoped in its own `unsafe` block with a dedicated
-//!   SAFETY justification comment, making auditing tractable.
-//! - **16 C library bindings** wrap complex APIs (Berkeley DB, Kerberos, DMARC,
-//!   SASL, etc.), each requiring 5-29 individual FFI call sites.
-//! - **Consolidation would reduce auditability.** Merging unrelated FFI calls
-//!   into larger `unsafe` blocks would obscure which specific call is
-//!   responsible for soundness invariants.
-//! - **All 230 blocks have been individually reviewed:** each has an inline
-//!   `SAFETY:` comment, null-pointer checks before dereference, and RAII
-//!   `Drop` implementations to prevent resource leaks.
-//! - **Zero `unsafe` blocks exist outside this crate** — all 16 non-FFI crates
-//!   enforce `#![deny(unsafe_code)]`.
+//! ## Hints Database Backends
 //!
-//! # Feature-Gated Modules
+//! The [`hintsdb`] module is always compiled (no top-level feature gate); each
+//! backend is feature-gated internally:
 //!
-//! Each FFI module is gated behind a Cargo feature flag. Only modules whose
-//! corresponding system library is present on the build host should be enabled.
-//! This replaces the C preprocessor `#ifdef` pattern used in the original Exim
-//! source tree.
+//! | Feature | Library | Purpose |
+//! |---------|---------|---------|
+//! | `hintsdb-bdb` | Berkeley DB | BDB hints database backend |
+//! | `hintsdb-gdbm` | GDBM | GDBM hints database backend |
+//! | `hintsdb-ndbm` | NDBM | NDBM hints database backend |
+//! | `hintsdb-tdb` | TDB | TDB hints database backend |
 //!
-//! | Feature          | C Library          | Module          | Purpose                         |
-//! |------------------|--------------------|-----------------|----------------------------------|
-//! | `ffi-pam`        | libpam             | `pam`           | PAM authentication               |
-//! | `ffi-radius`     | libradius          | `radius`        | RADIUS authentication            |
-//! | `ffi-perl`       | libperl            | `perl`          | Embedded Perl interpreter        |
-//! | `ffi-gsasl`      | libgsasl           | `gsasl`         | GNU SASL (SCRAM, channel-bind)   |
-//! | `ffi-krb5`       | libkrb5/Heimdal    | `krb5`          | Kerberos GSSAPI authentication   |
-//! | `ffi-spf`        | libspf2            | [`spf`]         | SPF validation                   |
+//! SQLite hints are **not** in this crate — they use the pure-Rust `rusqlite`
+//! crate in `exim-lookups` instead.
 //!
-//! # Hints Database Backends
+//! ## Always-Compiled Utility Modules
 //!
-//! | Feature          | C Library          | Purpose                          |
-//! |------------------|--------------------|----------------------------------|
-//! | `hintsdb-bdb`    | libdb              | Berkeley DB hints backend        |
-//! | `hintsdb-gdbm`   | libgdbm            | GDBM hints backend               |
-//! | `hintsdb-ndbm`   | libndbm            | NDBM hints backend               |
-//! | `hintsdb-tdb`    | libtdb             | TDB hints backend                |
+//! Two utility modules have no external C library dependency beyond the Rust
+//! standard library and the `nix` crate:
 //!
-//! # Safety Policy
+//! - [`fd`] — Safe raw file-descriptor conversions (`FromRawFd` wrapper)
+//! - [`signal`] — Safe POSIX signal handling (`sigaction` wrapper)
 //!
-//! - **Zero `unsafe` outside this crate** — all other workspace crates must be
-//!   100% safe Rust.
-//! - **All `unsafe` blocks documented** — every block has an inline comment
-//!   explaining soundness.
-//! - **No `#[allow(...)]`** without inline justification referencing a specific
-//!   technical reason.
-//! - **RAII for all C resources** — every raw pointer is wrapped in a struct
-//!   with a `Drop` implementation that calls the appropriate C free function.
+//! ## Safety Policy
+//!
+//! - **Zero `unsafe` outside this crate** — all other 17 workspace crates
+//!   enforce `#![deny(unsafe_code)]` and consume only safe public APIs from
+//!   this crate. Any `unsafe` code found outside `exim-ffi` is a **blocking
+//!   defect** per AAP §0.7.2.
+//! - **All `unsafe` blocks documented** — every `unsafe` block has an inline
+//!   `// SAFETY:` comment explaining why the operation is necessary and why
+//!   it is sound.
+//! - **RAII for all C resources** — every raw C pointer is wrapped in a
+//!   struct with a `Drop` implementation that calls the appropriate C free
+//!   function, preventing resource leaks even on early returns or panics.
+//! - **No `#[allow(...)]`** without inline justification referencing a
+//!   specific technical reason.
+//! - **`RUSTFLAGS="-D warnings"`** and **`cargo clippy -- -D warnings`**
+//!   must produce zero diagnostics.
+//!
+//! ## C Preprocessor → Cargo Feature Mapping
+//!
+//! For code review traceability, the following table documents which C
+//! preprocessor conditional each Cargo feature replaces:
+//!
+//! ```text
+//! C Preprocessor          → Cargo Feature
+//! ─────────────────────────────────────────────
+//! SUPPORT_PAM             → ffi-pam
+//! RADIUS_CONFIG_FILE      → ffi-radius
+//! EXIM_PERL               → ffi-perl
+//! AUTH_GSASL              → ffi-gsasl
+//! AUTH_HEIMDAL_GSSAPI     → ffi-krb5
+//! SUPPORT_SPF             → ffi-spf
+//! SUPPORT_DMARC           → ffi-dmarc
+//! LOOKUP_ORACLE           → ffi-oracle
+//! LOOKUP_WHOSON           → ffi-whoson
+//! LOOKUP_NISPLUS          → ffi-nisplus
+//! LOOKUP_NIS              → ffi-nis
+//! AUTH_CYRUS_SASL         → ffi-cyrus-sasl
+//! USE_DB                  → hintsdb-bdb
+//! USE_GDBM                → hintsdb-gdbm
+//! USE_NDBM                → hintsdb-ndbm
+//! USE_TDB                 → hintsdb-tdb
+//! ```
 
 // =============================================================================
 // Always-compiled utility modules
 // =============================================================================
 //
 // These modules provide safe wrappers around inherently-unsafe POSIX
-// operations that are needed by multiple workspace crates.  They are NOT
+// operations that are needed by multiple workspace crates. They are NOT
 // feature-gated because they have no external C library dependency beyond
 // the Rust standard library and the `nix` crate.
 
 /// Safe raw-file-descriptor conversion utilities.
 ///
-/// Provides [`fd::tcp_stream_from_raw_fd`] — a safe wrapper around the
-/// `FromRawFd` trait for converting POSIX file descriptors into
-/// `std::net::TcpStream`.  Consumed by `exim-tls` backends.
+/// Provides a safe wrapper around the `FromRawFd` trait for converting
+/// POSIX file descriptors into `std::net::TcpStream`. Consumed by
+/// `exim-tls` backends.
 pub mod fd;
 
 /// Safe POSIX signal handling wrappers.
 ///
-/// Provides [`signal::install_signal_action`] — a safe wrapper around
-/// `nix::sys::signal::sigaction()`.  Consumed by `exim-core/src/signal.rs`.
+/// Provides a safe wrapper around `nix::sys::signal::sigaction()`.
+/// Consumed by `exim-core/src/signal.rs`.
 pub mod signal;
 
 // =============================================================================
 // Feature-gated C library FFI module declarations
 // =============================================================================
 //
-// Each module is only compiled when its corresponding feature is enabled,
-// ensuring that the system library headers and link libraries are only
-// required when explicitly requested.
-//
-// NOTE: Module declarations for pam, radius, perl, gsasl, krb5, and hintsdb
-// will be added by their respective implementation agents when those files
-// are created. Only modules with source files present on disk are declared
-// below to avoid rustfmt resolution errors.
+// Each module below wraps a C library that has no viable Rust-native
+// replacement (see AAP §0.6.2). Modules are only compiled when their
+// corresponding Cargo feature is enabled, ensuring that system library
+// headers and link libraries are only required when explicitly requested.
 
-/// RADIUS authentication bindings (wraps libradius/radiusclient/freeradiusclient).
-/// Source: src/src/miscmods/radius.c — replaces RADIUS_CONFIG_FILE preprocessor conditional
-#[cfg(feature = "ffi-radius")]
-pub mod radius;
-
-#[cfg(feature = "ffi-gsasl")]
-pub mod gsasl;
-
-#[cfg(feature = "ffi-krb5")]
-pub mod krb5;
-
-#[cfg(feature = "ffi-perl")]
-pub mod perl;
-
+/// PAM authentication bindings (wraps libpam).
+///
+/// Source: `src/src/miscmods/pam.c` — replaces `SUPPORT_PAM` preprocessor
+/// conditional.
 #[cfg(feature = "ffi-pam")]
 pub mod pam;
 
+/// RADIUS authentication bindings (wraps libradius/radiusclient/freeradiusclient).
+///
+/// Source: `src/src/miscmods/radius.c` — replaces `RADIUS_CONFIG_FILE`
+/// preprocessor conditional.
+#[cfg(feature = "ffi-radius")]
+pub mod radius;
+
+/// Embedded Perl interpreter bindings (wraps libperl).
+///
+/// Source: `src/src/miscmods/perl.c` — replaces `EXIM_PERL` preprocessor
+/// conditional.
+#[cfg(feature = "ffi-perl")]
+pub mod perl;
+
+/// GNU SASL bindings (wraps libgsasl).
+///
+/// Source: `src/src/auths/gsasl.c` — replaces `AUTH_GSASL` preprocessor
+/// conditional.
+#[cfg(feature = "ffi-gsasl")]
+pub mod gsasl;
+
+/// Kerberos/GSSAPI bindings (wraps libkrb5/Heimdal).
+///
+/// Source: `src/src/auths/heimdal_gssapi.c` — replaces
+/// `AUTH_HEIMDAL_GSSAPI` preprocessor conditional.
+#[cfg(feature = "ffi-krb5")]
+pub mod krb5;
+
+/// SPF validation bindings (wraps libspf2).
+///
+/// Source: `src/src/miscmods/spf.c` — replaces `SUPPORT_SPF` preprocessor
+/// conditional.
 #[cfg(feature = "ffi-spf")]
 pub mod spf;
 
-/// Oracle OCI (Oracle Call Interface) FFI bindings (wraps libclntsh).
-/// Source: src/src/lookups/oracle.c — wraps legacy OCI v2 API for Oracle SQL lookups
-#[cfg(feature = "ffi-oracle")]
-pub mod oracle;
-
 /// DMARC policy evaluation bindings (wraps libopendmarc).
-/// Source: src/src/miscmods/dmarc.c — replaces SUPPORT_DMARC preprocessor conditional
+///
+/// Source: `src/src/miscmods/dmarc.c` — replaces `SUPPORT_DMARC`
+/// preprocessor conditional.
 #[cfg(feature = "ffi-dmarc")]
 pub mod dmarc;
 
+/// Oracle OCI (Oracle Call Interface) FFI bindings (wraps libclntsh).
+///
+/// Source: `src/src/lookups/oracle.c` — replaces `LOOKUP_ORACLE`
+/// preprocessor conditional.
+#[cfg(feature = "ffi-oracle")]
+pub mod oracle;
+
 /// WHOSON dynamic IP user tracking bindings (wraps libwhoson).
-/// Source: src/src/lookups/whoson.c — replaces LOOKUP_WHOSON preprocessor conditional
+///
+/// Source: `src/src/lookups/whoson.c` — replaces `LOOKUP_WHOSON`
+/// preprocessor conditional.
 #[cfg(feature = "ffi-whoson")]
 pub mod whoson;
 
-/// NIS (YP) directory service bindings (wraps libnsl NIS/YP API from rpcsvc/ypclnt.h).
-/// Source: src/src/lookups/nis.c — replaces LOOKUP_NIS preprocessor conditional.
-/// Provides safe wrappers around yp_get_default_domain() and yp_match().
-#[cfg(feature = "ffi-nis")]
-pub mod nis;
-
-/// NIS+ directory service bindings (wraps libnsl NIS+ API from rpcsvc/nis.h).
-/// Source: src/src/lookups/nisplus.c — replaces LOOKUP_NISPLUS preprocessor conditional
+/// NIS+ directory service bindings (wraps libnsl NIS+ API from
+/// `<rpcsvc/nis.h>`).
+///
+/// Source: `src/src/lookups/nisplus.c` — replaces `LOOKUP_NISPLUS`
+/// preprocessor conditional.
 #[cfg(feature = "ffi-nisplus")]
 pub mod nisplus;
 
+/// NIS (Yellow Pages) directory service bindings (wraps libnsl NIS/YP API
+/// from `<rpcsvc/ypclnt.h>`).
+///
+/// Source: `src/src/lookups/nis.c` — replaces `LOOKUP_NIS` preprocessor
+/// conditional.
+#[cfg(feature = "ffi-nis")]
+pub mod nis;
+
 /// Cyrus SASL (libsasl2) server-side authentication bindings.
-/// Source: src/src/auths/cyrus_sasl.c — replaces AUTH_CYRUS_SASL preprocessor conditional.
-/// Provides safe wrappers around sasl_server_init, sasl_server_new, sasl_listmech,
-/// sasl_server_start, sasl_server_step, sasl_getprop, sasl_setprop, and sasl_dispose.
-/// NOT to be confused with libgsasl (GNU SASL) which is wrapped in `gsasl.rs`.
+///
+/// Source: `src/src/auths/cyrus_sasl.c` — replaces `AUTH_CYRUS_SASL`
+/// preprocessor conditional. NOT to be confused with libgsasl (GNU SASL)
+/// which is wrapped in [`gsasl`].
 #[cfg(feature = "ffi-cyrus-sasl")]
 pub mod cyrus_sasl;
 
-/// LMDB environment safe wrapper — centralises the `unsafe` heed::EnvOpenOptions::open()
-/// call so that exim-lookups/src/lmdb.rs remains 100% safe Rust (per AAP §0.7.2).
-/// Provides [`lmdb::open_env_readonly`] for opening LMDB databases in read-only mode.
+/// LMDB environment safe wrapper — centralises the `unsafe`
+/// `heed::EnvOpenOptions::open()` call so that `exim-lookups/src/lmdb.rs`
+/// remains 100% safe Rust (per AAP §0.7.2).
 #[cfg(feature = "ffi-lmdb")]
 pub mod lmdb;
 
-/// Hints database abstraction layer — common trait and backend implementations.
-/// The `hintsdb` module is always available; individual backends are feature-gated
-/// internally (hintsdb-tdb, hintsdb-gdbm, hintsdb-ndbm, hintsdb-bdb).
+// =============================================================================
+// Hints database abstraction layer
+// =============================================================================
+//
+// The `hintsdb` module is always available (no top-level feature gate)
+// because it defines the common `HintsDb` trait used by all backends.
+// Individual backend implementations are feature-gated internally:
+//   - `hintsdb/bdb.rs`  → `#[cfg(feature = "hintsdb-bdb")]`
+//   - `hintsdb/gdbm.rs` → `#[cfg(feature = "hintsdb-gdbm")]`
+//   - `hintsdb/ndbm.rs` → `#[cfg(feature = "hintsdb-ndbm")]`
+//   - `hintsdb/tdb.rs`  → `#[cfg(feature = "hintsdb-tdb")]`
+//
+// This design allows the common HintsDb trait to always be available even
+// when no specific backend is selected, matching the C architecture where
+// USE_DB/USE_GDBM/USE_NDBM/USE_TDB conditionals gate backend code but
+// the hints API contract is always present.
+
+/// Hints database abstraction layer — common trait and backend
+/// implementations.
+///
+/// Source: `src/src/hintsdb/hints_*.h` — replaces `USE_DB`/`USE_GDBM`/
+/// `USE_NDBM`/`USE_TDB` preprocessor conditionals.
 pub mod hintsdb;
