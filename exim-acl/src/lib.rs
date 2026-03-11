@@ -19,3 +19,11 @@
 /// ACL phase definitions: [`AclWhere`](phases::AclWhere) enum, [`AclBitSet`](phases::AclBitSet)
 /// bitmask type, `BIT_*` constants, and the forbids/permits system.
 pub mod phases;
+
+/// ACL variable management: [`AclVarStore`](variables::AclVarStore) for variable
+/// creation, lookup, spool serialization/deserialization, and standalone variable
+/// setting for `-be` expand-test mode.
+pub mod variables;
+
+// Re-export key variable types for convenient access by dependent crates.
+pub use variables::{AclVarError, AclVarScope, AclVarStore, AclVariable};
