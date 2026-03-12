@@ -321,12 +321,21 @@ pub enum DnsRecordData {
     /// AAAA record — single IPv6 address.
     Aaaa(Ipv6Addr),
     /// MX record — preference value and mail exchange hostname.
-    Mx { preference: u16, exchange: String },
+    Mx {
+        /// MX preference (lower = higher priority).
+        preference: u16,
+        /// Mail exchange hostname.
+        exchange: String,
+    },
     /// SRV record — priority, weight, port, and target hostname.
     Srv {
+        /// Service priority (lower = higher priority).
         priority: u16,
+        /// Weight for load balancing among equal-priority targets.
         weight: u16,
+        /// TCP/UDP port for the service.
         port: u16,
+        /// Target hostname providing the service.
         target: String,
     },
     /// PTR record — domain name pointer.
@@ -339,19 +348,30 @@ pub enum DnsRecordData {
     Ns(String),
     /// SOA record — authority information.
     Soa {
+        /// Primary nameserver for the zone.
         mname: String,
+        /// Responsible person email (in DNS label form).
         rname: String,
+        /// Zone serial number.
         serial: u32,
+        /// Refresh interval in seconds.
         refresh: i32,
+        /// Retry interval in seconds.
         retry: i32,
+        /// Expire time in seconds.
         expire: i32,
+        /// Minimum TTL for negative caching (seconds).
         minimum: u32,
     },
     /// TLSA record — TLS authentication data (DANE).
     Tlsa {
+        /// Certificate usage field (0–3 per RFC 6698).
         cert_usage: u8,
+        /// Selector field (0=full cert, 1=SubjectPublicKeyInfo).
         selector: u8,
+        /// Matching type (0=exact, 1=SHA-256, 2=SHA-512).
         matching_type: u8,
+        /// Certificate association data.
         cert_data: Vec<u8>,
     },
     /// Unknown/unsupported record type — raw bytes preserved.
