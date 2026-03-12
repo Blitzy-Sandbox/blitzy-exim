@@ -33,3 +33,10 @@ pub mod spa;
 /// through `exim-ffi`.
 #[cfg(feature = "auth-heimdal-gssapi")]
 pub mod heimdal_gssapi;
+
+/// GNU SASL authenticator driver.
+/// Replaces C `src/src/auths/gsasl.c` + `gsasl.h` — the largest auth driver,
+/// supporting SCRAM mechanisms, channel-binding, and extensive SASL
+/// configuration via libgsasl through `exim-ffi`.
+#[cfg(feature = "auth-gsasl")]
+pub mod gsasl;

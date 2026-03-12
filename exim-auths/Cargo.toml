@@ -89,7 +89,7 @@ auth-external = []
 # GSASL: GNU SASL library integration for SCRAM and other mechanisms.
 # Requires FFI bindings from exim-ffi for libgsasl interop.
 # Replaces AUTH_GSASL / gsasl.c from the C build.
-auth-gsasl = ["dep:exim-ffi"]
+auth-gsasl = ["dep:exim-ffi", "exim-ffi/ffi-gsasl"]
 
 # Heimdal GSSAPI: Kerberos/GSSAPI authentication via Heimdal libraries.
 # Requires FFI bindings from exim-ffi for libkrb5/libgssapi interop.
