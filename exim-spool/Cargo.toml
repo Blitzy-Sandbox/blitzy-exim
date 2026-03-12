@@ -107,3 +107,22 @@ tracing = { workspace = true }
 # Provides the log facade for crate-level compatibility with libraries that
 # use the `log` crate rather than `tracing` directly.
 log = { workspace = true }
+
+# ── Safe POSIX API wrappers ──────────────────────────────────────────────────
+# Required for fcntl file locking (F_WRLCK on spool data first line), fchown
+# (setting exim_uid:exim_gid on temp files), and fchmod (setting SPOOL_MODE
+# permissions).  AAP §0.7.2 forbids unsafe blocks outside exim-ffi, so nix
+# provides safe wrappers for these POSIX calls.
+nix = { workspace = true, features = ["fs"] }
+
+# ── POSIX constant definitions ───────────────────────────────────────────────
+# Provides O_NOFOLLOW (symlink attack protection) and O_CLOEXEC (close-on-exec)
+# constants, plus the libc::flock struct for POSIX record locking byte ranges.
+libc = { workspace = true }
+
+# =============================================================================
+# Dev Dependencies (testing only)
+# =============================================================================
+
+[dev-dependencies]
+tempfile = "3"
