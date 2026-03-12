@@ -17,3 +17,4 @@ pub mod driver_init;
 pub mod macros;
 pub mod options;
 pub mod types;
+pub mod validate;
