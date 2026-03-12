@@ -34,6 +34,7 @@ pub mod orchestrator;
 pub mod parallel;
 pub mod retry;
 pub mod routing;
+pub mod transport_dispatch;
 
 // Re-export primary public types for ergonomic access
 pub use bounce::{
@@ -62,3 +63,9 @@ pub use routing::{
     route_findgroup, route_finduser, route_init, router_current_name, RouterInstance, RoutingError,
     RoutingResult, UserInfo, VerifyMode,
 };
+pub use transport_dispatch::{
+    batch_addresses, execute_local_transport, expand_transport_options, find_ugid,
+    prepare_remote_transport, same_hosts, same_ugid, tpt_parallel_check, ExpandedTransportOptions,
+    RemoteBatch, TransportDispatchError,
+};
+

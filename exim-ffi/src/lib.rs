@@ -113,6 +113,14 @@ pub mod fd;
 /// Consumed by `exim-core/src/signal.rs`.
 pub mod signal;
 
+/// Safe POSIX process management wrappers.
+///
+/// Provides a safe wrapper around `nix::unistd::fork()` (which is `unsafe`
+/// in the `nix` crate).  Exim's single-threaded fork-per-connection model
+/// guarantees the safety preconditions of `fork()`.  Consumed by
+/// `exim-deliver/src/transport_dispatch.rs` and `exim-core/src/process.rs`.
+pub mod process;
+
 // =============================================================================
 // Feature-gated C library FFI module declarations
 // =============================================================================
