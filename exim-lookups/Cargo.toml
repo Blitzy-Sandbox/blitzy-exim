@@ -204,11 +204,11 @@ lookup-lsearch = []
 # MySQL/MariaDB SQL lookup via mysql_async (async, bridged via block_on)
 lookup-mysql = ["dep:mysql_async", "async-lookups"]
 
-# NIS (Yellow Pages) directory lookup via FFI
-lookup-nis = ["dep:exim-ffi"]
+# NIS (Yellow Pages) directory lookup via FFI (forwards ffi-nis to exim-ffi)
+lookup-nis = ["dep:exim-ffi", "exim-ffi/ffi-nis"]
 
-# NIS+ directory lookup via FFI
-lookup-nisplus = ["dep:exim-ffi"]
+# NIS+ directory lookup via FFI (forwards ffi-nisplus to exim-ffi)
+lookup-nisplus = ["dep:exim-ffi", "exim-ffi/ffi-nisplus"]
 
 # NMH datagram protocol lookup (pure Rust socket I/O)
 lookup-nmh = []
