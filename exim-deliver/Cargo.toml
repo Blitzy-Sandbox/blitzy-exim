@@ -127,6 +127,11 @@ dane = []
 # Replaces 3 occurrences of #ifndef DISABLE_PRDR in deliver.c.
 prdr = []
 
+# IP address translation support — enables the translate_ip_address
+# option in router configurations for rewriting host list IP addresses
+# before delivery. Replaces #ifdef SUPPORT_TRANSLATE_IP_ADDRESS in route.c.
+translate-ip-address = []
+
 # =============================================================================
 # Dependencies
 # =============================================================================

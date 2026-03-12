@@ -32,6 +32,7 @@ pub mod bounce;
 pub mod journal;
 pub mod orchestrator;
 pub mod retry;
+pub mod routing;
 
 // Re-export primary public types for ergonomic access
 pub use bounce::{
@@ -49,4 +50,10 @@ pub use retry::{
     retry_add_item, retry_check_address, retry_find_config, retry_host_key_build,
     retry_ultimate_address_timeout, retry_update, HostStatus, HostWhyUnusable, RetryConfig,
     RetryError, RetryItem, RetryItemFlags, RetryRecord, RetryRule, RetryRuleType,
+};
+pub use routing::{
+    check_files, check_router_conditions, route_address, route_check_access, route_check_dls,
+    route_check_prefix, route_check_suffix, route_find_expanded_group, route_find_expanded_user,
+    route_findgroup, route_finduser, route_init, router_current_name, RouterInstance, RoutingError,
+    RoutingResult, UserInfo, VerifyMode,
 };
