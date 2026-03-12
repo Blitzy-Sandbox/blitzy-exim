@@ -14,3 +14,9 @@ pub mod helpers;
 /// TLS client certificate parameters.
 #[cfg(feature = "auth-tls")]
 pub mod tls_auth;
+
+/// SPA/NTLM authenticator driver.
+/// Replaces C `src/src/auths/spa.c` + `spa.h` + `auth-spa.c` + `auth-spa.h` —
+/// full NTLM protocol with built-in MD4/DES crypto.
+#[cfg(feature = "auth-spa")]
+pub mod spa;
