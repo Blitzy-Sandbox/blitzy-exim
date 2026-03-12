@@ -364,7 +364,7 @@ pub fn expand_string_2(string: &str, textonly: &mut bool) -> Result<String, Expa
     let mut parser_inst = parser::Parser::new(string);
     let ast = parser_inst.parse()?;
 
-    let mut eval = evaluator::Evaluator::new();
+    let mut eval = evaluator::Evaluator::new_default();
     let flags = EsiFlags::ESI_HONOR_DOLLAR;
     eval.evaluate(&ast, flags)
 }
@@ -390,7 +390,7 @@ pub fn expand_string_nonempty(string: &str) -> bool {
         Err(_) => return false,
     };
 
-    let mut eval = evaluator::Evaluator::new();
+    let mut eval = evaluator::Evaluator::new_default();
     let flags = EsiFlags::ESI_HONOR_DOLLAR | EsiFlags::ESI_EXISTS_ONLY;
     match eval.evaluate(&ast, flags) {
         Ok(s) => !s.is_empty(),
@@ -1220,7 +1220,7 @@ mod tests {
 
     #[test]
     fn evaluator_reexport_accessible() {
-        let eval = Evaluator::new();
+        let eval = Evaluator::new_default();
         assert_eq!(eval.expand_level, 0);
         assert_eq!(eval.expand_forbid, 0);
         assert!(!eval.forced_fail);
