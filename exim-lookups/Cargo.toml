@@ -240,8 +240,8 @@ lookup-sqlite = ["dep:rusqlite"]
 # Synthetic test backends (no external deps — used by test suite)
 lookup-testdb = []
 
-# Whoson dynamic IP lookup via FFI
-lookup-whoson = ["dep:exim-ffi"]
+# Whoson dynamic IP lookup via FFI (forwards ffi-whoson to exim-ffi)
+lookup-whoson = ["dep:exim-ffi", "exim-ffi/ffi-whoson"]
 
 # ── Meta-feature: async runtime for database lookups ───────────────────────
 # Enables tokio runtime for async database backends (MySQL, PostgreSQL, LDAP).
