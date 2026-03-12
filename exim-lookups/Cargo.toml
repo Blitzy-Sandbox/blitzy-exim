@@ -214,7 +214,7 @@ lookup-nisplus = ["dep:exim-ffi"]
 lookup-nmh = []
 
 # Oracle OCI SQL lookup via FFI
-lookup-oracle = ["dep:exim-ffi"]
+lookup-oracle = ["dep:exim-ffi", "exim-ffi/ffi-oracle"]
 
 # System passwd database lookup (pure Rust via nix User::from_name — safe getpwnam_r)
 lookup-passwd = ["dep:nix"]
