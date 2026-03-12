@@ -31,6 +31,11 @@ pub mod verbs;
 /// setting for `-be` expand-test mode.
 pub mod variables;
 
+/// ACL condition/modifier evaluation: [`AclCondition`](conditions::AclCondition) enum,
+/// [`acl_check_condition`](conditions::acl_check_condition) dispatcher, control types,
+/// CSA verification, ratelimit, and all per-condition evaluation semantics.
+pub mod conditions;
+
 // Re-export key variable types for convenient access by dependent crates.
 pub use variables::{AclVarError, AclVarScope, AclVarStore, AclVariable};
 
