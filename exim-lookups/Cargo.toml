@@ -56,6 +56,10 @@ exim-drivers = { path = "../exim-drivers" }
 # Tainted<T>/Clean<T> newtypes, arena allocation, memory management
 exim-store = { path = "../exim-store" }
 
+# DNS resolution types and resolver (wraps hickory-resolver)
+# OPTIONAL: only pulled in when lookup-dnsdb feature is enabled
+exim-dns = { path = "../exim-dns", optional = true }
+
 # FFI bindings for C-library-backed lookups (NIS, NIS+, Oracle, Whoson, DBM)
 # OPTIONAL: only pulled in when FFI-backed lookup features are enabled
 exim-ffi = { path = "../exim-ffi", optional = true }
@@ -181,8 +185,9 @@ hintsdb-gdbm = ["lookup-dbmdb", "exim-ffi/hintsdb-gdbm"]
 hintsdb-ndbm = ["lookup-dbmdb", "exim-ffi/hintsdb-ndbm"]
 hintsdb-bdb = ["lookup-dbmdb", "exim-ffi/hintsdb-bdb"]
 
-# DNS query lookup via hickory-resolver (A/AAAA/MX/SRV/TLSA/PTR/TXT)
-lookup-dnsdb = ["dep:hickory-resolver", "async-lookups"]
+# DNS query lookup via exim-dns crate (wraps hickory-resolver for
+# A/AAAA/MX/SRV/TLSA/PTR/TXT resolution plus CSA/MXH/ZNS virtual types)
+lookup-dnsdb = ["dep:exim-dns"]
 
 # Directory entry search (pure Rust, uses std::fs)
 lookup-dsearch = []

@@ -827,6 +827,7 @@ name = "exim-lookups"
 version = "0.1.0"
 dependencies = [
  "deadpool-postgres",
+ "exim-dns",
  "exim-drivers",
  "exim-ffi",
  "exim-store",
