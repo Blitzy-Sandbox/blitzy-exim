@@ -8,3 +8,9 @@
 //! directory from the C codebase.
 
 pub mod helpers;
+
+/// TLS client certificate authenticator driver.
+/// Replaces C `src/src/auths/tls.c` + `tls.h` — server-only auth based on
+/// TLS client certificate parameters.
+#[cfg(feature = "auth-tls")]
+pub mod tls_auth;
