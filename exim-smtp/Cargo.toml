@@ -105,6 +105,13 @@ default = ["tls", "prdr", "dkim", "content-scan", "pipe-connect", "events"]
 # subsystem is excluded from compilation.
 tls = ["dep:exim-tls"]
 
+# ── DANE/TLSA support ───────────────────────────────────────────────────────
+# Replaces: #ifdef SUPPORT_DANE (smtp_out.c, dane.c, tls-openssl.c)
+# Enables: DANE/TLSA certificate verification on outbound SMTP connections
+#          after TLS handshake. Forwards to exim-tls's dane feature. Requires
+#          the tls feature to also be enabled (uses optional dep syntax "?").
+dane = ["exim-tls?/dane"]
+
 # ── Per-Recipient Data Response ──────────────────────────────────────────────
 # Replaces: #ifndef DISABLE_PRDR (smtp_in.c lines 291, 309, 1784, 3137,
 #           4457, 4790, 4955, 4963)
