@@ -28,9 +28,11 @@
 
 #![deny(unsafe_code)]
 
+pub mod journal;
 pub mod orchestrator;
 
 // Re-export primary public types for ergonomic access
+pub use journal::{JournalError, JournalState};
 pub use orchestrator::{
     common_error, deliver_make_addr, deliver_message, deliver_msglog, deliver_set_expansions,
     deliver_split_address, post_process_one, AddressFlags, AddressItem, AddressLists,

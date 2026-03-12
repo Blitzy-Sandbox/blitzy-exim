@@ -246,6 +246,14 @@ anyhow = { workspace = true }
 regex = { workspace = true }
 
 # =============================================================================
+# Dev Dependencies
+# =============================================================================
+# These are only compiled for test, bench, and example targets.
+
+[dev-dependencies]
+tempfile = "3"
+
+# =============================================================================
 # Library Target
 # =============================================================================
 # Pure library crate consumed by exim-core (for top-level message delivery
