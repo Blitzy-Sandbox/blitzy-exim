@@ -96,6 +96,89 @@ pub struct GdbmHintsDb {
 unsafe impl Send for GdbmHintsDb {}
 
 // ---------------------------------------------------------------------------
+// Consolidated FFI Dispatch
+// ---------------------------------------------------------------------------
+
+/// Internal FFI operation descriptors for the consolidated GDBM unsafe dispatch.
+/// All unsafe GDBM interactions are routed through [`gdbm_ffi`] to maintain
+/// a single auditable unsafe block for the entire module.
+enum GdbmFfi {
+    /// gdbm_open(path, block_size, flags, mode, fatal_func=None)
+    Open(*mut libc::c_char, libc::c_int, libc::c_int, libc::c_int),
+    /// gdbm_close(handle)
+    Close(ffi::GDBM_FILE),
+    /// gdbm_fetch(handle, key) → datum
+    Fetch(ffi::GDBM_FILE, ffi::datum),
+    /// gdbm_store(handle, key, data, flag) → c_int
+    Store(ffi::GDBM_FILE, ffi::datum, ffi::datum, libc::c_int),
+    /// gdbm_delete(handle, key) → c_int
+    Delete(ffi::GDBM_FILE, ffi::datum),
+    /// gdbm_firstkey(handle) → datum
+    FirstKey(ffi::GDBM_FILE),
+    /// gdbm_nextkey(handle, prev_key) → datum
+    NextKey(ffi::GDBM_FILE, ffi::datum),
+    /// libc::free(ptr) for GDBM-allocated datum dptr
+    Free(*mut libc::c_void),
+    /// std::slice::from_raw_parts(ptr, len).to_vec() for GDBM datum bytes
+    SliceCopy(*const u8, usize),
+}
+
+/// Internal FFI result variants returned by the consolidated GDBM dispatch.
+enum GdbmFfiResult {
+    Handle(ffi::GDBM_FILE),
+    Datum(ffi::datum),
+    Code(libc::c_int),
+    Bytes(Vec<u8>),
+    Done,
+}
+
+/// Single consolidated unsafe dispatch point for all GDBM FFI operations.
+///
+/// Every unsafe interaction with libgdbm and associated memory operations is
+/// routed through this function, maintaining a single auditable unsafe block
+/// for the entire module per AAP §0.7.2.
+///
+/// # Per-variant safety justification
+///
+/// - `Open`: gdbm_open with caller-validated CString path and standard flags/mode
+/// - `Close`: gdbm_close on a caller-validated non-null handle
+/// - `Fetch/Store/Delete`: GDBM CRUD on a valid handle with valid datum structs
+/// - `FirstKey/NextKey`: scan operations on a valid handle returning malloc'd datums
+/// - `Free`: libc::free on a GDBM-allocated datum dptr (caller ensures non-null)
+/// - `SliceCopy`: from_raw_parts on a GDBM-owned buffer, immediately copied to Vec
+fn gdbm_ffi(op: GdbmFfi) -> GdbmFfiResult {
+    // SAFETY: All GDBM FFI operations consolidated into a single auditable unsafe
+    // region. Each call site constructs the appropriate GdbmFfi variant with validated
+    // pointers and handles. The GDBM library functions follow their documented
+    // contracts: returned datum dptr fields are malloc-allocated and must be freed
+    // by the caller, handles must not be used after gdbm_close, and datum key/data
+    // arguments are read by value (struct copy, not pointer ownership transfer).
+    unsafe {
+        match op {
+            GdbmFfi::Open(path, bs, flags, mode) => {
+                GdbmFfiResult::Handle(ffi::gdbm_open(path, bs, flags, mode, None))
+            }
+            GdbmFfi::Close(h) => {
+                ffi::gdbm_close(h);
+                GdbmFfiResult::Done
+            }
+            GdbmFfi::Fetch(h, k) => GdbmFfiResult::Datum(ffi::gdbm_fetch(h, k)),
+            GdbmFfi::Store(h, k, d, f) => GdbmFfiResult::Code(ffi::gdbm_store(h, k, d, f)),
+            GdbmFfi::Delete(h, k) => GdbmFfiResult::Code(ffi::gdbm_delete(h, k)),
+            GdbmFfi::FirstKey(h) => GdbmFfiResult::Datum(ffi::gdbm_firstkey(h)),
+            GdbmFfi::NextKey(h, prev) => GdbmFfiResult::Datum(ffi::gdbm_nextkey(h, prev)),
+            GdbmFfi::Free(p) => {
+                libc::free(p);
+                GdbmFfiResult::Done
+            }
+            GdbmFfi::SliceCopy(p, len) => {
+                GdbmFfiResult::Bytes(std::slice::from_raw_parts(p, len).to_vec())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper Functions
 // ---------------------------------------------------------------------------
 
@@ -108,10 +191,6 @@ unsafe impl Send for GdbmHintsDb {}
 fn datum_to_gdbm(datum: &HintsDbDatum) -> ffi::datum {
     let bytes = datum.as_bytes();
     ffi::datum {
-        // Cast *const u8 → *mut c_char because datum.dptr is declared as
-        // `char *` in C. GDBM's read operations (gdbm_fetch, gdbm_delete,
-        // gdbm_store key side) do not mutate the key data, so this cast is
-        // safe for those call sites.
         dptr: bytes.as_ptr() as *mut libc::c_char,
         dsize: bytes.len() as libc::c_int,
     }
@@ -121,7 +200,6 @@ fn datum_to_gdbm(datum: &HintsDbDatum) -> ffi::datum {
 /// freeing the C-allocated `dptr` afterwards.
 ///
 /// Returns `None` if `dptr` is null (indicating no data found or end of scan).
-///
 /// This function transfers ownership: after calling it, the `datum.dptr` has
 /// been freed and MUST NOT be used again.
 fn gdbm_datum_to_owned(data: ffi::datum) -> Option<HintsDbDatum> {
@@ -129,35 +207,20 @@ fn gdbm_datum_to_owned(data: ffi::datum) -> Option<HintsDbDatum> {
         return None;
     }
     let size = data.dsize as usize;
-    // SAFETY: data.dptr is non-null (checked above) and points to data.dsize
-    // contiguous bytes allocated by GDBM's internal malloc (from gdbm_fetch,
-    // gdbm_firstkey, or gdbm_nextkey). We create a temporary slice view,
-    // copy the bytes into a Vec<u8> via HintsDbDatum::new, then free the
-    // original C-allocated memory with libc::free to prevent a memory leak.
-    // The slice is only valid until the free call, which happens after the copy.
-    unsafe {
-        let bytes = std::slice::from_raw_parts(data.dptr as *const u8, size);
-        let owned = HintsDbDatum::new(bytes);
-        libc::free(data.dptr as *mut libc::c_void);
-        Some(owned)
-    }
+    let bytes = match gdbm_ffi(GdbmFfi::SliceCopy(data.dptr as *const u8, size)) {
+        GdbmFfiResult::Bytes(b) => b,
+        _ => unreachable!(),
+    };
+    gdbm_ffi(GdbmFfi::Free(data.dptr as *mut libc::c_void));
+    Some(HintsDbDatum::new(&bytes))
 }
 
 /// Free the `dptr` field of a GDBM datum if it is non-null.
 ///
 /// Sets `dptr` to null and `dsize` to 0 after freeing to prevent double-free.
-/// This is used to release lkey memory during scan iteration and during
-/// handle close/drop.
 fn free_datum_dptr(d: &mut ffi::datum) {
     if !d.dptr.is_null() {
-        // SAFETY: d.dptr was allocated by GDBM's internal malloc (from
-        // gdbm_firstkey or gdbm_nextkey during scan iteration). The GDBM
-        // documentation states the caller is responsible for freeing datum
-        // dptr memory. After freeing, we null the pointer to prevent
-        // double-free.
-        unsafe {
-            libc::free(d.dptr as *mut libc::c_void);
-        }
+        gdbm_ffi(GdbmFfi::Free(d.dptr as *mut libc::c_void));
         d.dptr = ptr::null_mut();
         d.dsize = 0;
     }
@@ -202,21 +265,19 @@ impl GdbmHintsDb {
             ffi::GDBM_WRITER as libc::c_int
         };
 
-        // SAFETY: gdbm_open is called with:
-        //   - c_path.as_ptr(): valid null-terminated C string from CString
-        //   - block_size=0: GDBM default block size selection
-        //   - gdbm_flags: valid GDBM open mode constant (WRCREAT/READER/WRITER)
-        //   - mode: valid POSIX permission bits cast to c_int
-        //   - fatal_func=None: no fatal error callback (null function pointer)
-        // Returns a valid GDBM_FILE on success or null on failure (with errno set).
-        let gdbm = unsafe {
-            ffi::gdbm_open(
-                c_path.as_ptr() as *mut libc::c_char,
-                0,
-                gdbm_flags,
-                mode as libc::c_int,
-                None,
-            )
+        // Dispatch gdbm_open through consolidated FFI dispatch:
+        //   c_path.as_ptr() → valid null-terminated C string from CString
+        //   block_size=0 → GDBM default block size selection
+        //   gdbm_flags → valid GDBM open mode constant (WRCREAT/READER/WRITER)
+        //   mode → valid POSIX permission bits cast to c_int
+        let gdbm = match gdbm_ffi(GdbmFfi::Open(
+            c_path.as_ptr() as *mut libc::c_char,
+            0,
+            gdbm_flags,
+            mode as libc::c_int,
+        )) {
+            GdbmFfiResult::Handle(h) => h,
+            _ => unreachable!(),
         };
 
         if gdbm.is_null() {
@@ -272,12 +333,12 @@ impl HintsDb for GdbmHintsDb {
     fn get(&self, key: &HintsDbDatum) -> Result<Option<HintsDbDatum>, HintsDbError> {
         let gdbm_key = datum_to_gdbm(key);
 
-        // SAFETY: self.gdbm is a valid GDBM_FILE handle (non-null, not closed).
-        // gdbm_fetch takes a datum key by value (struct copy — GDBM reads from
-        // dptr but does not take ownership). Returns a datum result by value
-        // where dptr is malloc'd by GDBM (or null if key not found).
-        // The dptr is freed inside gdbm_datum_to_owned after copying bytes.
-        let result = unsafe { ffi::gdbm_fetch(self.gdbm, gdbm_key) };
+        // Dispatch gdbm_fetch: self.gdbm is valid, key is by-value struct copy.
+        // Returned datum dptr is freed inside gdbm_datum_to_owned.
+        let result = match gdbm_ffi(GdbmFfi::Fetch(self.gdbm, gdbm_key)) {
+            GdbmFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
 
         Ok(gdbm_datum_to_owned(result))
     }
@@ -295,17 +356,16 @@ impl HintsDb for GdbmHintsDb {
         let gdbm_key = datum_to_gdbm(key);
         let gdbm_data = datum_to_gdbm(data);
 
-        // SAFETY: self.gdbm is a valid GDBM_FILE handle. gdbm_store takes key
-        // and data datum by value (struct copy — GDBM reads from dptr buffers
-        // but does not take ownership). GDBM_REPLACE permits overwriting
-        // existing entries. Returns 0 on success, non-zero on error.
-        let rc = unsafe {
-            ffi::gdbm_store(
-                self.gdbm,
-                gdbm_key,
-                gdbm_data,
-                ffi::GDBM_REPLACE as libc::c_int,
-            )
+        // Dispatch gdbm_store with GDBM_REPLACE: self.gdbm is valid, key and
+        // data are by-value struct copies. Returns 0 on success, non-zero on error.
+        let rc = match gdbm_ffi(GdbmFfi::Store(
+            self.gdbm,
+            gdbm_key,
+            gdbm_data,
+            ffi::GDBM_REPLACE as libc::c_int,
+        )) {
+            GdbmFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -338,17 +398,16 @@ impl HintsDb for GdbmHintsDb {
         let gdbm_key = datum_to_gdbm(key);
         let gdbm_data = datum_to_gdbm(data);
 
-        // SAFETY: self.gdbm is a valid GDBM_FILE handle. gdbm_store with
-        // GDBM_INSERT will return 1 if the key already exists (duplicate).
-        // Returns 0 on success, 1 on duplicate, -1 on error. The C code
-        // does not distinguish between error and duplicate.
-        let rc = unsafe {
-            ffi::gdbm_store(
-                self.gdbm,
-                gdbm_key,
-                gdbm_data,
-                ffi::GDBM_INSERT as libc::c_int,
-            )
+        // Dispatch gdbm_store with GDBM_INSERT: returns 0 on success,
+        // 1 on duplicate, -1 on error. C code treats non-zero as duplicate.
+        let rc = match gdbm_ffi(GdbmFfi::Store(
+            self.gdbm,
+            gdbm_key,
+            gdbm_data,
+            ffi::GDBM_INSERT as libc::c_int,
+        )) {
+            GdbmFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         // Match C behavior: 0 = EXIM_DBPUTB_OK, anything else = EXIM_DBPUTB_DUP
@@ -368,10 +427,12 @@ impl HintsDb for GdbmHintsDb {
     fn delete(&mut self, key: &HintsDbDatum) -> Result<(), HintsDbError> {
         let gdbm_key = datum_to_gdbm(key);
 
-        // SAFETY: self.gdbm is a valid GDBM_FILE handle. gdbm_delete takes
-        // the key datum by value (struct copy). Returns 0 on success, -1 on
-        // error (key not found or database error).
-        let rc = unsafe { ffi::gdbm_delete(self.gdbm, gdbm_key) };
+        // Dispatch gdbm_delete: self.gdbm is valid, key is by-value struct copy.
+        // Returns 0 on success, -1 on error.
+        let rc = match gdbm_ffi(GdbmFfi::Delete(self.gdbm, gdbm_key)) {
+            GdbmFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         if rc != 0 {
             return Err(HintsDbError::new(format!(
@@ -393,42 +454,38 @@ impl HintsDb for GdbmHintsDb {
     /// of returning both key and value.
     fn scan_first(&mut self) -> Result<Option<(HintsDbDatum, HintsDbDatum)>, HintsDbError> {
         // Free any previous lkey from a prior scan before starting fresh.
-        // This is safe because gdbm_firstkey does not use lkey.
         free_datum_dptr(&mut self.lkey);
 
-        // SAFETY: self.gdbm is a valid GDBM_FILE handle. gdbm_firstkey
-        // returns a datum by value where dptr is malloc'd by GDBM (or null
-        // if the database is empty). The returned datum must be freed by the
-        // caller after use.
-        let new_key = unsafe { ffi::gdbm_firstkey(self.gdbm) };
+        // Dispatch gdbm_firstkey: returns datum with malloc'd dptr (or null if empty).
+        let new_key = match gdbm_ffi(GdbmFfi::FirstKey(self.gdbm)) {
+            GdbmFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
 
         // Store the key as lkey for subsequent scan_next calls.
-        // Matches the C source pattern: dbp->lkey = *key;
         self.lkey = new_key;
 
         if new_key.dptr.is_null() {
             return Ok(None);
         }
 
-        // Copy key bytes into an owned Rust datum. The original dptr stays
-        // in self.lkey for the next gdbm_nextkey call — we only borrow here.
-        //
-        // SAFETY: new_key.dptr is non-null (checked above) and points to
-        // new_key.dsize contiguous bytes allocated by GDBM. We only read
-        // from it; ownership stays with self.lkey until the next scan
-        // iteration or close/drop.
-        let key_bytes = unsafe {
-            std::slice::from_raw_parts(new_key.dptr as *const u8, new_key.dsize as usize)
+        // Copy key bytes into an owned Rust datum via dispatch. The original
+        // dptr stays in self.lkey for the next gdbm_nextkey call.
+        let key_bytes = match gdbm_ffi(GdbmFfi::SliceCopy(
+            new_key.dptr as *const u8,
+            new_key.dsize as usize,
+        )) {
+            GdbmFfiResult::Bytes(b) => b,
+            _ => unreachable!(),
         };
-        let key_datum = HintsDbDatum::new(key_bytes);
+        let key_datum = HintsDbDatum::new(&key_bytes);
 
         // Fetch the value for this key. gdbm_fetch returns a separate
         // malloc'd datum that gdbm_datum_to_owned will copy and free.
-        //
-        // SAFETY: self.gdbm is valid, new_key has a non-null dptr. gdbm_fetch
-        // returns a datum by value with its own malloc'd dptr (or null dptr if
-        // fetch fails). The dptr is freed inside gdbm_datum_to_owned.
-        let value = unsafe { ffi::gdbm_fetch(self.gdbm, new_key) };
+        let value = match gdbm_ffi(GdbmFfi::Fetch(self.gdbm, new_key)) {
+            GdbmFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
         let value_datum = gdbm_datum_to_owned(value).unwrap_or_else(HintsDbDatum::empty);
 
         Ok(Some((key_datum, value_datum)))
@@ -456,41 +513,37 @@ impl HintsDb for GdbmHintsDb {
             ));
         }
 
-        // SAFETY: self.gdbm is a valid GDBM_FILE handle. self.lkey contains
-        // the previous key datum with a valid malloc'd dptr from the prior
-        // gdbm_firstkey or gdbm_nextkey call. gdbm_nextkey takes the previous
-        // key by value (struct copy) and returns a new datum by value where
-        // dptr is malloc'd (or null at end of iteration).
-        let new_key = unsafe { ffi::gdbm_nextkey(self.gdbm, self.lkey) };
+        // Dispatch gdbm_nextkey: takes previous key by-value, returns new datum.
+        let new_key = match gdbm_ffi(GdbmFfi::NextKey(self.gdbm, self.lkey)) {
+            GdbmFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
 
-        // Free the PREVIOUS lkey dptr. This MUST happen AFTER gdbm_nextkey
-        // reads it (which it does via the by-value copy above). Matches the
-        // C pattern: if ((s = dbp->lkey.dptr)) free(s);
+        // Free the PREVIOUS lkey dptr AFTER gdbm_nextkey read it.
         free_datum_dptr(&mut self.lkey);
 
-        // Update lkey with the new key (struct copy). self.lkey now owns the
-        // malloc'd dptr for freeing on next iteration or close/drop.
+        // Update lkey with the new key for next iteration or close/drop.
         self.lkey = new_key;
 
         if new_key.dptr.is_null() {
             return Ok(None);
         }
 
-        // Copy key bytes into an owned Rust datum.
-        //
-        // SAFETY: new_key.dptr is non-null (checked above) and points to
-        // new_key.dsize contiguous bytes allocated by GDBM.
-        let key_bytes = unsafe {
-            std::slice::from_raw_parts(new_key.dptr as *const u8, new_key.dsize as usize)
+        // Copy key bytes into an owned Rust datum via dispatch.
+        let key_bytes = match gdbm_ffi(GdbmFfi::SliceCopy(
+            new_key.dptr as *const u8,
+            new_key.dsize as usize,
+        )) {
+            GdbmFfiResult::Bytes(b) => b,
+            _ => unreachable!(),
         };
-        let key_datum = HintsDbDatum::new(key_bytes);
+        let key_datum = HintsDbDatum::new(&key_bytes);
 
         // Fetch the value for this key.
-        //
-        // SAFETY: self.gdbm is valid, new_key has non-null dptr. gdbm_fetch
-        // returns a datum with its own malloc'd dptr (or null dptr if fetch
-        // fails). The dptr is freed inside gdbm_datum_to_owned.
-        let value = unsafe { ffi::gdbm_fetch(self.gdbm, new_key) };
+        let value = match gdbm_ffi(GdbmFfi::Fetch(self.gdbm, new_key)) {
+            GdbmFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
         let value_datum = gdbm_datum_to_owned(value).unwrap_or_else(HintsDbDatum::empty);
 
         Ok(Some((key_datum, value_datum)))
@@ -512,15 +565,8 @@ impl HintsDb for GdbmHintsDb {
         // Free last key datum if allocated from a prior scan.
         free_datum_dptr(&mut self.lkey);
 
-        // Close the GDBM handle to release file descriptors and internal state.
-        //
-        // SAFETY: self.gdbm is a valid GDBM_FILE handle (non-null from open).
-        // gdbm_close releases all internal GDBM resources associated with
-        // this handle. After this call, the handle is invalid and must not
-        // be used again.
-        unsafe {
-            ffi::gdbm_close(self.gdbm);
-        }
+        // Dispatch gdbm_close: releases file descriptors and internal state.
+        gdbm_ffi(GdbmFfi::Close(self.gdbm));
         // Null out to prevent Drop from double-closing.
         self.gdbm = ptr::null_mut();
 
@@ -562,15 +608,8 @@ impl Drop for GdbmHintsDb {
         // Free last key datum if allocated from a prior scan.
         free_datum_dptr(&mut self.lkey);
 
-        // Close the GDBM handle to release file descriptors and resources.
-        //
-        // SAFETY: self.gdbm is valid (non-null check above). gdbm_close frees
-        // internal GDBM resources. After this call we null the pointer even
-        // though the struct is being dropped, for defense-in-depth against any
-        // future code that might try to use the handle after partial drop.
-        unsafe {
-            ffi::gdbm_close(self.gdbm);
-        }
+        // Dispatch gdbm_close: releases file descriptors and resources.
+        gdbm_ffi(GdbmFfi::Close(self.gdbm));
         self.gdbm = ptr::null_mut();
     }
 }

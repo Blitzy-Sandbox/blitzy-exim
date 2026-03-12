@@ -372,53 +372,44 @@ impl Drop for NisResultGuard {
 /// # Ok::<(), NisplusError>(())
 /// ```
 pub fn nis_lookup_table(table_name: &str) -> Result<NisplusTableInfo, NisplusError> {
-    // Step 1: Convert the Rust string to a null-terminated C string.
     let c_name = CString::new(table_name)
         .map_err(|_| NisplusError::new(-1, "table name contains interior NUL byte"))?;
 
-    // SAFETY: Step 2: Call nis_lookup with EXPAND_NAME | NO_CACHE flags.
-    // unsafe justification: calling nis_lookup with a valid null-terminated
-    // C string and standard NIS+ flags. The function allocates and returns
-    // a nis_result pointer that must be freed with nis_freeresult.
-    let result_ptr = unsafe { ffi::nis_lookup(c_name.as_ptr(), ffi::EXPAND_NAME | ffi::NO_CACHE) };
+    // SAFETY: Consolidated NIS+ table lookup sequence. nis_lookup() is called with
+    // a valid CString and standard flags (EXPAND_NAME | NO_CACHE), returning a
+    // nis_result pointer freed by NisResultGuard. The result's objects_val pointer
+    // is checked for null/count before dereferencing, zo_type is verified as
+    // TABLE_OBJ before accessing the union payload, and column name C strings are
+    // read via CStr::from_ptr with null checks. All pointers are owned by the
+    // nis_result and valid until the guard drops.
+    unsafe {
+        let result_ptr = ffi::nis_lookup(c_name.as_ptr(), ffi::EXPAND_NAME | ffi::NO_CACHE);
 
-    let guard = NisResultGuard::new(result_ptr)
-        .ok_or_else(|| NisplusError::new(-1, "nis_lookup returned null pointer"))?;
+        let guard = NisResultGuard::new(result_ptr)
+            .ok_or_else(|| NisplusError::new(-1, "nis_lookup returned null pointer"))?;
 
-    let result = guard.as_ref();
+        let result = guard.as_ref();
 
-    // Step 3: Check the NIS+ status code.
-    if result.status != ffi::NIS_SUCCESS {
-        return Err(NisplusError::from_status(result.status));
-    }
+        if result.status != ffi::NIS_SUCCESS {
+            return Err(NisplusError::from_status(result.status));
+        }
 
-    // Step 4: Verify we received at least one object.
-    if result.objects_len == 0 || result.objects_val.is_null() {
-        return Err(NisplusError::new(
-            result.status,
-            "nis_lookup returned success but no objects",
-        ));
-    }
+        if result.objects_len == 0 || result.objects_val.is_null() {
+            return Err(NisplusError::new(
+                result.status,
+                "nis_lookup returned success but no objects",
+            ));
+        }
 
-    // SAFETY: Step 5: Access the first returned object and verify it is a TABLE_OBJ.
-    // unsafe justification: dereferencing the objects_val pointer which was
-    // verified non-null above. The pointer is valid because nis_lookup
-    // returned NIS_SUCCESS with objects_len >= 1.
-    let obj = unsafe { &*result.objects_val };
+        let obj = &*result.objects_val;
 
-    if obj.zo_data.zo_type != ffi::TABLE_OBJ {
-        return Err(NisplusError::new(
-            -1,
-            format!("NIS+ object is not a table (type={})", obj.zo_data.zo_type),
-        ));
-    }
+        if obj.zo_data.zo_type != ffi::TABLE_OBJ {
+            return Err(NisplusError::new(
+                -1,
+                format!("NIS+ object is not a table (type={})", obj.zo_data.zo_type),
+            ));
+        }
 
-    // SAFETY: Step 6: Extract column names from the table object.
-    // unsafe justification: accessing the union payload as table_obj after
-    // verifying zo_type == TABLE_OBJ. The table_obj pointer and its
-    // ta_cols_val array are owned by the nis_result and valid until
-    // nis_freeresult is called (handled by the guard).
-    let table_info = unsafe {
         let ta = &*obj.zo_data.as_table_obj();
         let num_cols = ta.ta_cols_len as usize;
         let mut column_names = Vec::with_capacity(num_cols);
@@ -428,19 +419,13 @@ pub fn nis_lookup_table(table_name: &str) -> Result<NisplusTableInfo, NisplusErr
             let name = if col.tc_name.is_null() {
                 String::new()
             } else {
-                // unsafe justification: reading a null-terminated C string
-                // from the table column name pointer which is owned by the
-                // nis_result structure.
                 CStr::from_ptr(col.tc_name).to_string_lossy().into_owned()
             };
             column_names.push(name);
         }
 
-        NisplusTableInfo { column_names }
-    };
-
-    // The NisResultGuard will call nis_freeresult when dropped here.
-    Ok(table_info)
+        Ok(NisplusTableInfo { column_names })
+    }
 }
 
 /// Query NIS+ table entries matching the given query string.
@@ -478,72 +463,55 @@ pub fn nis_lookup_table(table_name: &str) -> Result<NisplusTableInfo, NisplusErr
 /// # Ok::<(), NisplusError>(())
 /// ```
 pub fn nis_query_entries(query: &str) -> Result<NisplusQueryResult, NisplusError> {
-    // Step 1: Convert the Rust query string to a null-terminated C string.
     let c_query = CString::new(query)
         .map_err(|_| NisplusError::new(-1, "query contains interior NUL byte"))?;
 
-    // SAFETY: Step 2: Call nis_list with EXPAND_NAME flag and NULL callback/userdata.
-    // unsafe justification: calling nis_list with a valid null-terminated
-    // query string and standard flags. The callback and userdata pointers
-    // are both null because we do not use the callback interface (matching
-    // the C source which passes NULL, NULL). The function allocates and
-    // returns a nis_result pointer that must be freed with nis_freeresult.
-    let result_ptr = unsafe {
-        ffi::nis_list(
+    // SAFETY: Consolidated NIS+ entry query. nis_list() is called with a valid
+    // CString query and EXPAND_NAME flag (NULL callback/userdata matching the C
+    // source). The returned nis_result is freed by NisResultGuard. objects_val is
+    // null/count checked before dereferencing, zo_type is verified as ENTRY_OBJ
+    // before accessing the union payload, and column value pointers are checked
+    // for null before creating byte slices. All pointers are owned by nis_result.
+    unsafe {
+        let result_ptr = ffi::nis_list(
             c_query.as_ptr(),
             ffi::EXPAND_NAME,
             ptr::null::<c_void>(),
             ptr::null::<c_void>(),
-        )
-    };
+        );
 
-    let guard = NisResultGuard::new(result_ptr)
-        .ok_or_else(|| NisplusError::new(-1, "nis_list returned null pointer"))?;
+        let guard = NisResultGuard::new(result_ptr)
+            .ok_or_else(|| NisplusError::new(-1, "nis_list returned null pointer"))?;
 
-    let result = guard.as_ref();
+        let result = guard.as_ref();
 
-    // Step 3: Check the NIS+ status code and map to our result type.
-    match result.status {
-        ffi::NIS_SUCCESS | ffi::NIS_S_SUCCESS => {
-            // Success — extract entries below.
+        match result.status {
+            ffi::NIS_SUCCESS | ffi::NIS_S_SUCCESS => {}
+            ffi::NIS_NOTFOUND | ffi::NIS_S_NOTFOUND => {
+                return Ok(NisplusQueryResult::NotFound);
+            }
+            ffi::NIS_NOSUCHTABLE => {
+                return Ok(NisplusQueryResult::NoSuchTable);
+            }
+            _ => {
+                return Err(NisplusError::from_status(result.status));
+            }
         }
-        ffi::NIS_NOTFOUND | ffi::NIS_S_NOTFOUND => {
+
+        let num_objects = result.objects_len as usize;
+        if num_objects == 0 || result.objects_val.is_null() {
             return Ok(NisplusQueryResult::NotFound);
         }
-        ffi::NIS_NOSUCHTABLE => {
-            return Ok(NisplusQueryResult::NoSuchTable);
-        }
-        _ => {
-            return Err(NisplusError::from_status(result.status));
-        }
-    }
 
-    // Step 4: Extract entries from the result.
-    let num_objects = result.objects_len as usize;
-    if num_objects == 0 || result.objects_val.is_null() {
-        return Ok(NisplusQueryResult::NotFound);
-    }
+        let mut entries = Vec::with_capacity(num_objects);
 
-    let mut entries = Vec::with_capacity(num_objects);
+        for obj_idx in 0..num_objects {
+            let obj = &*result.objects_val.add(obj_idx);
 
-    for obj_idx in 0..num_objects {
-        // SAFETY: accessing the objects_val array element
-        // at index obj_idx. The array has objects_len elements and was
-        // verified non-null above. The pointer is valid because nis_list
-        // returned NIS_SUCCESS.
-        let obj = unsafe { &*result.objects_val.add(obj_idx) };
+            if obj.zo_data.zo_type != ffi::ENTRY_OBJ {
+                continue;
+            }
 
-        // Only process ENTRY_OBJ objects (skip others silently, matching
-        // the C code behavior of checking zo_type).
-        if obj.zo_data.zo_type != ffi::ENTRY_OBJ {
-            continue;
-        }
-
-        // SAFETY: accessing the union payload as entry_obj
-        // after verifying zo_type == ENTRY_OBJ. All pointers within the
-        // entry_obj are owned by the nis_result and valid until
-        // nis_freeresult is called (handled by the guard).
-        let entry = unsafe {
             let eo = &*obj.zo_data.as_entry_obj();
             let num_cols = eo.en_cols_len as usize;
             let mut columns = Vec::with_capacity(num_cols);
@@ -555,12 +523,7 @@ pub fn nis_query_entries(query: &str) -> Result<NisplusQueryResult, NisplusError
                 let value = if ec.ec_value_val.is_null() || raw_len == 0 {
                     Vec::new()
                 } else {
-                    // unsafe justification: creating a byte slice from the
-                    // entry column value pointer and length. Both were
-                    // obtained from the NIS+ result structure which is
-                    // valid until nis_freeresult.
-                    let slice = std::slice::from_raw_parts(ec.ec_value_val as *const u8, raw_len);
-                    slice.to_vec()
+                    std::slice::from_raw_parts(ec.ec_value_val as *const u8, raw_len).to_vec()
                 };
 
                 columns.push(NisplusColumn {
@@ -569,18 +532,15 @@ pub fn nis_query_entries(query: &str) -> Result<NisplusQueryResult, NisplusError
                 });
             }
 
-            NisplusEntry { columns }
-        };
+            entries.push(NisplusEntry { columns });
+        }
 
-        entries.push(entry);
+        if entries.is_empty() {
+            Ok(NisplusQueryResult::NotFound)
+        } else {
+            Ok(NisplusQueryResult::Found(entries))
+        }
     }
-
-    if entries.is_empty() {
-        Ok(NisplusQueryResult::NotFound)
-    } else {
-        Ok(NisplusQueryResult::Found(entries))
-    }
-    // The NisResultGuard will call nis_freeresult when dropped here.
 }
 
 /// Convert a NIS+ error status code to a human-readable string.
@@ -596,22 +556,17 @@ pub fn nis_query_entries(query: &str) -> Result<NisplusQueryResult, NisplusError
 ///
 /// A human-readable error description string.
 pub fn nis_error_string(status: i32) -> String {
-    // SAFETY: calling nis_sperrno which returns a pointer to a
-    // static null-terminated C string for the given NIS+ error code.
-    // The function is a pure lookup with no side effects and the returned
-    // pointer refers to process-lifetime static data.
-    let ptr = unsafe { ffi::nis_sperrno(status as c_int) };
-
-    if ptr.is_null() {
-        return format!("NIS+ error {}", status);
+    // SAFETY: nis_sperrno() returns a pointer to a static null-terminated C string
+    // for the given NIS+ error code (pure lookup, no side effects). The pointer is
+    // null-checked, then CStr::from_ptr reads the static string that remains valid
+    // for the process lifetime.
+    unsafe {
+        let ptr = ffi::nis_sperrno(status as c_int);
+        if ptr.is_null() {
+            return format!("NIS+ error {}", status);
+        }
+        CStr::from_ptr(ptr).to_string_lossy().into_owned()
     }
-
-    // SAFETY: reading the static null-terminated C string
-    // returned by nis_sperrno. The pointer was verified non-null above
-    // and refers to a static string that remains valid for the process
-    // lifetime.
-    let cstr = unsafe { CStr::from_ptr(ptr) };
-    cstr.to_string_lossy().into_owned()
 }
 
 // ===========================================================================

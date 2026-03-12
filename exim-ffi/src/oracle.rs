@@ -253,6 +253,224 @@ mod ffi {
         pub fn ologof(lda: *mut LdaDef) -> c_int;
     }
 }
+// ---------------------------------------------------------------------------
+// Centralized FFI dispatch — consolidates all unsafe blocks (AAP §0.7.2)
+// ---------------------------------------------------------------------------
+
+/// Enumeration of every Oracle OCI FFI operation.
+///
+/// Each variant carries the raw pointers and arguments needed for one OCI
+/// call.  All unsafe code is confined to the single [`oracle_ffi`] dispatch
+/// function below, keeping the public API free of `unsafe` blocks.
+#[allow(dead_code)] // variants used contextually across OracleSession/OracleCursor
+enum OracleFfi {
+    /// Produce a zero-initialized [`ffi::CdaDef`] on the heap.
+    Zeroed,
+    /// `olog` — establish an Oracle session.
+    Connect {
+        lda: *mut ffi::CdaDef,
+        hda: *mut u8,
+        user: *const libc::c_char,
+        pwd: *const libc::c_char,
+        host: *const libc::c_char,
+    },
+    /// `oerhms` — format a human-readable error message.
+    ErrMsg {
+        lda: *mut ffi::CdaDef,
+        code: ffi::Sb2,
+        buf: *mut libc::c_char,
+        buf_len: libc::c_int,
+    },
+    /// `ologof` — disconnect from Oracle.
+    Disconnect { lda: *mut ffi::CdaDef },
+    /// `oopen` — open a cursor on a session.
+    OpenCursor {
+        cda: *mut ffi::CdaDef,
+        lda: *mut ffi::CdaDef,
+    },
+    /// `oparse` — compile a SQL statement.
+    Parse {
+        cda: *mut ffi::CdaDef,
+        query: *const libc::c_char,
+        defer: libc::c_int,
+        version: ffi::Ub4,
+    },
+    /// `odescr` — describe a column in the select list.
+    Describe {
+        cda: *mut ffi::CdaDef,
+        col: libc::c_int,
+        dbsize: *mut ffi::Sb4,
+        dbtype: *mut ffi::Sb2,
+        name: *mut libc::c_char,
+        name_len: *mut ffi::Sb4,
+        dsize: *mut ffi::Sb4,
+        precision: *mut ffi::Sb2,
+        scale: *mut ffi::Sb2,
+        nullok: *mut ffi::Sb2,
+    },
+    /// `odefin` — bind an output buffer for a column.
+    Define {
+        cda: *mut ffi::CdaDef,
+        col: libc::c_int,
+        buf: *mut libc::c_char,
+        buf_len: libc::c_int,
+        ftype: libc::c_int,
+        def_scale: libc::c_int,
+        ind: *mut ffi::Sb2,
+        fmt: *const libc::c_char,
+        fmt_len: libc::c_int,
+        fmt_type: libc::c_int,
+        retlen: *mut ffi::Ub2,
+        retcode: *mut ffi::Ub2,
+    },
+    /// `oexec` — execute a parsed statement.
+    Execute { cda: *mut ffi::CdaDef },
+    /// `ofetch` — fetch the next result row.
+    Fetch { cda: *mut ffi::CdaDef },
+    /// `oclose` — release cursor resources.
+    CloseCursor { cda: *mut ffi::CdaDef },
+}
+
+/// Result type for [`oracle_ffi`].
+enum OracleFfiResult {
+    /// Integer return code from an OCI function.
+    Code(libc::c_int),
+    /// Heap-allocated, zero-initialized CdaDef.
+    CdaDef(Box<ffi::CdaDef>),
+    /// Operation completed with no meaningful return value.
+    Done,
+}
+
+/// Single-point-of-entry for all Oracle OCI FFI calls.
+///
+/// # Safety
+///
+/// All raw pointer arguments must satisfy the preconditions of the
+/// corresponding OCI function (valid, properly aligned, pointing to
+/// sufficient storage).  Callers enforce these preconditions through
+/// the safe public API on [`OracleSession`] and [`OracleCursor`].
+fn oracle_ffi(op: OracleFfi) -> OracleFfiResult {
+    // SAFETY: every match arm calls exactly one OCI C function whose
+    // preconditions are guaranteed by the safe wrappers above.
+    unsafe {
+        match op {
+            OracleFfi::Zeroed => {
+                // Safety: std::mem::zeroed is valid for CdaDef — a #[repr(C)]
+                // struct of integer and byte-array fields.
+                OracleFfiResult::CdaDef(Box::new(std::mem::zeroed()))
+            }
+            OracleFfi::Connect {
+                lda,
+                hda,
+                user,
+                pwd,
+                host,
+            } => {
+                // Safety: lda is zero-initialized; hda is a 512-byte buffer;
+                // all strings are null-terminated CStrings; -1 = null-terminated.
+                OracleFfiResult::Code(ffi::olog(
+                    lda,
+                    hda,
+                    user,
+                    -1,
+                    pwd,
+                    -1,
+                    host,
+                    -1,
+                    ffi::OCI_LM_DEF,
+                ))
+            }
+            OracleFfi::ErrMsg {
+                lda,
+                code,
+                buf,
+                buf_len,
+            } => {
+                // Safety: lda contains the error; buf has buf_len bytes.
+                ffi::oerhms(lda, code, buf, buf_len);
+                OracleFfiResult::Done
+            }
+            OracleFfi::Disconnect { lda } => {
+                // Safety: lda is a valid LDA from a successful olog.
+                OracleFfiResult::Code(ffi::ologof(lda))
+            }
+            OracleFfi::OpenCursor { cda, lda } => {
+                // Safety: cda is zero-initialized; lda is a connected session.
+                OracleFfiResult::Code(ffi::oopen(
+                    cda,
+                    lda,
+                    std::ptr::null(),
+                    -1,
+                    -1,
+                    std::ptr::null(),
+                    -1,
+                ))
+            }
+            OracleFfi::Parse {
+                cda,
+                query,
+                defer,
+                version,
+            } => {
+                // Safety: cda is an open cursor; query is null-terminated.
+                OracleFfiResult::Code(ffi::oparse(cda, query, -1, defer, version))
+            }
+            OracleFfi::Describe {
+                cda,
+                col,
+                dbsize,
+                dbtype,
+                name,
+                name_len,
+                dsize,
+                precision,
+                scale,
+                nullok,
+            } => {
+                // Safety: cda has a parsed SELECT; all output pointers are
+                // valid stack-allocated variables.
+                OracleFfiResult::Code(ffi::odescr(
+                    cda, col, dbsize, dbtype, name, name_len, dsize, precision, scale, nullok,
+                ))
+            }
+            OracleFfi::Define {
+                cda,
+                col,
+                buf,
+                buf_len,
+                ftype,
+                def_scale,
+                ind,
+                fmt,
+                fmt_len,
+                fmt_type,
+                retlen,
+                retcode,
+            } => {
+                // Safety: cda has a parsed statement; buf/ind/retlen/retcode
+                // point to heap storage with stable addresses.
+                OracleFfiResult::Code(ffi::odefin(
+                    cda, col, buf, buf_len, ftype, def_scale, ind, fmt, fmt_len, fmt_type, retlen,
+                    retcode,
+                ))
+            }
+            OracleFfi::Execute { cda } => {
+                // Safety: cda has a successfully parsed statement.
+                OracleFfiResult::Code(ffi::oexec(cda))
+            }
+            OracleFfi::Fetch { cda } => {
+                // Safety: cda is a cursor after a successful oexec.
+                let _ = ffi::ofetch(cda);
+                OracleFfiResult::Done
+            }
+            OracleFfi::CloseCursor { cda } => {
+                // Safety: cda is a valid cursor from a successful oopen.
+                let _ = ffi::oclose(cda);
+                OracleFfiResult::Done
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // OracleError
@@ -460,48 +678,32 @@ impl OracleSession {
         let c_password = CString::new(password)?;
         let c_host = CString::new(host)?;
 
-        // SAFETY: std::mem::zeroed is valid for CdaDef because it is a
-        // #[repr(C)] struct composed entirely of integer and byte-array
-        // fields, all of which have a valid zero representation.
-        let mut lda: Box<ffi::CdaDef> = Box::new(unsafe { std::mem::zeroed() });
+        let mut lda = match oracle_ffi(OracleFfi::Zeroed) {
+            OracleFfiResult::CdaDef(b) => b,
+            _ => unreachable!(),
+        };
         let mut hda: Box<[u8; ffi::HDA_SIZE]> = Box::new([0u8; ffi::HDA_SIZE]);
 
-        // SAFETY: calling olog to establish an Oracle connection.
-        let rc = unsafe {
-            // Safety: calling olog to establish an Oracle connection.
-            // - `lda` is a valid heap-allocated, zero-initialized CdaDef.
-            // - `hda` is a valid heap-allocated, zero-initialized 512-byte buffer.
-            // - All C string pointers come from CString and are null-terminated.
-            // - String length -1 tells Oracle the strings are null-terminated.
-            ffi::olog(
-                &mut *lda,
-                hda.as_mut_ptr(),
-                c_user.as_ptr(),
-                -1,
-                c_password.as_ptr(),
-                -1,
-                c_host.as_ptr(),
-                -1,
-                ffi::OCI_LM_DEF,
-            )
+        let rc = match oracle_ffi(OracleFfi::Connect {
+            lda: &mut *lda,
+            hda: hda.as_mut_ptr(),
+            user: c_user.as_ptr(),
+            pwd: c_password.as_ptr(),
+            host: c_host.as_ptr(),
+        }) {
+            OracleFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
             let code = lda.rc as i16;
             let mut msg_buf = [0u8; MAX_ITEM_BUFFER_SIZE];
-            // SAFETY: calling oerhms to format the Oracle error message.
-            unsafe {
-                // Safety: calling oerhms to format the Oracle error message.
-                // - `lda` is a valid CdaDef whose `rc` field contains the error.
-                // - `msg_buf` is a stack-allocated buffer of known size.
-                // - oerhms writes a null-terminated string into the buffer.
-                ffi::oerhms(
-                    &mut *lda,
-                    code as ffi::Sb2,
-                    msg_buf.as_mut_ptr() as *mut libc::c_char,
-                    msg_buf.len() as libc::c_int,
-                );
-            }
+            oracle_ffi(OracleFfi::ErrMsg {
+                lda: &mut *lda,
+                code: code as ffi::Sb2,
+                buf: msg_buf.as_mut_ptr() as *mut libc::c_char,
+                buf_len: msg_buf.len() as libc::c_int,
+            });
             let message = extract_c_string(&msg_buf);
             return Err(OracleError::new(code, message));
         }
@@ -519,20 +721,12 @@ impl OracleSession {
     /// session's LDA.
     pub fn error_message(&self, error_code: i16) -> String {
         let mut buf = [0u8; MAX_ITEM_BUFFER_SIZE];
-        // SAFETY: calling oerhms to retrieve an error description.
-        unsafe {
-            // Safety: calling oerhms to retrieve an error description.
-            // - The const-to-mut cast is sound because oerhms does not modify
-            //   the LDA; the `*mut` in its C signature is a legacy API artifact
-            //   predating `const` in C89/C99.
-            // - `buf` is a valid stack buffer of known size.
-            ffi::oerhms(
-                &*self.lda as *const ffi::CdaDef as *mut ffi::CdaDef,
-                error_code as ffi::Sb2,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len() as libc::c_int,
-            );
-        }
+        oracle_ffi(OracleFfi::ErrMsg {
+            lda: &*self.lda as *const ffi::CdaDef as *mut ffi::CdaDef,
+            code: error_code as ffi::Sb2,
+            buf: buf.as_mut_ptr() as *mut libc::c_char,
+            buf_len: buf.len() as libc::c_int,
+        });
         extract_c_string(&buf)
     }
 
@@ -544,14 +738,9 @@ impl OracleSession {
 
 impl Drop for OracleSession {
     fn drop(&mut self) {
-        // SAFETY: calling ologof to cleanly disconnect from Oracle.
-        unsafe {
-            // Safety: calling ologof to cleanly disconnect from Oracle.
-            // - `self.lda` is a valid LDA from a successful olog call.
-            // - After ologof returns, the LDA and HDA are no longer referenced
-            //   by Oracle and will be freed when their Boxes drop.
-            let _ = ffi::ologof(&mut *self.lda);
-        }
+        oracle_ffi(OracleFfi::Disconnect {
+            lda: &mut *self.lda,
+        });
     }
 }
 
@@ -576,24 +765,17 @@ impl OracleCursor {
     ///
     /// Returns [`OracleError`] if the OCI `oopen` call fails.
     pub fn open(session: &mut OracleSession) -> Result<Self, OracleError> {
-        // SAFETY: std::mem::zeroed is valid for CdaDef (see OracleSession::connect).
-        let mut cda: Box<ffi::CdaDef> = Box::new(unsafe { std::mem::zeroed() });
+        let mut cda = match oracle_ffi(OracleFfi::Zeroed) {
+            OracleFfiResult::CdaDef(b) => b,
+            _ => unreachable!(),
+        };
 
-        // SAFETY: calling oopen to allocate cursor resources.
-        let rc = unsafe {
-            // Safety: calling oopen to allocate cursor resources.
-            // - `cda` is a valid, zero-initialized CdaDef.
-            // - `session.lda` is a valid LDA from a successful olog call.
-            // - Null name/uid with -1 lengths selects default behavior.
-            ffi::oopen(
-                &mut *cda,
-                &mut *session.lda,
-                std::ptr::null(),
-                -1,
-                -1,
-                std::ptr::null(),
-                -1,
-            )
+        let rc = match oracle_ffi(OracleFfi::OpenCursor {
+            cda: &mut *cda,
+            lda: &mut *session.lda,
+        }) {
+            OracleFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -617,21 +799,14 @@ impl OracleCursor {
     pub fn parse(&mut self, query: &str) -> Result<(), OracleError> {
         let c_query = CString::new(query)?;
 
-        // SAFETY: calling oparse to parse the SQL statement.
-        let rc = unsafe {
-            // Safety: calling oparse to parse the SQL statement.
-            // - `self.cda` is a valid CdaDef from a successful oopen call.
-            // - `c_query` is a valid null-terminated C string.
-            // - query_len of -1 tells Oracle the string is null-terminated.
-            // - PARSE_NO_DEFER (0) = immediate parse.
-            // - PARSE_V7_LNG (2) = V7 language version.
-            ffi::oparse(
-                &mut *self.cda,
-                c_query.as_ptr(),
-                -1,
-                ffi::PARSE_NO_DEFER,
-                ffi::PARSE_V7_LNG,
-            )
+        let rc = match oracle_ffi(OracleFfi::Parse {
+            cda: &mut *self.cda,
+            query: c_query.as_ptr(),
+            defer: ffi::PARSE_NO_DEFER,
+            version: ffi::PARSE_V7_LNG,
+        }) {
+            OracleFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -665,25 +840,20 @@ impl OracleCursor {
         let mut scale: ffi::Sb2 = 0;
         let mut nullok: ffi::Sb2 = 0;
 
-        // SAFETY: calling odescr to retrieve column metadata.
-        let rc = unsafe {
-            // Safety: calling odescr to retrieve column metadata.
-            // - `self.cda` is a valid cursor with a parsed SELECT statement.
-            // - All output parameters are valid stack-allocated variables.
-            // - `name_buf` is large enough (MAX_ITEM_BUFFER_SIZE bytes).
-            // - Column index is 1-based per Oracle convention.
-            ffi::odescr(
-                &mut *self.cda,
-                col + 1,
-                &mut dbsize,
-                &mut dbtype,
-                name_buf.as_mut_ptr() as *mut libc::c_char,
-                &mut name_len,
-                &mut dsize,
-                &mut precision,
-                &mut scale,
-                &mut nullok,
-            )
+        let rc = match oracle_ffi(OracleFfi::Describe {
+            cda: &mut *self.cda,
+            col: col + 1,
+            dbsize: &mut dbsize,
+            dbtype: &mut dbtype,
+            name: name_buf.as_mut_ptr() as *mut libc::c_char,
+            name_len: &mut name_len,
+            dsize: &mut dsize,
+            precision: &mut precision,
+            scale: &mut scale,
+            nullok: &mut nullok,
+        }) {
+            OracleFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -744,31 +914,22 @@ impl OracleCursor {
         let retlen_ptr: *mut ffi::Ub2 = &mut def.meta.return_length;
         let retcode_ptr: *mut ffi::Ub2 = &mut def.meta.return_code;
 
-        // SAFETY: calling odefin to bind an output buffer for a column.
-        let rc = unsafe {
-            // Safety: calling odefin to bind an output buffer for a column.
-            // - `self.cda` is a valid cursor with a parsed statement.
-            // - `buf_ptr` points into the Vec's heap allocation (stable).
-            // - `ind_ptr`, `retlen_ptr`, `retcode_ptr` point into the
-            //   Box<DefineMetadata> heap allocation (stable).
-            // - Column index is 1-based per Oracle convention.
-            // - ftype = STRING_TYPE (5) to retrieve data as text.
-            // - scale = -1, fmt = null, fmt_len = -1, fmt_type = -1 for
-            //   default formatting (matches oracle.c line 186–190).
-            ffi::odefin(
-                &mut *self.cda,
-                col + 1,
-                buf_ptr,
-                buf_len as libc::c_int,
-                STRING_TYPE as libc::c_int,
-                -1,
-                ind_ptr,
-                std::ptr::null(),
-                -1,
-                -1,
-                retlen_ptr,
-                retcode_ptr,
-            )
+        let rc = match oracle_ffi(OracleFfi::Define {
+            cda: &mut *self.cda,
+            col: col + 1,
+            buf: buf_ptr,
+            buf_len: buf_len as libc::c_int,
+            ftype: STRING_TYPE as libc::c_int,
+            def_scale: -1,
+            ind: ind_ptr,
+            fmt: std::ptr::null(),
+            fmt_len: -1,
+            fmt_type: -1,
+            retlen: retlen_ptr,
+            retcode: retcode_ptr,
+        }) {
+            OracleFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -788,11 +949,11 @@ impl OracleCursor {
     ///
     /// Returns [`OracleError`] if the OCI `oexec` call fails.
     pub fn execute(&mut self) -> Result<(), OracleError> {
-        // SAFETY: calling oexec to execute the parsed statement.
-        let rc = unsafe {
-            // Safety: calling oexec to execute the parsed statement.
-            // - `self.cda` is a valid cursor with a successfully parsed statement.
-            ffi::oexec(&mut *self.cda)
+        let rc = match oracle_ffi(OracleFfi::Execute {
+            cda: &mut *self.cda,
+        }) {
+            OracleFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -816,13 +977,9 @@ impl OracleCursor {
     ///
     /// Returns [`OracleError`] for fetch failures other than end-of-data.
     pub fn fetch(&mut self) -> Result<OracleFetchResult, OracleError> {
-        // SAFETY: calling ofetch to retrieve the next result row.
-        let _ = unsafe {
-            // Safety: calling ofetch to retrieve the next result row.
-            // - `self.cda` is a valid cursor after a successful oexec.
-            // - Oracle writes to buffers previously bound via odefin.
-            ffi::ofetch(&mut *self.cda)
-        };
+        oracle_ffi(OracleFfi::Fetch {
+            cda: &mut *self.cda,
+        });
 
         let rc = self.cda.rc;
         if rc == NO_DATA_FOUND as ffi::Ub2 {
@@ -850,14 +1007,9 @@ impl OracleCursor {
 
 impl Drop for OracleCursor {
     fn drop(&mut self) {
-        // SAFETY: calling oclose to release cursor resources.
-        unsafe {
-            // Safety: calling oclose to release cursor resources.
-            // - `self.cda` is a valid CdaDef from a successful oopen call.
-            // - After oclose returns, Oracle no longer references the CDA or
-            //   any buffers bound via odefin.
-            let _ = ffi::oclose(&mut *self.cda);
-        }
+        oracle_ffi(OracleFfi::CloseCursor {
+            cda: &mut *self.cda,
+        });
     }
 }
 

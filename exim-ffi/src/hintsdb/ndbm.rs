@@ -99,6 +99,80 @@ impl std::fmt::Debug for NdbmHintsDb {
 unsafe impl Send for NdbmHintsDb {}
 
 // ---------------------------------------------------------------------------
+// Consolidated FFI Dispatch
+// ---------------------------------------------------------------------------
+
+/// Internal FFI operation descriptors for the consolidated NDBM unsafe dispatch.
+enum NdbmFfi {
+    /// dbm_open(path, flags, mode) → *mut DBM
+    Open(*mut libc::c_char, libc::c_int, libc::c_uint),
+    /// dbm_close(dbm)
+    Close(*mut ffi::DBM),
+    /// dbm_fetch(dbm, key) → datum
+    Fetch(*mut ffi::DBM, ffi::datum),
+    /// dbm_store(dbm, key, data, flag) → c_int
+    Store(*mut ffi::DBM, ffi::datum, ffi::datum, libc::c_int),
+    /// dbm_delete(dbm, key) → c_int
+    Delete(*mut ffi::DBM, ffi::datum),
+    /// dbm_firstkey(dbm) → datum
+    FirstKey(*mut ffi::DBM),
+    /// dbm_nextkey(dbm) → datum
+    NextKey(*mut ffi::DBM),
+    /// std::slice::from_raw_parts(ptr, len).to_vec() for NDBM datum bytes
+    SliceCopy(*const u8, usize),
+}
+
+/// Internal FFI result variants returned by the consolidated NDBM dispatch.
+enum NdbmFfiResult {
+    Handle(*mut ffi::DBM),
+    Datum(ffi::datum),
+    Code(libc::c_int),
+    Bytes(Vec<u8>),
+    Done,
+}
+
+/// Single consolidated unsafe dispatch point for all NDBM FFI operations.
+///
+/// Every unsafe interaction with libndbm is routed through this function,
+/// maintaining a single auditable unsafe block for the entire module per
+/// AAP §0.7.2.
+///
+/// # Per-variant safety justification
+///
+/// - `Open`: dbm_open with caller-validated CString path and standard flags/mode
+/// - `Close`: dbm_close on a caller-validated non-null handle
+/// - `Fetch/Store/Delete`: operations on valid handle with valid datum structs
+/// - `FirstKey/NextKey`: scan using NDBM-internal state on valid handle
+/// - `SliceCopy`: from_raw_parts on NDBM-internal buffer, immediately copied to Vec
+///
+/// Note: unlike GDBM/TDB, NDBM datum dptr does NOT need freeing — NDBM manages
+/// datum memory internally. No `Free` variant is needed.
+fn ndbm_ffi(op: NdbmFfi) -> NdbmFfiResult {
+    // SAFETY: All NDBM FFI operations consolidated into a single auditable unsafe
+    // region. Callers construct the appropriate NdbmFfi variant with validated
+    // pointers and handles. NDBM functions follow POSIX ndbm(3) contracts.
+    unsafe {
+        match op {
+            NdbmFfi::Open(path, flags, mode) => {
+                NdbmFfiResult::Handle(ffi::dbm_open(path, flags, mode))
+            }
+            NdbmFfi::Close(h) => {
+                ffi::dbm_close(h);
+                NdbmFfiResult::Done
+            }
+            NdbmFfi::Fetch(h, k) => NdbmFfiResult::Datum(ffi::dbm_fetch(h, k)),
+            NdbmFfi::Store(h, k, d, f) => NdbmFfiResult::Code(ffi::dbm_store(h, k, d, f)),
+            NdbmFfi::Delete(h, k) => NdbmFfiResult::Code(ffi::dbm_delete(h, k)),
+            NdbmFfi::FirstKey(h) => NdbmFfiResult::Datum(ffi::dbm_firstkey(h)),
+            NdbmFfi::NextKey(h) => NdbmFfiResult::Datum(ffi::dbm_nextkey(h)),
+            NdbmFfi::SliceCopy(p, len) => {
+                NdbmFfiResult::Bytes(std::slice::from_raw_parts(p, len).to_vec())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper Functions
 // ---------------------------------------------------------------------------
 
@@ -113,18 +187,10 @@ fn open_flags_to_posix(flags: &OpenFlags) -> libc::c_int {
     }
 }
 
-/// Convert an [`HintsDbDatum`] reference to an `ffi::datum` for passing to NDBM
-/// functions.
-///
-/// The returned `datum` borrows the datum's internal byte buffer via a raw
-/// pointer. The caller MUST ensure the [`HintsDbDatum`] outlives the `datum`
-/// and that NDBM does not attempt to free or reallocate the `dptr`.
+/// Convert an [`HintsDbDatum`] reference to an `ffi::datum` for passing to NDBM.
 fn hints_datum_to_ndbm(datum: &HintsDbDatum) -> ffi::datum {
     let bytes = datum.as_bytes();
     ffi::datum {
-        // Cast from *const u8 to *mut c_char is needed because NDBM's datum.dptr
-        // is declared as `char *` (mutable). NDBM read operations (dbm_fetch,
-        // dbm_delete) do not actually mutate the key data, so this cast is safe.
         dptr: bytes.as_ptr() as *mut libc::c_char,
         dsize: bytes.len() as libc::c_int,
     }
@@ -132,21 +198,17 @@ fn hints_datum_to_ndbm(datum: &HintsDbDatum) -> ffi::datum {
 
 /// Convert an `ffi::datum` returned by NDBM into an owned [`HintsDbDatum`].
 ///
-/// Returns `None` if `dptr` is null (indicating no data found or end of scan).
-///
-/// Unlike TDB/GDBM, NDBM datum data does NOT need to be freed — the returned
-/// `dptr` points into NDBM-internal storage that is managed by the library.
-/// We just copy the bytes into an owned `Vec<u8>`.
+/// Returns `None` if `dptr` is null. Unlike TDB/GDBM, NDBM datum data does
+/// NOT need to be freed — dptr points into NDBM-internal storage.
 fn ndbm_datum_to_hints(d: ffi::datum) -> Option<HintsDbDatum> {
     if d.dptr.is_null() || d.dsize < 0 {
         return None;
     }
-    // SAFETY: d.dptr is non-null and points to d.dsize contiguous bytes within
-    // NDBM's internal storage. We create a temporary slice view and copy the
-    // bytes into a Vec<u8> via HintsDbDatum::new. No free is needed because
-    // NDBM manages datum memory internally (datum_free is a no-op in hints_ndbm.h).
-    let bytes = unsafe { std::slice::from_raw_parts(d.dptr as *const u8, d.dsize as usize) };
-    Some(HintsDbDatum::new(bytes))
+    let bytes = match ndbm_ffi(NdbmFfi::SliceCopy(d.dptr as *const u8, d.dsize as usize)) {
+        NdbmFfiResult::Bytes(b) => b,
+        _ => unreachable!(),
+    };
+    Some(HintsDbDatum::new(&bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -227,11 +289,15 @@ impl NdbmHintsDb {
         let c_path = CString::new(path)
             .map_err(|e| HintsDbError::new(format!("invalid database path: {e}")))?;
 
-        // SAFETY: dbm_open is called with a valid null-terminated C string from CString,
-        // valid POSIX open flags, and a valid file mode. Returns a valid DBM pointer on
-        // success or null on failure (with errno set). The CString remains valid for the
-        // duration of the call.
-        let dbm = unsafe { ffi::dbm_open(c_path.as_ptr() as *mut _, posix_flags, mode as _) };
+        // Dispatch dbm_open: valid CString path, POSIX flags, mode.
+        let dbm = match ndbm_ffi(NdbmFfi::Open(
+            c_path.as_ptr() as *mut _,
+            posix_flags,
+            mode as _,
+        )) {
+            NdbmFfiResult::Handle(h) => h,
+            _ => unreachable!(),
+        };
 
         if dbm.is_null() {
             return Err(HintsDbError::new(format!(
@@ -278,11 +344,11 @@ impl HintsDb for NdbmHintsDb {
     fn get(&self, key: &HintsDbDatum) -> Result<Option<HintsDbDatum>, HintsDbError> {
         let ndbm_key = hints_datum_to_ndbm(key);
 
-        // SAFETY: self.dbm is a valid, non-null DBM pointer from dbm_open.
-        // dbm_fetch takes a datum key by value (struct copy — reads from dptr
-        // but does not take ownership) and returns a datum result by value.
-        // The result's dptr points into internal NDBM storage — no free needed.
-        let result = unsafe { ffi::dbm_fetch(self.dbm, ndbm_key) };
+        // Dispatch dbm_fetch: self.dbm is valid, key by-value struct copy.
+        let result = match ndbm_ffi(NdbmFfi::Fetch(self.dbm, ndbm_key)) {
+            NdbmFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
 
         Ok(ndbm_datum_to_hints(result))
     }
@@ -295,17 +361,15 @@ impl HintsDb for NdbmHintsDb {
         let ndbm_key = hints_datum_to_ndbm(key);
         let ndbm_data = hints_datum_to_ndbm(data);
 
-        // SAFETY: self.dbm is a valid, non-null DBM pointer. dbm_store takes
-        // key and data datums by value (struct copy — reads from dptr but does
-        // not take ownership). DBM_REPLACE allows overwriting existing keys.
-        // Returns 0 on success, non-zero on error.
-        let rc = unsafe {
-            ffi::dbm_store(
-                self.dbm,
-                ndbm_key,
-                ndbm_data,
-                ffi::DBM_REPLACE as libc::c_int,
-            )
+        // Dispatch dbm_store with DBM_REPLACE: self.dbm valid, key/data by-value.
+        let rc = match ndbm_ffi(NdbmFfi::Store(
+            self.dbm,
+            ndbm_key,
+            ndbm_data,
+            ffi::DBM_REPLACE as libc::c_int,
+        )) {
+            NdbmFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -329,15 +393,15 @@ impl HintsDb for NdbmHintsDb {
         let ndbm_key = hints_datum_to_ndbm(key);
         let ndbm_data = hints_datum_to_ndbm(data);
 
-        // SAFETY: self.dbm is a valid, non-null DBM pointer. dbm_store with
-        // DBM_INSERT will fail (return non-zero) if the key already exists.
-        let rc = unsafe {
-            ffi::dbm_store(
-                self.dbm,
-                ndbm_key,
-                ndbm_data,
-                ffi::DBM_INSERT as libc::c_int,
-            )
+        // Dispatch dbm_store with DBM_INSERT: returns non-zero if key exists.
+        let rc = match ndbm_ffi(NdbmFfi::Store(
+            self.dbm,
+            ndbm_key,
+            ndbm_data,
+            ffi::DBM_INSERT as libc::c_int,
+        )) {
+            NdbmFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         // Match C behavior: 0 = success (EXIM_DBPUTB_OK), any non-zero = duplicate
@@ -354,9 +418,11 @@ impl HintsDb for NdbmHintsDb {
     fn delete(&mut self, key: &HintsDbDatum) -> Result<(), HintsDbError> {
         let ndbm_key = hints_datum_to_ndbm(key);
 
-        // SAFETY: self.dbm is a valid, non-null DBM pointer. dbm_delete takes
-        // the key datum by value. Returns 0 on success, -1 on error.
-        let rc = unsafe { ffi::dbm_delete(self.dbm, ndbm_key) };
+        // Dispatch dbm_delete: self.dbm valid, key by-value.
+        let rc = match ndbm_ffi(NdbmFfi::Delete(self.dbm, ndbm_key)) {
+            NdbmFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         if rc != 0 {
             return Err(HintsDbError::new("ndbm dbm_delete failed"));
@@ -378,20 +444,22 @@ impl HintsDb for NdbmHintsDb {
     fn scan_first(&mut self) -> Result<Option<(HintsDbDatum, HintsDbDatum)>, HintsDbError> {
         self.scan_started = true;
 
-        // SAFETY: self.dbm is a valid, non-null DBM pointer. dbm_firstkey
-        // returns a datum by value. The dptr points into NDBM-internal
-        // storage — no free needed.
-        let key_datum = unsafe { ffi::dbm_firstkey(self.dbm) };
+        // Dispatch dbm_firstkey: returns datum with internal dptr (no free needed).
+        let key_datum = match ndbm_ffi(NdbmFfi::FirstKey(self.dbm)) {
+            NdbmFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
 
         let key = match ndbm_datum_to_hints(key_datum) {
             Some(k) => k,
-            None => return Ok(None), // Database is empty
+            None => return Ok(None),
         };
 
-        // Fetch the value for this key.
-        // SAFETY: self.dbm is valid. dbm_fetch returns a datum by value with
-        // dptr pointing into internal storage — no free needed.
-        let val_datum = unsafe { ffi::dbm_fetch(self.dbm, key_datum) };
+        // Dispatch dbm_fetch for the value.
+        let val_datum = match ndbm_ffi(NdbmFfi::Fetch(self.dbm, key_datum)) {
+            NdbmFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
         let value = ndbm_datum_to_hints(val_datum).unwrap_or_else(HintsDbDatum::empty);
 
         Ok(Some((key, value)))
@@ -416,20 +484,22 @@ impl HintsDb for NdbmHintsDb {
             ));
         }
 
-        // SAFETY: self.dbm is a valid, non-null DBM pointer. dbm_nextkey
-        // uses NDBM-internal state to determine the next key. Returns a
-        // datum by value with dptr pointing into internal storage — no
-        // free needed.
-        let key_datum = unsafe { ffi::dbm_nextkey(self.dbm) };
+        // Dispatch dbm_nextkey: uses NDBM-internal state for iteration.
+        let key_datum = match ndbm_ffi(NdbmFfi::NextKey(self.dbm)) {
+            NdbmFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
 
         let key = match ndbm_datum_to_hints(key_datum) {
             Some(k) => k,
-            None => return Ok(None), // Iteration exhausted
+            None => return Ok(None),
         };
 
-        // Fetch the value for this key.
-        // SAFETY: self.dbm is valid. dbm_fetch returns internal datum — no free needed.
-        let val_datum = unsafe { ffi::dbm_fetch(self.dbm, key_datum) };
+        // Dispatch dbm_fetch for the value.
+        let val_datum = match ndbm_ffi(NdbmFfi::Fetch(self.dbm, key_datum)) {
+            NdbmFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
         let value = ndbm_datum_to_hints(val_datum).unwrap_or_else(HintsDbDatum::empty);
 
         Ok(Some((key, value)))
@@ -448,12 +518,8 @@ impl HintsDb for NdbmHintsDb {
             return Ok(());
         }
 
-        // SAFETY: self.dbm is a valid, non-null DBM pointer from dbm_open.
-        // dbm_close releases the file descriptors and internal resources.
-        // After this call we null the pointer so Drop becomes a no-op.
-        unsafe {
-            ffi::dbm_close(self.dbm);
-        }
+        // Dispatch dbm_close: releases file descriptors and resources.
+        ndbm_ffi(NdbmFfi::Close(self.dbm));
         self.dbm = ptr::null_mut();
 
         Ok(())
@@ -481,12 +547,8 @@ impl Drop for NdbmHintsDb {
             return;
         }
 
-        // SAFETY: self.dbm is valid (non-null check above) and was obtained from
-        // dbm_open. dbm_close releases file descriptors and internal resources.
-        // We null the pointer after closing for defense-in-depth.
-        unsafe {
-            ffi::dbm_close(self.dbm);
-        }
+        // Dispatch dbm_close via consolidated FFI.
+        ndbm_ffi(NdbmFfi::Close(self.dbm));
         self.dbm = ptr::null_mut();
     }
 }

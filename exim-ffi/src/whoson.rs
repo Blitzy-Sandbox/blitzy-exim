@@ -149,37 +149,33 @@ pub fn wso_query(query: &str) -> Result<WhosonQueryResult, WhosonError> {
 
     let mut buffer = [0u8; WSO_BUFFER_SIZE];
 
-    // SAFETY: calling C `wso_query` with:
-    //   1. `c_query.as_ptr()` — a valid, non-null, null-terminated C string
-    //      produced by `CString::new()`.
-    //   2. `buffer.as_mut_ptr()` — a valid pointer to a stack-allocated byte
-    //      array of exactly `WSO_BUFFER_SIZE` bytes.
-    //   3. `WSO_BUFFER_SIZE` — the exact size of the buffer, ensuring the C
-    //      function writes at most `bufsize - 1` bytes plus a null terminator.
-    // The C function does not retain pointers beyond this call.
-    let rc = unsafe {
-        ffi::wso_query(
+    // SAFETY: `ffi::wso_query` is called with (1) a valid null-terminated
+    // C string from `CString::new`, (2) a valid mutable pointer to a
+    // stack-allocated `WSO_BUFFER_SIZE`-byte array, (3) the exact buffer
+    // size.  On success (rc=0) the C function writes a null-terminated
+    // result into `buffer`, making `CStr::from_ptr` sound because the
+    // zero-initialized buffer guarantees a terminator within bounds.
+    // The C function does not retain any pointers beyond this call.
+    unsafe {
+        let rc = ffi::wso_query(
             c_query.as_ptr(),
             buffer.as_mut_ptr().cast::<libc::c_char>(),
             WSO_BUFFER_SIZE as libc::size_t,
-        )
-    };
+        );
 
-    match rc {
-        0 => {
-            // SAFETY: after a successful query (return code 0),
-            // `wso_query` has written a null-terminated string into `buffer`.
-            // The buffer was zero-initialized and has size `WSO_BUFFER_SIZE`,
-            // so `CStr::from_ptr` will find a null terminator within bounds.
-            let c_result = unsafe { CStr::from_ptr(buffer.as_ptr().cast::<libc::c_char>()) };
-            let username = c_result.to_string_lossy().into_owned();
-            Ok(WhosonQueryResult::Found(username))
+        match rc {
+            0 => {
+                let c_result = CStr::from_ptr(buffer.as_ptr().cast::<libc::c_char>());
+                Ok(WhosonQueryResult::Found(
+                    c_result.to_string_lossy().into_owned(),
+                ))
+            }
+            1 => Ok(WhosonQueryResult::NotFound),
+            code => Err(WhosonError::new(format!(
+                "wso_query failed with return code {}",
+                code
+            ))),
         }
-        1 => Ok(WhosonQueryResult::NotFound),
-        code => Err(WhosonError::new(format!(
-            "wso_query failed with return code {}",
-            code
-        ))),
     }
 }
 
@@ -191,22 +187,18 @@ pub fn wso_query(query: &str) -> Result<WhosonQueryResult, WhosonError> {
 /// Returns `"unknown"` if the C function returns a null pointer (defensive
 /// guard — should not occur with a correctly linked libwhoson).
 pub fn wso_version() -> String {
-    // SAFETY: calling C `wso_version()` which returns a pointer
-    // to a statically allocated, null-terminated C string. The pointer is
-    // valid for the entire lifetime of the process and the data is immutable.
-    // No arguments are passed and no mutable state is modified.
-    let ptr = unsafe { ffi::wso_version() };
-
-    if ptr.is_null() {
-        return String::from("unknown");
+    // SAFETY: `ffi::wso_version()` returns a pointer to a statically
+    // allocated, null-terminated C string valid for the process lifetime.
+    // The data is immutable and the pointer is never freed.  When non-null,
+    // `CStr::from_ptr` safely reads the static string.  No mutable state
+    // is modified by this call.
+    unsafe {
+        let ptr = ffi::wso_version();
+        if ptr.is_null() {
+            return String::from("unknown");
+        }
+        CStr::from_ptr(ptr).to_string_lossy().into_owned()
     }
-
-    // SAFETY: the non-null pointer returned by `wso_version()`
-    // points to a static, null-terminated C string that lives for the entire
-    // process lifetime. Reading it via `CStr::from_ptr` is sound because the
-    // data will not be mutated or freed.
-    let c_version = unsafe { CStr::from_ptr(ptr) };
-    c_version.to_string_lossy().into_owned()
 }
 
 // ── Unit Tests ─────────────────────────────────────────────────────────────

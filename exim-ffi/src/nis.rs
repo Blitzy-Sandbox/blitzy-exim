@@ -272,39 +272,30 @@ fn nis_error_description(code: libc::c_int) -> String {
 pub fn get_default_domain() -> Result<String, NisError> {
     let mut domain_ptr: *mut libc::c_char = ptr::null_mut();
 
-    // SAFETY: `yp_get_default_domain` is a standard NIS/YP
-    // client function from libnsl. It takes a single `char **` out-parameter
-    // and writes a pointer to a statically-allocated, null-terminated C string
-    // (the NIS domain name from the system configuration). The pointer
-    // `&mut domain_ptr` is a valid, aligned, writable location on our stack.
-    // The function does not retain any reference to `domain_ptr` after return.
-    // The written pointer (if non-null) points to static data with process
-    // lifetime, so it is safe to read after the call returns.
-    let rc = unsafe { ffi::yp_get_default_domain(&mut domain_ptr) };
+    // SAFETY: `yp_get_default_domain` takes a `char **` out-parameter and
+    // writes a pointer to a statically-allocated, null-terminated C string.
+    // `&mut domain_ptr` is a valid, aligned, writable stack location.  On
+    // success the written pointer has process lifetime, so `CStr::from_ptr`
+    // is sound.  The function does not retain any references after return.
+    unsafe {
+        let rc = ffi::yp_get_default_domain(&mut domain_ptr);
 
-    if rc != YPERR_SUCCESS {
-        return Err(NisError::DomainNotBound(format!(
-            "yp_get_default_domain failed: {}",
-            nis_error_description(rc)
-        )));
+        if rc != YPERR_SUCCESS {
+            return Err(NisError::DomainNotBound(format!(
+                "yp_get_default_domain failed: {}",
+                nis_error_description(rc)
+            )));
+        }
+
+        if domain_ptr.is_null() {
+            return Err(NisError::DomainNotBound(
+                "yp_get_default_domain returned null domain pointer".to_string(),
+            ));
+        }
+
+        let domain_cstr = CStr::from_ptr(domain_ptr);
+        Ok(domain_cstr.to_string_lossy().into_owned())
     }
-
-    // Defensive null-pointer guard — yp_get_default_domain should always
-    // set the pointer on success, but we check to prevent UB.
-    if domain_ptr.is_null() {
-        return Err(NisError::DomainNotBound(
-            "yp_get_default_domain returned null domain pointer".to_string(),
-        ));
-    }
-
-    // SAFETY: `domain_ptr` is non-null (checked above) and
-    // points to a statically-allocated, null-terminated C string managed by
-    // the NIS client library. This string has process lifetime and will not
-    // be freed or mutated. `CStr::from_ptr` reads up to the null terminator,
-    // which is guaranteed to exist within the static buffer.
-    let domain_cstr = unsafe { CStr::from_ptr(domain_ptr) };
-
-    Ok(domain_cstr.to_string_lossy().into_owned())
 }
 
 /// Look up a key in a NIS map, returning the result as raw bytes.
@@ -372,95 +363,58 @@ pub fn yp_match_query(domain: &str, map: &str, key: &[u8]) -> Result<Vec<u8>, Ni
     let mut result_ptr: *mut libc::c_char = ptr::null_mut();
     let mut result_len: libc::c_int = 0;
 
-    // SAFETY: calling C `yp_match` from libnsl with:
-    //   1. `c_domain.as_ptr()` — valid, non-null, null-terminated C string
-    //      produced by `CString::new()`. Lifetime extends to end of this scope.
-    //   2. `c_map.as_ptr()` — valid, non-null, null-terminated C string.
-    //      Lifetime extends to end of this scope.
-    //   3. `key.as_ptr().cast::<libc::c_char>()` — valid pointer to the start
-    //      of the key byte slice. The buffer has at least `key_len` bytes.
-    //   4. `key_len` — the exact length of the key buffer, verified above to
-    //      fit in `c_int`.
-    //   5. `&mut result_ptr` — valid, aligned, writable stack location where
-    //      `yp_match` will write a `malloc`-allocated result pointer.
-    //   6. `&mut result_len` — valid, aligned, writable stack location where
-    //      `yp_match` will write the result byte count.
-    //
-    // On success (return 0), `result_ptr` points to a `malloc`-allocated
-    // buffer of `result_len` bytes. The caller must free it via `free()`.
-    // On error, `result_ptr` is not guaranteed to be valid.
-    // The C function does not retain references to any input pointers.
-    let rc = unsafe {
-        ffi::yp_match(
+    // SAFETY: calling C `yp_match` from libnsl with valid inputs:
+    //   - `c_domain` / `c_map`: non-null, null-terminated `CString` values
+    //   - `key`: valid pointer with exactly `key_len` bytes
+    //   - `result_ptr` / `result_len`: valid writable stack out-parameters
+    // On success, `result_ptr` is `malloc`-allocated and must be freed.
+    // `std::slice::from_raw_parts` reads exactly `result_len` bytes from
+    // the allocation before `libc::free` releases it.  No pointers are
+    // retained by the C function after return.
+    unsafe {
+        let rc = ffi::yp_match(
             c_domain.as_ptr(),
             c_map.as_ptr(),
             key.as_ptr().cast::<libc::c_char>(),
             key_len,
             &mut result_ptr,
             &mut result_len,
-        )
-    };
+        );
 
-    // Map non-zero return codes to typed errors, matching the C source:
-    //   YPERR_KEY → FAIL (KeyNotFound)
-    //   YPERR_MAP → FAIL (MapNotFound)
-    //   other     → DEFER (SystemError)
-    if rc != YPERR_SUCCESS {
-        return match rc {
-            YPERR_KEY => Err(NisError::KeyNotFound),
-            YPERR_MAP => Err(NisError::MapNotFound(format!("{map} (domain: {domain})"))),
-            code => Err(NisError::SystemError {
-                code,
-                message: nis_error_description(code),
-            }),
-        };
-    }
-
-    // Defensive guards: ensure the result pointer and length are valid
-    // before attempting to read the data.
-    if result_ptr.is_null() {
-        return Err(NisError::SystemError {
-            code: 0,
-            message: "yp_match returned success but result pointer is null".to_string(),
-        });
-    }
-
-    if result_len < 0 {
-        // SAFETY: `result_ptr` was set by `yp_match` on a
-        // success return and is non-null (checked above). It was allocated
-        // via `malloc` by the NIS library, so it must be freed with `free()`.
-        // Even though `result_len` is invalid, the pointer itself is still a
-        // valid malloc allocation that must be released.
-        unsafe {
-            libc::free(result_ptr.cast::<libc::c_void>());
+        if rc != YPERR_SUCCESS {
+            return match rc {
+                YPERR_KEY => Err(NisError::KeyNotFound),
+                YPERR_MAP => Err(NisError::MapNotFound(format!("{map} (domain: {domain})"))),
+                code => Err(NisError::SystemError {
+                    code,
+                    message: nis_error_description(code),
+                }),
+            };
         }
-        return Err(NisError::SystemError {
-            code: 0,
-            message: format!(
-                "yp_match returned success but result length is negative: {result_len}"
-            ),
-        });
-    }
 
-    let len = result_len as usize;
+        if result_ptr.is_null() {
+            return Err(NisError::SystemError {
+                code: 0,
+                message: "yp_match returned success but result pointer is null".to_string(),
+            });
+        }
 
-    // SAFETY: `result_ptr` is non-null (checked above) and
-    // points to a `malloc`-allocated buffer of at least `result_len` bytes,
-    // as guaranteed by a successful `yp_match` return. We create a byte
-    // slice view over exactly `len` bytes, copy it into an owned `Vec<u8>`,
-    // then immediately free the C-allocated buffer via `libc::free`.
-    //
-    // The `result_ptr` was allocated by `yp_match` using `malloc`, so
-    // freeing it with `free()` is the correct deallocation. After `free`,
-    // the pointer is no longer accessed.
-    let data = unsafe {
+        if result_len < 0 {
+            libc::free(result_ptr.cast::<libc::c_void>());
+            return Err(NisError::SystemError {
+                code: 0,
+                message: format!(
+                    "yp_match returned success but result length is negative: {result_len}"
+                ),
+            });
+        }
+
+        let len = result_len as usize;
         let byte_slice = std::slice::from_raw_parts(result_ptr.cast::<u8>(), len);
         let owned = byte_slice.to_vec();
         libc::free(result_ptr.cast::<libc::c_void>());
-        owned
-    };
-
-    Ok(data)
+        Ok(owned)
+    }
 }
 
 // ── Unit Tests ────────────────────────────────────────────────────────────

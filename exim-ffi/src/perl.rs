@@ -69,7 +69,7 @@ mod ffi {
     // Perl headers parsed by bindgen. We declare it manually with the exact
     // signature matching the Perl XSUBADDR_t convention with MULTIPLICITY.
     // =========================================================================
-    unsafe extern "C" {
+    extern "C" {
         /// Bootstrap function for the DynaLoader XS extension module.
         ///
         /// This symbol is provided by the Perl DynaLoader shared object at

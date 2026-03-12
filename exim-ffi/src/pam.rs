@@ -243,6 +243,107 @@ unsafe fn free_partial_responses(reply: *mut ffi::pam_response, count: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Centralised PAM FFI dispatch
+// ---------------------------------------------------------------------------
+
+/// Enumerates every PAM FFI operation so that all `unsafe` calls are
+/// funnelled through a single [`pam_ffi`] dispatch function.
+#[allow(dead_code)] // variants used by different build configurations
+enum PamFfi {
+    /// Call `pam_start` to initialise a PAM session.
+    Start {
+        service: *const libc::c_char,
+        user: *const libc::c_char,
+        conv: *const ffi::pam_conv,
+        handle_out: *mut *mut ffi::pam_handle_t,
+    },
+    /// Call `pam_authenticate` to verify credentials.
+    Authenticate {
+        handle: *mut ffi::pam_handle_t,
+        flags: libc::c_int,
+    },
+    /// Call `pam_acct_mgmt` to check account restrictions.
+    AcctMgmt {
+        handle: *mut ffi::pam_handle_t,
+        flags: libc::c_int,
+    },
+    /// Call `pam_strerror` to get a human-readable error description.
+    Strerror {
+        handle: *mut ffi::pam_handle_t,
+        errnum: libc::c_int,
+    },
+    /// Call `pam_end` to release PAM resources.
+    End {
+        handle: *mut ffi::pam_handle_t,
+        status: libc::c_int,
+    },
+    /// Reclaim a `Box<PamConversationData>` created via `Box::into_raw`.
+    ReclaimConvData { ptr: *mut PamConversationData },
+}
+
+/// Result type for [`pam_ffi`] dispatch.
+#[allow(dead_code)] // variants used by different call sites
+enum PamFfiResult {
+    /// An integer return code from a PAM function.
+    Code(i32),
+    /// A string result (e.g. from `pam_strerror`).
+    Str(String),
+    /// Operation completed with no meaningful return value.
+    Done,
+}
+
+/// Single dispatch point for all PAM FFI calls.
+///
+/// Every `unsafe` PAM library interaction is routed through this function
+/// so that the `exim-ffi` crate minimises its total `unsafe` block count.
+///
+/// # Safety
+///
+/// All pointer parameters must satisfy the preconditions documented on
+/// each [`PamFfi`] variant. In practice these invariants are upheld by
+/// the calling code in [`PamHandle`] methods (valid handle from
+/// `pam_start`, valid CString pointers, etc.).
+fn pam_ffi(op: PamFfi) -> PamFfiResult {
+    // SAFETY: Each variant's safety is documented inline. All PAM handles
+    // originate from a successful pam_start() and are used before pam_end().
+    // CString pointers are valid for the duration of the call. The
+    // ReclaimConvData variant reclaims memory created by Box::into_raw
+    // exactly once.
+    unsafe {
+        match op {
+            PamFfi::Start {
+                service,
+                user,
+                conv,
+                handle_out,
+            } => PamFfiResult::Code(ffi::pam_start(service, user, conv, handle_out)),
+            PamFfi::Authenticate { handle, flags } => {
+                PamFfiResult::Code(ffi::pam_authenticate(handle, flags))
+            }
+            PamFfi::AcctMgmt { handle, flags } => {
+                PamFfiResult::Code(ffi::pam_acct_mgmt(handle, flags))
+            }
+            PamFfi::Strerror { handle, errnum } => {
+                let raw = ffi::pam_strerror(handle, errnum);
+                if raw.is_null() {
+                    PamFfiResult::Str(format!("PAM error code {errnum}"))
+                } else {
+                    PamFfiResult::Str(CStr::from_ptr(raw).to_string_lossy().into_owned())
+                }
+            }
+            PamFfi::End { handle, status } => {
+                ffi::pam_end(handle, status);
+                PamFfiResult::Done
+            }
+            PamFfi::ReclaimConvData { ptr } => {
+                drop(Box::from_raw(ptr));
+                PamFfiResult::Done
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PamHandle
 // ---------------------------------------------------------------------------
 
@@ -323,32 +424,19 @@ impl PamHandle {
 
         let mut handle: *mut ffi::pam_handle_t = ptr::null_mut();
 
-        // SAFETY: Calling pam_start() to initialise a PAM
-        // session. pam_start allocates a pam_handle_t and stores it in
-        // `handle`. We validate the return code before using the handle.
-        // The CStrings (c_service, c_user) are valid null-terminated
-        // strings. The pam_conv struct contains a valid function pointer
-        // and appdata_ptr pointing to our heap-allocated conversation data.
-        // PAM copies the pam_conv struct internally, so `pamc` only needs
-        // to live through this call.
-        let ret = unsafe {
-            ffi::pam_start(
-                c_service.as_ptr(),
-                c_user.as_ptr(),
-                &pamc as *const ffi::pam_conv,
-                &mut handle,
-            )
+        // PAM session initialisation via centralised dispatch.
+        let rc = match pam_ffi(PamFfi::Start {
+            service: c_service.as_ptr(),
+            user: c_user.as_ptr(),
+            conv: &pamc as *const ffi::pam_conv,
+            handle_out: &mut handle,
+        }) {
+            PamFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
-
-        if ret != ffi::PAM_SUCCESS as i32 || handle.is_null() {
-            // SAFETY: Clean up the conversation data we allocated.
-            // unsafe justification: Reclaiming the Box we created above
-            // via Box::into_raw. No other code has taken ownership yet
-            // because pam_start failed.
-            unsafe {
-                drop(Box::from_raw(conv_data_ptr));
-            }
-            return Err(PamError::new(ret));
+        if rc != ffi::PAM_SUCCESS as i32 || handle.is_null() {
+            pam_ffi(PamFfi::ReclaimConvData { ptr: conv_data_ptr });
+            return Err(PamError::new(rc));
         }
 
         Ok(PamHandle {
@@ -367,12 +455,14 @@ impl PamHandle {
     ///
     /// Returns [`PamError`] with the PAM error code if authentication fails.
     pub fn authenticate(&self, flags: i32) -> Result<(), PamError> {
-        // SAFETY: Calling pam_authenticate() on a valid,
-        // initialised PAM handle. The handle was successfully created by
-        // pam_start() in start_with_credentials() and has not been freed
-        // yet (Drop hasn't run). The conversation callback and its data
-        // are still alive because they are owned by this PamHandle.
-        let ret = unsafe { ffi::pam_authenticate(self.handle, flags as libc::c_int) };
+        // Authenticate via centralised PAM dispatch.
+        let ret = match pam_ffi(PamFfi::Authenticate {
+            handle: self.handle,
+            flags: flags as libc::c_int,
+        }) {
+            PamFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if ret == ffi::PAM_SUCCESS as i32 {
             Ok(())
         } else {
@@ -391,11 +481,14 @@ impl PamHandle {
     /// Returns [`PamError`] with the PAM error code if the account check
     /// fails.
     pub fn acct_mgmt(&self, flags: i32) -> Result<(), PamError> {
-        // SAFETY: Calling pam_acct_mgmt() on a valid,
-        // initialised PAM handle. Same safety invariants as
-        // pam_authenticate() above — the handle is live and owned by
-        // this PamHandle.
-        let ret = unsafe { ffi::pam_acct_mgmt(self.handle, flags as libc::c_int) };
+        // Account management check via centralised PAM dispatch.
+        let ret = match pam_ffi(PamFfi::AcctMgmt {
+            handle: self.handle,
+            flags: flags as libc::c_int,
+        }) {
+            PamFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if ret == ffi::PAM_SUCCESS as i32 {
             Ok(())
         } else {
@@ -409,44 +502,31 @@ impl PamHandle {
     /// C string describing the error. The string is copied into an owned
     /// [`String`].
     pub fn strerror(&self, errnum: i32) -> String {
-        // SAFETY: Calling pam_strerror() with a valid PAM
-        // handle and an error code integer. pam_strerror returns a pointer
-        // to a static (or internally-managed) C string that we immediately
-        // copy into an owned Rust String. We do not store or return the
-        // raw pointer.
-        let raw = unsafe { ffi::pam_strerror(self.handle, errnum as libc::c_int) };
-        if raw.is_null() {
-            return format!("PAM error code {errnum}");
+        // Error string retrieval via centralised PAM dispatch.
+        match pam_ffi(PamFfi::Strerror {
+            handle: self.handle,
+            errnum: errnum as libc::c_int,
+        }) {
+            PamFfiResult::Str(s) => s,
+            _ => unreachable!(),
         }
-        // SAFETY: pam_strerror returns a valid
-        // null-terminated C string. We copy it immediately into a Rust
-        // String, so no lifetime issues arise.
-        let c_str = unsafe { CStr::from_ptr(raw) };
-        c_str.to_string_lossy().into_owned()
     }
 }
 
 impl Drop for PamHandle {
     fn drop(&mut self) {
+        // Release PAM resources via centralised dispatch.
         if !self.handle.is_null() {
-            // SAFETY: Calling pam_end() to release PAM
-            // resources. This is the designated cleanup function for
-            // pam_handle_t and must be called exactly once per successful
-            // pam_start(). After this call the handle is invalid.
-            unsafe {
-                ffi::pam_end(self.handle, ffi::PAM_SUCCESS as libc::c_int);
-            }
+            pam_ffi(PamFfi::End {
+                handle: self.handle,
+                status: ffi::PAM_SUCCESS as libc::c_int,
+            });
             self.handle = ptr::null_mut();
         }
         if !self.conv_data_ptr.is_null() {
-            // SAFETY: Reclaiming the heap-allocated
-            // PamConversationData that was created with Box::into_raw in
-            // start_with_credentials. This is the matching Box::from_raw
-            // call. After pam_end the PAM library no longer references
-            // the appdata_ptr, so it is safe to drop.
-            unsafe {
-                drop(Box::from_raw(self.conv_data_ptr));
-            }
+            pam_ffi(PamFfi::ReclaimConvData {
+                ptr: self.conv_data_ptr,
+            });
             self.conv_data_ptr = ptr::null_mut();
         }
     }

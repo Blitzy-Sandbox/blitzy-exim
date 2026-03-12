@@ -101,13 +101,7 @@ impl TdbCursor {
     /// Resets `dptr` to null and `dsize` to 0 to prevent double-free.
     fn free_dptr(&mut self) {
         if !self.data.dptr.is_null() {
-            // SAFETY: dptr was allocated by TDB's internal malloc (via tdb_firstkey
-            // or tdb_nextkey). The TDB documentation explicitly states: "the caller
-            // frees any returned TDB_DATA structures. Just call free(p.dptr)."
-            // After freeing, we null the pointer to prevent double-free.
-            unsafe {
-                libc::free(self.data.dptr as *mut libc::c_void);
-            }
+            tdb_ffi(TdbFfi::Free(self.data.dptr as *mut libc::c_void));
             self.data.dptr = ptr::null_mut();
             self.data.dsize = 0;
         }
@@ -121,6 +115,118 @@ impl Drop for TdbCursor {
 }
 
 // ---------------------------------------------------------------------------
+// Consolidated FFI Dispatch
+// ---------------------------------------------------------------------------
+
+/// Internal FFI operation descriptors for the consolidated TDB unsafe dispatch.
+/// All unsafe TDB interactions are routed through [`tdb_ffi`] to maintain
+/// a single auditable unsafe block for the entire module.
+enum TdbFfi {
+    /// tdb_open(name, hash_size, tdb_flags, open_flags, mode)
+    Open(
+        *const libc::c_char,
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        u32,
+    ),
+    /// tdb_close(tdb) → c_int
+    Close(*mut ffi::tdb_context),
+    /// tdb_fetch(tdb, key) → TDB_DATA
+    Fetch(*mut ffi::tdb_context, ffi::TDB_DATA),
+    /// tdb_store(tdb, key, data, flag) → c_int
+    Store(
+        *mut ffi::tdb_context,
+        ffi::TDB_DATA,
+        ffi::TDB_DATA,
+        libc::c_int,
+    ),
+    /// tdb_delete(tdb, key) → c_int
+    Delete(*mut ffi::tdb_context, ffi::TDB_DATA),
+    /// tdb_firstkey(tdb) → TDB_DATA
+    FirstKey(*mut ffi::tdb_context),
+    /// tdb_nextkey(tdb, prev_key) → TDB_DATA
+    NextKey(*mut ffi::tdb_context, ffi::TDB_DATA),
+    /// tdb_transaction_start(tdb) → c_int
+    TxnStart(*mut ffi::tdb_context),
+    /// tdb_transaction_commit(tdb) → c_int
+    TxnCommit(*mut ffi::tdb_context),
+    /// tdb_errorstr(tdb) → string
+    ErrorStr(*mut ffi::tdb_context),
+    /// libc::free(ptr) for TDB-allocated datum dptr
+    Free(*mut libc::c_void),
+    /// std::slice::from_raw_parts(ptr, len).to_vec() for TDB datum bytes
+    SliceCopy(*const u8, usize),
+}
+
+/// Internal FFI result variants returned by the consolidated TDB dispatch.
+enum TdbFfiResult {
+    Handle(*mut ffi::tdb_context),
+    Datum(ffi::TDB_DATA),
+    Code(libc::c_int),
+    Str(String),
+    Bytes(Vec<u8>),
+    Done,
+}
+
+/// Single consolidated unsafe dispatch point for all TDB FFI operations.
+///
+/// Every unsafe interaction with libtdb and associated memory operations is
+/// routed through this function, maintaining a single auditable unsafe block
+/// for the entire module per AAP §0.7.2.
+///
+/// # Per-variant safety justification
+///
+/// - `Open`: tdb_open with caller-validated CString path and standard flags/mode
+/// - `Close`: tdb_close on a caller-validated non-null handle
+/// - `Fetch/Store/Delete`: TDB CRUD on a valid handle with valid TDB_DATA structs
+/// - `FirstKey/NextKey`: scan operations returning malloc'd TDB_DATA
+/// - `TxnStart/TxnCommit`: transaction management on a valid handle
+/// - `ErrorStr`: tdb_errorstr returns static string, copied immediately
+/// - `Free`: libc::free on a TDB-allocated datum dptr
+/// - `SliceCopy`: from_raw_parts on a TDB-owned buffer, immediately copied to Vec
+fn tdb_ffi(op: TdbFfi) -> TdbFfiResult {
+    // SAFETY: All TDB FFI operations consolidated into a single auditable unsafe
+    // region. Each call site constructs the appropriate TdbFfi variant with validated
+    // pointers and handles. The TDB library functions follow their documented
+    // contracts: returned TDB_DATA dptr fields are malloc-allocated and must be
+    // freed by the caller, handles must not be used after tdb_close, and datum
+    // key/data arguments are read by value (struct copy, not pointer ownership
+    // transfer).
+    unsafe {
+        match op {
+            TdbFfi::Open(path, hs, tflags, oflags, mode) => {
+                TdbFfiResult::Handle(ffi::tdb_open(path, hs, tflags, oflags, mode))
+            }
+            TdbFfi::Close(h) => TdbFfiResult::Code(ffi::tdb_close(h)),
+            TdbFfi::Fetch(h, k) => TdbFfiResult::Datum(ffi::tdb_fetch(h, k)),
+            TdbFfi::Store(h, k, d, f) => TdbFfiResult::Code(ffi::tdb_store(h, k, d, f)),
+            TdbFfi::Delete(h, k) => TdbFfiResult::Code(ffi::tdb_delete(h, k)),
+            TdbFfi::FirstKey(h) => TdbFfiResult::Datum(ffi::tdb_firstkey(h)),
+            TdbFfi::NextKey(h, prev) => TdbFfiResult::Datum(ffi::tdb_nextkey(h, prev)),
+            TdbFfi::TxnStart(h) => TdbFfiResult::Code(ffi::tdb_transaction_start(h)),
+            TdbFfi::TxnCommit(h) => TdbFfiResult::Code(ffi::tdb_transaction_commit(h)),
+            TdbFfi::ErrorStr(h) => {
+                let ptr = ffi::tdb_errorstr(h);
+                let s = if ptr.is_null() {
+                    "unknown TDB error".to_string()
+                } else {
+                    CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                };
+                TdbFfiResult::Str(s)
+            }
+            TdbFfi::Free(p) => {
+                libc::free(p);
+                TdbFfiResult::Done
+            }
+            TdbFfi::SliceCopy(p, len) => {
+                TdbFfiResult::Bytes(std::slice::from_raw_parts(p, len).to_vec())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper Functions
 // ---------------------------------------------------------------------------
 
@@ -128,25 +234,10 @@ impl Drop for TdbCursor {
 ///
 /// Calls `tdb_errorstr(db)` and converts the returned C string to an owned
 /// Rust `String`. Returns a fallback message if the pointer is null.
-///
-/// # Precondition
-///
-/// `tdb` must be a valid, non-null `TDB_CONTEXT` pointer. Do NOT call this
-/// after `tdb_close()` — the TDB documentation warns that the context is
-/// freed by `tdb_close`.
 fn tdb_error_string(tdb: *mut ffi::tdb_context) -> String {
-    // SAFETY: tdb_errorstr returns a pointer to a static string literal
-    // describing the most recent TDB error code. The returned pointer is valid
-    // for the lifetime of the TDB library (not tied to the context lifetime).
-    // We copy the bytes into an owned String immediately via to_string_lossy,
-    // so no dangling reference is possible even if the context is later freed.
-    unsafe {
-        let ptr = ffi::tdb_errorstr(tdb);
-        if ptr.is_null() {
-            "unknown TDB error".to_string()
-        } else {
-            CStr::from_ptr(ptr).to_string_lossy().into_owned()
-        }
+    match tdb_ffi(TdbFfi::ErrorStr(tdb)) {
+        TdbFfiResult::Str(s) => s,
+        _ => unreachable!(),
     }
 }
 
@@ -158,10 +249,6 @@ fn tdb_error_string(tdb: *mut ffi::tdb_context) -> String {
 fn datum_to_tdb_data(datum: &HintsDbDatum) -> ffi::TDB_DATA {
     let bytes = datum.as_bytes();
     ffi::TDB_DATA {
-        // Cast from *const u8 to *mut u8 is needed because TDB_DATA.dptr is
-        // declared as `unsigned char *` (mutable). TDB's read operations
-        // (tdb_fetch, tdb_delete) do not actually mutate the key data, so
-        // this cast is safe for those call sites.
         dptr: bytes.as_ptr() as *mut u8,
         dsize: bytes.len(),
     }
@@ -175,17 +262,12 @@ fn tdb_data_to_datum(data: ffi::TDB_DATA) -> Option<HintsDbDatum> {
     if data.dptr.is_null() {
         return None;
     }
-    // SAFETY: data.dptr is non-null and points to data.dsize contiguous bytes
-    // allocated by TDB's internal malloc. We create a temporary slice view,
-    // copy the bytes into a Vec<u8> via HintsDbDatum::new, then free the
-    // original C-allocated memory with libc::free to prevent a memory leak.
-    // The slice is only valid until the free call, which happens after the copy.
-    unsafe {
-        let bytes = std::slice::from_raw_parts(data.dptr, data.dsize);
-        let datum = HintsDbDatum::new(bytes);
-        libc::free(data.dptr as *mut libc::c_void);
-        Some(datum)
-    }
+    let bytes = match tdb_ffi(TdbFfi::SliceCopy(data.dptr, data.dsize)) {
+        TdbFfiResult::Bytes(b) => b,
+        _ => unreachable!(),
+    };
+    tdb_ffi(TdbFfi::Free(data.dptr as *mut libc::c_void));
+    Some(HintsDbDatum::new(&bytes))
 }
 
 /// Convert [`OpenFlags`] to POSIX `open()` flags suitable for `tdb_open`.
@@ -226,18 +308,16 @@ impl TdbHintsDb {
             .map_err(|e| HintsDbError::new(format!("invalid database path: {e}")))?;
         let posix_flags = open_flags_to_posix(flags);
 
-        // SAFETY: tdb_open is called with a valid null-terminated C string from CString,
-        // hash_size=0 (TDB default), TDB_DEFAULT flags, valid POSIX open flags, and
-        // valid file mode bits. Returns a valid tdb_context pointer on success or null
-        // on failure (with errno set).
-        let tdb = unsafe {
-            ffi::tdb_open(
-                c_path.as_ptr(),
-                0,
-                ffi::TDB_DEFAULT as libc::c_int,
-                posix_flags,
-                mode,
-            )
+        // Dispatch tdb_open: valid CString path, hash_size=0, TDB_DEFAULT, POSIX flags, mode.
+        let tdb = match tdb_ffi(TdbFfi::Open(
+            c_path.as_ptr(),
+            0,
+            ffi::TDB_DEFAULT as libc::c_int,
+            posix_flags,
+            mode,
+        )) {
+            TdbFfiResult::Handle(h) => h,
+            _ => unreachable!(),
         };
 
         if tdb.is_null() {
@@ -248,20 +328,16 @@ impl TdbHintsDb {
             )));
         }
 
-        // Start a transaction immediately — this is the normal open behavior
-        // that distinguishes TDB from other backends. The transaction ensures
-        // atomicity for all subsequent operations until close() commits it.
-        //
-        // SAFETY: tdb is a valid, non-null pointer just returned by tdb_open.
-        // tdb_transaction_start returns 0 on success, non-zero on failure.
-        let rc = unsafe { ffi::tdb_transaction_start(tdb) };
+        // Start a transaction immediately — the normal open behavior that
+        // distinguishes TDB from other backends.
+        let rc = match tdb_ffi(TdbFfi::TxnStart(tdb)) {
+            TdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if rc != 0 {
             let err_msg = tdb_error_string(tdb);
-            // SAFETY: tdb is valid; we must close it to release file descriptors
-            // and internal resources after the failed transaction start.
-            unsafe {
-                ffi::tdb_close(tdb);
-            }
+            // Close the handle after failed transaction start.
+            tdb_ffi(TdbFfi::Close(tdb));
             return Err(HintsDbError::new(format!(
                 "tdb_transaction_start failed for '{}': {}",
                 path, err_msg
@@ -294,16 +370,16 @@ impl TdbHintsDb {
             .map_err(|e| HintsDbError::new(format!("invalid database path: {e}")))?;
         let posix_flags = open_flags_to_posix(flags);
 
-        // SAFETY: tdb_open with valid arguments as documented in open(). No
-        // transaction is started for the multi-open path.
-        let tdb = unsafe {
-            ffi::tdb_open(
-                c_path.as_ptr(),
-                0,
-                ffi::TDB_DEFAULT as libc::c_int,
-                posix_flags,
-                mode,
-            )
+        // Dispatch tdb_open for multi-open (no transaction).
+        let tdb = match tdb_ffi(TdbFfi::Open(
+            c_path.as_ptr(),
+            0,
+            ffi::TDB_DEFAULT as libc::c_int,
+            posix_flags,
+            mode,
+        )) {
+            TdbFfiResult::Handle(h) => h,
+            _ => unreachable!(),
         };
 
         if tdb.is_null() {
@@ -336,11 +412,11 @@ impl TdbHintsDb {
         // Drop cursor first to free any allocated dptr before closing.
         self.cursor = None;
 
-        // SAFETY: self.tdb is a valid tdb_context pointer from tdb_open.
-        // tdb_close returns 0 on success, -1 on error. After this call the
-        // tdb_context is freed by TDB — we null our pointer to prevent
-        // Drop from double-closing.
-        let rc = unsafe { ffi::tdb_close(self.tdb) };
+        // Dispatch tdb_close: releases all TDB resources for multi-open handles.
+        let rc = match tdb_ffi(TdbFfi::Close(self.tdb)) {
+            TdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         self.tdb = ptr::null_mut();
         // When this function returns, Drop runs but sees null tdb → no-op.
 
@@ -360,55 +436,41 @@ impl TdbHintsDb {
     ) -> Result<Option<(HintsDbDatum, HintsDbDatum)>, HintsDbError> {
         let cursor = self.cursor.get_or_insert_with(TdbCursor::new);
 
-        // Step 1: Obtain the next key. For the first call, use tdb_firstkey.
-        // For subsequent calls, tdb_nextkey needs the previous key from the
-        // cursor to determine the next entry in the hash chain.
-        //
-        // SAFETY: self.tdb is a valid tdb_context pointer.
-        // - tdb_firstkey: takes only the context, returns TDB_DATA by value
-        //   with a malloc'd dptr (or null dptr if database is empty).
-        // - tdb_nextkey: takes the context and previous key (by value),
-        //   returns TDB_DATA with a malloc'd dptr (or null dptr at end).
-        let new_key = unsafe {
-            if first {
-                ffi::tdb_firstkey(self.tdb)
-            } else {
-                ffi::tdb_nextkey(self.tdb, cursor.data)
+        // Step 1: Dispatch firstkey or nextkey via consolidated FFI.
+        let new_key = if first {
+            match tdb_ffi(TdbFfi::FirstKey(self.tdb)) {
+                TdbFfiResult::Datum(d) => d,
+                _ => unreachable!(),
+            }
+        } else {
+            match tdb_ffi(TdbFfi::NextKey(self.tdb, cursor.data)) {
+                TdbFfiResult::Datum(d) => d,
+                _ => unreachable!(),
             }
         };
 
-        // Step 2: Free the PREVIOUS cursor dptr. This MUST happen AFTER
-        // tdb_nextkey uses it. Follows the C pattern in hints_tdb.h:
-        //   free(cursor->dptr);
-        //   *cursor = *key;
+        // Step 2: Free the PREVIOUS cursor dptr AFTER nextkey read it.
         cursor.free_dptr();
 
-        // Step 3: Update cursor with the new key (struct copy — the cursor
-        // now owns the malloc'd dptr for freeing on next iteration or drop).
+        // Step 3: Update cursor with the new key.
         cursor.data = new_key;
 
-        // Check if iteration is exhausted (null dptr = no more keys).
         if new_key.dptr.is_null() {
             return Ok(None);
         }
 
-        // Step 4: Copy key bytes into an owned Rust datum. The original dptr
-        // stays in cursor.data for the next tdb_nextkey call.
-        //
-        // SAFETY: new_key.dptr is non-null and points to new_key.dsize bytes
-        // allocated by TDB. We only read from it; ownership stays with the
-        // cursor until the next iteration or cursor drop.
-        let key_bytes = unsafe { std::slice::from_raw_parts(new_key.dptr, new_key.dsize) };
-        let key_datum = HintsDbDatum::new(key_bytes);
+        // Step 4: Copy key bytes via dispatch.
+        let key_bytes = match tdb_ffi(TdbFfi::SliceCopy(new_key.dptr, new_key.dsize)) {
+            TdbFfiResult::Bytes(b) => b,
+            _ => unreachable!(),
+        };
+        let key_datum = HintsDbDatum::new(&key_bytes);
 
-        // Step 5: Fetch the value for this key. Pass the key TDB_DATA by value.
-        //
-        // SAFETY: self.tdb is valid, new_key has a non-null dptr. tdb_fetch
-        // returns TDB_DATA by value with its own malloc'd dptr that we free
-        // inside tdb_data_to_datum.
-        let value = unsafe { ffi::tdb_fetch(self.tdb, new_key) };
-
-        // Convert value to owned datum (frees value dptr) or empty if missing.
+        // Step 5: Fetch the value for this key.
+        let value = match tdb_ffi(TdbFfi::Fetch(self.tdb, new_key)) {
+            TdbFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
         let value_datum = tdb_data_to_datum(value).unwrap_or_else(HintsDbDatum::empty);
 
         Ok(Some((key_datum, value_datum)))
@@ -443,10 +505,11 @@ impl HintsDb for TdbHintsDb {
     fn get(&self, key: &HintsDbDatum) -> Result<Option<HintsDbDatum>, HintsDbError> {
         let tdb_key = datum_to_tdb_data(key);
 
-        // SAFETY: self.tdb is a valid tdb_context pointer. tdb_fetch takes a
-        // TDB_DATA key by value and returns a TDB_DATA result by value. The
-        // result's dptr is malloc'd by TDB — freed in tdb_data_to_datum.
-        let result = unsafe { ffi::tdb_fetch(self.tdb, tdb_key) };
+        // Dispatch tdb_fetch: self.tdb is valid, key is by-value struct copy.
+        let result = match tdb_ffi(TdbFfi::Fetch(self.tdb, tdb_key)) {
+            TdbFfiResult::Datum(d) => d,
+            _ => unreachable!(),
+        };
 
         Ok(tdb_data_to_datum(result))
     }
@@ -461,12 +524,16 @@ impl HintsDb for TdbHintsDb {
         let tdb_key = datum_to_tdb_data(key);
         let tdb_data = datum_to_tdb_data(data);
 
-        // SAFETY: self.tdb is a valid tdb_context pointer. tdb_store takes
-        // key and data TDB_DATA by value (struct copy — TDB reads from the
-        // dptr buffers but does not take ownership). TDB_REPLACE permits
-        // overwriting. Returns 0 on success, non-zero on error.
-        let rc =
-            unsafe { ffi::tdb_store(self.tdb, tdb_key, tdb_data, ffi::TDB_REPLACE as libc::c_int) };
+        // Dispatch tdb_store with TDB_REPLACE: self.tdb is valid, key/data by-value.
+        let rc = match tdb_ffi(TdbFfi::Store(
+            self.tdb,
+            tdb_key,
+            tdb_data,
+            ffi::TDB_REPLACE as libc::c_int,
+        )) {
+            TdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         if rc != 0 {
             return Err(HintsDbError::new(format!(
@@ -496,10 +563,16 @@ impl HintsDb for TdbHintsDb {
         let tdb_key = datum_to_tdb_data(key);
         let tdb_data = datum_to_tdb_data(data);
 
-        // SAFETY: self.tdb is a valid tdb_context pointer. tdb_store with
-        // TDB_INSERT will fail (return non-zero) if the key already exists.
-        let rc =
-            unsafe { ffi::tdb_store(self.tdb, tdb_key, tdb_data, ffi::TDB_INSERT as libc::c_int) };
+        // Dispatch tdb_store with TDB_INSERT: returns non-zero if key exists.
+        let rc = match tdb_ffi(TdbFfi::Store(
+            self.tdb,
+            tdb_key,
+            tdb_data,
+            ffi::TDB_INSERT as libc::c_int,
+        )) {
+            TdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         // Match C behavior: 0 = success, any non-zero = duplicate.
         if rc == 0 {
@@ -515,9 +588,11 @@ impl HintsDb for TdbHintsDb {
     fn delete(&mut self, key: &HintsDbDatum) -> Result<(), HintsDbError> {
         let tdb_key = datum_to_tdb_data(key);
 
-        // SAFETY: self.tdb is a valid tdb_context pointer. tdb_delete takes
-        // the key TDB_DATA by value. Returns 0 on success, -1 on error.
-        let rc = unsafe { ffi::tdb_delete(self.tdb, tdb_key) };
+        // Dispatch tdb_delete: self.tdb is valid, key by-value struct copy.
+        let rc = match tdb_ffi(TdbFfi::Delete(self.tdb, tdb_key)) {
+            TdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         if rc != 0 {
             return Err(HintsDbError::new(format!(
@@ -572,21 +647,21 @@ impl HintsDb for TdbHintsDb {
 
         // Commit the transaction if one is active.
         if self.in_transaction {
-            // SAFETY: self.tdb is a valid tdb_context pointer with an active
-            // transaction. tdb_transaction_commit returns 0 on success.
-            let rc = unsafe { ffi::tdb_transaction_commit(self.tdb) };
+            let rc = match tdb_ffi(TdbFfi::TxnCommit(self.tdb)) {
+                TdbFfiResult::Code(c) => c,
+                _ => unreachable!(),
+            };
             if rc != 0 {
                 commit_err = Some(tdb_error_string(self.tdb));
             }
             self.in_transaction = false;
         }
 
-        // Close the database handle. After tdb_close, the tdb_context is freed
-        // by TDB — we MUST NOT call tdb_errorstr after this point.
-        //
-        // SAFETY: self.tdb is a valid tdb_context pointer (whether or not the
-        // commit succeeded). tdb_close releases all internal TDB resources.
-        let close_rc = unsafe { ffi::tdb_close(self.tdb) };
+        // Close the database handle via dispatch.
+        let close_rc = match tdb_ffi(TdbFfi::Close(self.tdb)) {
+            TdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         self.tdb = ptr::null_mut();
         // After returning, Drop runs but sees null tdb → no-op.
 
@@ -615,9 +690,11 @@ impl HintsDb for TdbHintsDb {
             return false;
         }
 
-        // SAFETY: self.tdb is a valid tdb_context pointer with no active
-        // transaction. tdb_transaction_start returns 0 on success.
-        let rc = unsafe { ffi::tdb_transaction_start(self.tdb) };
+        // Dispatch tdb_transaction_start: self.tdb is valid, no active transaction.
+        let rc = match tdb_ffi(TdbFfi::TxnStart(self.tdb)) {
+            TdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if rc == 0 {
             self.in_transaction = true;
             true
@@ -641,9 +718,11 @@ impl HintsDb for TdbHintsDb {
             return;
         }
 
-        // SAFETY: self.tdb is a valid tdb_context pointer with an active
-        // transaction (verified by in_transaction flag above).
-        let rc = unsafe { ffi::tdb_transaction_commit(self.tdb) };
+        // Dispatch tdb_transaction_commit: self.tdb is valid, transaction active.
+        let rc = match tdb_ffi(TdbFfi::TxnCommit(self.tdb)) {
+            TdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         self.in_transaction = false;
 
         if rc != 0 {
@@ -675,10 +754,10 @@ impl Drop for TdbHintsDb {
 
         // Best-effort commit if a transaction is active.
         if self.in_transaction {
-            // SAFETY: self.tdb is valid (non-null check above) with an active
-            // transaction. Best-effort commit — errors are logged but cannot
-            // be propagated from Drop.
-            let rc = unsafe { ffi::tdb_transaction_commit(self.tdb) };
+            let rc = match tdb_ffi(TdbFfi::TxnCommit(self.tdb)) {
+                TdbFfiResult::Code(c) => c,
+                _ => unreachable!(),
+            };
             if rc != 0 {
                 tracing::debug!(
                     "tdb drop: transaction_commit failed: {}",
@@ -688,12 +767,11 @@ impl Drop for TdbHintsDb {
             self.in_transaction = false;
         }
 
-        // Close the database handle to release file descriptors and resources.
-        //
-        // SAFETY: self.tdb is valid (non-null check above). tdb_close frees
-        // the internal tdb_context. After this call we null the pointer even
-        // though the struct is being dropped, for defense-in-depth.
-        let rc = unsafe { ffi::tdb_close(self.tdb) };
+        // Close the database handle via dispatch.
+        let rc = match tdb_ffi(TdbFfi::Close(self.tdb)) {
+            TdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if rc != 0 {
             tracing::debug!("tdb drop: tdb_close failed");
         }

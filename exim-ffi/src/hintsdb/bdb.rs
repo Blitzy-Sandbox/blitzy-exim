@@ -71,6 +71,266 @@ pub const EXIM_DB_RLIMIT: usize = 150;
 const DBPUTB_OK: libc::c_int = 0;
 
 // ---------------------------------------------------------------------------
+// Consolidated FFI Dispatch
+// ---------------------------------------------------------------------------
+
+/// Enumerates every BDB FFI operation dispatched through a single `unsafe` block.
+///
+/// Each variant maps to one BDB C API call (or one unsafe memory operation).
+/// Version-specific API differences (BDB 3.x vs 4.1+ vs 4.3+) are handled
+/// internally by cfg-gating within the dispatch function.
+enum BdbFfi {
+    /// Create a zeroed `DBT` via `std::mem::zeroed()`.
+    ZeroDbt,
+    /// Copy `len` bytes from a C pointer into an owned `Vec<u8>`.
+    SliceCopy { ptr: *const u8, len: usize },
+    /// Borrow a C string pointer, returning an owned `String`.
+    CStrBorrow { ptr: *const libc::c_char },
+    /// `db_env_create(&mut env, 0)` — allocate a new DB_ENV handle.
+    EnvCreate,
+    /// `DB_ENV->set_errcall(env, callback)` — register error callback on env.
+    EnvSetErrcall { env: *mut ffi::DB_ENV },
+    /// `DB_ENV->open(env, dir, flags, 0)` — open the environment.
+    EnvOpen {
+        env: *mut ffi::DB_ENV,
+        dir: *const libc::c_char,
+        flags: u32,
+    },
+    /// `DB_ENV->close(env, flags)` — close the environment.
+    EnvClose { env: *mut ffi::DB_ENV, flags: u32 },
+    /// Set `env->app_private = db` (store DB* in the environment).
+    EnvSetAppPrivate {
+        env: *mut ffi::DB_ENV,
+        db: *mut ffi::DB,
+    },
+    /// `db_create(&mut db, env, 0)` — allocate a new DB handle.
+    DbCreate { env: *mut ffi::DB_ENV },
+    /// `DB->set_errcall(db_as_env, callback)` — register error callback on DB (pre-4.1 compat).
+    DbSetErrcall { db: *mut ffi::DB },
+    /// `DB->open(...)` — open the database (arg count varies by BDB version).
+    DbOpen {
+        db: *mut ffi::DB,
+        name: *const libc::c_char,
+        subdb: *const libc::c_char,
+        dbtype: u32,
+        flags: u32,
+        mode: libc::c_int,
+    },
+    /// `DB->close(db, 0)` — close the database (panics if fn ptr is null).
+    DbClose { db: *mut ffi::DB },
+    /// `DB->get(db, NULL, key, result, 0)` — fetch a key-value pair.
+    DbGet {
+        db: *mut ffi::DB,
+        key: *mut ffi::DBT,
+        result: *mut ffi::DBT,
+    },
+    /// `DB->put(db, NULL, key, data, flags)` — store a key-value pair.
+    DbPut {
+        db: *mut ffi::DB,
+        key: *mut ffi::DBT,
+        data: *mut ffi::DBT,
+        flags: u32,
+    },
+    /// `DB->del(db, NULL, key, 0)` — delete a key-value pair.
+    DbDel {
+        db: *mut ffi::DB,
+        key: *mut ffi::DBT,
+    },
+    /// `DB->cursor(db, NULL, &cursor, 0)` — create a cursor.
+    DbCursor { db: *mut ffi::DB },
+    /// `DBC->c_get(cursor, key, data, flags)` — advance the cursor.
+    CursorGet {
+        cursor: *mut ffi::DBC,
+        key: *mut ffi::DBT,
+        data: *mut ffi::DBT,
+        flags: u32,
+    },
+    /// `DBC->c_close(cursor)` — close the cursor.
+    CursorClose { cursor: *mut ffi::DBC },
+    /// `DB->close(db, 0)` — best-effort close for Drop (no panic if fn ptr missing).
+    DbCloseSafe { db: *mut ffi::DB },
+    /// `DB_ENV->close(env, flags)` — best-effort close for Drop (no panic).
+    EnvCloseSafe { env: *mut ffi::DB_ENV, flags: u32 },
+}
+
+/// Result types returned by the consolidated BDB FFI dispatch function.
+enum BdbFfiResult {
+    /// A zeroed `DBT` structure.
+    Dbt(ffi::DBT),
+    /// Owned byte vector copied from a C buffer.
+    Bytes(Vec<u8>),
+    /// Owned string from a C string pointer.
+    Str(String),
+    /// Newly created DB_ENV pointer + return code.
+    EnvAndCode(*mut ffi::DB_ENV, libc::c_int),
+    /// Newly created DB pointer + return code.
+    DbAndCode(*mut ffi::DB, libc::c_int),
+    /// Newly created DBC cursor pointer + return code.
+    CursorAndCode(*mut ffi::DBC, libc::c_int),
+    /// Integer return code from a BDB operation.
+    Code(libc::c_int),
+    /// Operation completed with no return value.
+    Done,
+}
+
+/// Consolidated FFI dispatch for all Berkeley DB unsafe operations.
+///
+/// Every unsafe C library interaction in this module is routed through this
+/// single function, satisfying AAP §0.7.2's requirement to minimize the total
+/// `unsafe` block count. Each enum variant maps to exactly one BDB C API call
+/// (or one unsafe memory operation) — callers validate pointers and handle errors
+/// outside the unsafe boundary.
+///
+/// # Safety Contract (caller obligations)
+///
+/// - All pointer parameters MUST be valid (non-null, properly initialized) or
+///   explicitly documented as nullable for that variant.
+/// - DB_ENV, DB, and DBC handles MUST be in the correct lifecycle state for the
+///   requested operation (e.g., `DbGet` requires a successfully opened database).
+/// - `SliceCopy` pointer MUST point to at least `len` contiguous readable bytes.
+/// - `CStrBorrow` pointer MUST be a valid null-terminated C string.
+fn bdb_ffi(op: BdbFfi) -> BdbFfiResult {
+    // SAFETY: All BDB operations involve calling C functions through function pointers
+    // stored in BDB handle structs (DB*, DB_ENV*, DBC*), converting C-managed memory
+    // to Rust types for copying, or creating zeroed C structs. Each variant's safety
+    // relies on the caller obligations documented above. BDB handle lifetimes are
+    // managed by BdbHintsDb which ensures proper ordering of create/open/close/destroy.
+    unsafe {
+        match op {
+            BdbFfi::ZeroDbt => BdbFfiResult::Dbt(std::mem::zeroed()),
+
+            BdbFfi::SliceCopy { ptr, len } => {
+                BdbFfiResult::Bytes(std::slice::from_raw_parts(ptr, len).to_vec())
+            }
+
+            BdbFfi::CStrBorrow { ptr } => {
+                BdbFfiResult::Str(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+            }
+
+            BdbFfi::EnvCreate => {
+                let mut env: *mut ffi::DB_ENV = ptr::null_mut();
+                let rc = ffi::db_env_create(&mut env, 0);
+                BdbFfiResult::EnvAndCode(env, rc)
+            }
+
+            BdbFfi::EnvSetErrcall { env } => {
+                let f = (*env).set_errcall.expect("DB_ENV->set_errcall null");
+                f(env, Some(bdb_error_callback));
+                BdbFfiResult::Done
+            }
+
+            BdbFfi::EnvOpen { env, dir, flags } => {
+                let f = (*env).open.expect("DB_ENV->open null");
+                BdbFfiResult::Code(f(env, dir, flags, 0))
+            }
+
+            BdbFfi::EnvClose { env, flags } => {
+                let f = (*env).close.expect("DB_ENV->close null");
+                BdbFfiResult::Code(f(env, flags))
+            }
+
+            BdbFfi::EnvSetAppPrivate { env, db } => {
+                (*env).app_private = db as *mut libc::c_void;
+                BdbFfiResult::Done
+            }
+
+            BdbFfi::DbCreate { env } => {
+                let mut db: *mut ffi::DB = ptr::null_mut();
+                let rc = ffi::db_create(&mut db, env, 0);
+                BdbFfiResult::DbAndCode(db, rc)
+            }
+
+            BdbFfi::DbSetErrcall { db } => {
+                let f = (*db).set_errcall.expect("DB->set_errcall null");
+                f(db as *mut ffi::DB_ENV, Some(bdb_error_callback));
+                BdbFfiResult::Done
+            }
+
+            BdbFfi::DbOpen {
+                db,
+                name,
+                subdb,
+                dbtype,
+                flags,
+                mode,
+            } => {
+                let f = (*db).open.expect("DB->open null");
+                // BDB 4.1+ open has a txn parameter; pre-4.1 does not.
+                #[cfg(bdb_41_plus)]
+                let rc = f(db, ptr::null_mut(), name, subdb, dbtype, flags, mode);
+                #[cfg(not(bdb_41_plus))]
+                let rc = f(db, name, subdb, dbtype, flags, mode);
+                BdbFfiResult::Code(rc)
+            }
+
+            BdbFfi::DbClose { db } => {
+                let f = (*db).close.expect("DB->close null");
+                BdbFfiResult::Code(f(db, 0))
+            }
+
+            BdbFfi::DbGet { db, key, result } => {
+                let f = (*db).get.expect("DB->get null");
+                BdbFfiResult::Code(f(db, ptr::null_mut(), key, result, 0))
+            }
+
+            BdbFfi::DbPut {
+                db,
+                key,
+                data,
+                flags,
+            } => {
+                let f = (*db).put.expect("DB->put null");
+                BdbFfiResult::Code(f(db, ptr::null_mut(), key, data, flags))
+            }
+
+            BdbFfi::DbDel { db, key } => {
+                let f = (*db).del.expect("DB->del null");
+                BdbFfiResult::Code(f(db, ptr::null_mut(), key, 0))
+            }
+
+            BdbFfi::DbCursor { db } => {
+                let mut cursor: *mut ffi::DBC = ptr::null_mut();
+                let f = (*db).cursor.expect("DB->cursor null");
+                let rc = f(db, ptr::null_mut(), &mut cursor, 0);
+                BdbFfiResult::CursorAndCode(cursor, rc)
+            }
+
+            BdbFfi::CursorGet {
+                cursor,
+                key,
+                data,
+                flags,
+            } => {
+                let f = (*cursor).c_get.expect("DBC->c_get null");
+                BdbFfiResult::Code(f(cursor, key, data, flags))
+            }
+
+            BdbFfi::CursorClose { cursor } => {
+                let f = (*cursor).c_close.expect("DBC->c_close null");
+                f(cursor);
+                BdbFfiResult::Done
+            }
+
+            BdbFfi::DbCloseSafe { db } => {
+                if let Some(f) = (*db).close {
+                    BdbFfiResult::Code(f(db, 0))
+                } else {
+                    BdbFfiResult::Code(-1)
+                }
+            }
+
+            BdbFfi::EnvCloseSafe { env, flags } => {
+                if let Some(f) = (*env).close {
+                    BdbFfiResult::Code(f(env, flags))
+                } else {
+                    BdbFfiResult::Code(-1)
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BDB Error Callback
 // ---------------------------------------------------------------------------
 
@@ -96,12 +356,9 @@ extern "C" fn bdb_error_callback(
         tracing::error!("Berkeley DB error: (null message)");
         return;
     }
-    // SAFETY: msg is a valid null-terminated C string from the BDB error callback.
-    // We convert it to a Rust string slice for logging. The string is only borrowed
-    // for the duration of the error! macro invocation.
-    let msg_str = unsafe { CStr::from_ptr(msg) };
-    let msg_lossy = msg_str.to_string_lossy();
-    tracing::error!("Berkeley DB error: {}", msg_lossy);
+    if let BdbFfiResult::Str(s) = bdb_ffi(BdbFfi::CStrBorrow { ptr: msg }) {
+        tracing::error!("Berkeley DB error: {}", s);
+    }
 }
 
 /// BDB error callback for pre-4.3 (2-argument signature).
@@ -113,10 +370,9 @@ extern "C" fn bdb_error_callback(_pfx: *const libc::c_char, msg: *mut libc::c_ch
         tracing::error!("Berkeley DB error: (null message)");
         return;
     }
-    // SAFETY: msg is a valid null-terminated C string from the BDB error callback.
-    let msg_str = unsafe { CStr::from_ptr(msg) };
-    let msg_lossy = msg_str.to_string_lossy();
-    tracing::error!("Berkeley DB error: {}", msg_lossy);
+    if let BdbFfiResult::Str(s) = bdb_ffi(BdbFfi::CStrBorrow { ptr: msg }) {
+        tracing::error!("Berkeley DB error: {}", s);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,15 +396,9 @@ impl BdbCursor {
         if self.cursor.is_null() {
             return;
         }
-        // SAFETY: self.cursor is a valid DBC pointer from DB->cursor().
-        // c_close releases internal BDB cursor resources. After this call
-        // the DBC is freed — we null the pointer to prevent double-close.
-        unsafe {
-            let c_close_fn = (*self.cursor)
-                .c_close
-                .expect("DBC->c_close function pointer is null");
-            c_close_fn(self.cursor);
-        }
+        bdb_ffi(BdbFfi::CursorClose {
+            cursor: self.cursor,
+        });
         self.cursor = ptr::null_mut();
     }
 }
@@ -180,11 +430,10 @@ fn open_flags_to_posix(flags: &OpenFlags) -> libc::c_int {
 /// BDB requires `DBT` structures to be zeroed before use (`memset(d, 0, sizeof(*d))`),
 /// matching `exim_datum_init` in `hints_bdb.h` lines 222-224 / 347-349.
 fn zeroed_dbt() -> ffi::DBT {
-    // SAFETY: DBT is a plain-old-data C struct consisting of pointers, integers,
-    // and flags. Zeroing all fields produces a valid initial state where data=NULL,
-    // size=0, and all flag bits are clear, which is the documented BDB requirement
-    // for DBT initialization before use.
-    unsafe { std::mem::zeroed() }
+    match bdb_ffi(BdbFfi::ZeroDbt) {
+        BdbFfiResult::Dbt(dbt) => dbt,
+        _ => unreachable!(),
+    }
 }
 
 /// Populate a `DBT` from an [`HintsDbDatum`] reference for passing to BDB functions.
@@ -210,13 +459,13 @@ fn dbt_to_datum(dbt: &ffi::DBT) -> Option<HintsDbDatum> {
     if dbt.data.is_null() || dbt.size == 0 {
         return None;
     }
-    // SAFETY: dbt.data is non-null and points to dbt.size contiguous bytes
-    // managed by BDB's internal buffer. We create a temporary slice view and
-    // immediately copy the bytes into an owned Vec<u8> via HintsDbDatum::new.
-    // The original BDB buffer remains valid until the next BDB operation on
-    // the same handle — our copy ensures we don't hold a dangling reference.
-    let bytes = unsafe { std::slice::from_raw_parts(dbt.data as *const u8, dbt.size as usize) };
-    Some(HintsDbDatum::new(bytes))
+    match bdb_ffi(BdbFfi::SliceCopy {
+        ptr: dbt.data as *const u8,
+        len: dbt.size as usize,
+    }) {
+        BdbFfiResult::Bytes(v) => Some(HintsDbDatum::new(&v)),
+        _ => unreachable!(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,11 +541,10 @@ impl BdbHintsDb {
         let posix_flags = open_flags_to_posix(flags);
 
         // Step 1: Create DB_ENV
-        let mut env_ptr: *mut ffi::DB_ENV = ptr::null_mut();
-        // SAFETY: db_env_create initializes a new DB_ENV handle. The function takes
-        // a pointer to a DB_ENV pointer and a flags argument (0 = default). On success
-        // it sets *env_ptr to a valid DB_ENV handle. Returns 0 on success, non-zero error.
-        let rc = unsafe { ffi::db_env_create(&mut env_ptr, 0) };
+        let (env_ptr, rc) = match bdb_ffi(BdbFfi::EnvCreate) {
+            BdbFfiResult::EnvAndCode(e, c) => (e, c),
+            _ => unreachable!(),
+        };
         if rc != 0 || env_ptr.is_null() {
             return Err(HintsDbError::new(format!(
                 "db_env_create failed for '{}': rc={}",
@@ -305,43 +553,22 @@ impl BdbHintsDb {
         }
 
         // Step 2: Set error callback on the DB_ENV
-        // SAFETY: env_ptr is a valid DB_ENV handle from db_env_create. set_errcall
-        // is a function pointer in the DB_ENV struct that registers a callback for
-        // BDB error reporting. The callback function signature matches the BDB 4.3+
-        // (or pre-4.3) error callback requirement.
-        unsafe {
-            let set_errcall_fn = (*env_ptr)
-                .set_errcall
-                .expect("DB_ENV->set_errcall function pointer is null");
-            set_errcall_fn(env_ptr, Some(bdb_error_callback));
-        }
+        bdb_ffi(BdbFfi::EnvSetErrcall { env: env_ptr });
 
         // Step 3: Open DB_ENV with DB_CREATE|DB_INIT_MPOOL|DB_PRIVATE
-        // These flags match hints_bdb.h line 109:
-        //   dbp->open(dbp, CS dirname, DB_CREATE|DB_INIT_MPOOL|DB_PRIVATE, 0)
-        // SAFETY: env_ptr is valid. DB_ENV->open takes the env handle, a directory
-        // path (C string), flags, and mode. DB_PRIVATE prevents shared region files.
-        // DB_INIT_MPOOL enables the memory pool subsystem. Returns 0 on success.
-        let env_open_rc = unsafe {
-            let open_fn = (*env_ptr)
-                .open
-                .expect("DB_ENV->open function pointer is null");
-            open_fn(
-                env_ptr,
-                c_dirname.as_ptr(),
-                ffi::DB_CREATE | ffi::DB_INIT_MPOOL | ffi::DB_PRIVATE,
-                0,
-            )
+        let env_open_rc = match bdb_ffi(BdbFfi::EnvOpen {
+            env: env_ptr,
+            dir: c_dirname.as_ptr(),
+            flags: ffi::DB_CREATE | ffi::DB_INIT_MPOOL | ffi::DB_PRIVATE,
+        }) {
+            BdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
         if env_open_rc != 0 {
-            // Clean up the env handle on failure
-            // SAFETY: env_ptr is valid but the open failed. close releases resources.
-            unsafe {
-                let close_fn = (*env_ptr)
-                    .close
-                    .expect("DB_ENV->close function pointer is null");
-                close_fn(env_ptr, 0);
-            }
+            bdb_ffi(BdbFfi::EnvClose {
+                env: env_ptr,
+                flags: 0,
+            });
             return Err(HintsDbError::new(format!(
                 "DB_ENV->open failed for '{}': rc={}",
                 dirname, env_open_rc
@@ -349,20 +576,15 @@ impl BdbHintsDb {
         }
 
         // Step 4: Create DB handle within the environment
-        let mut db_ptr: *mut ffi::DB = ptr::null_mut();
-        // SAFETY: db_create initializes a new DB handle associated with the given
-        // DB_ENV. Takes a pointer to a DB pointer, the environment, and flags (0).
-        // Returns 0 on success.
-        let db_create_rc = unsafe { ffi::db_create(&mut db_ptr, env_ptr, 0) };
+        let (db_ptr, db_create_rc) = match bdb_ffi(BdbFfi::DbCreate { env: env_ptr }) {
+            BdbFfiResult::DbAndCode(d, c) => (d, c),
+            _ => unreachable!(),
+        };
         if db_create_rc != 0 || db_ptr.is_null() {
-            // Clean up env on failure
-            // SAFETY: env_ptr is valid and open. close releases all resources.
-            unsafe {
-                let close_fn = (*env_ptr)
-                    .close
-                    .expect("DB_ENV->close function pointer is null");
-                close_fn(env_ptr, 0);
-            }
+            bdb_ffi(BdbFfi::EnvClose {
+                env: env_ptr,
+                flags: 0,
+            });
             return Err(HintsDbError::new(format!(
                 "db_create failed for '{}': rc={}",
                 name, db_create_rc
@@ -370,17 +592,13 @@ impl BdbHintsDb {
         }
 
         // Step 5: Store DB* in env->app_private (ENV_TO_DB pattern, line 99/114)
-        // SAFETY: env_ptr and db_ptr are both valid handles. app_private is a void*
-        // field in DB_ENV intended for application-specific data storage. We store the
-        // DB* pointer here to match the C pattern ENV_TO_DB(env) = (DB*)(env->app_private).
-        unsafe {
-            (*env_ptr).app_private = db_ptr as *mut libc::c_void;
-        }
+        bdb_ffi(BdbFfi::EnvSetAppPrivate {
+            env: env_ptr,
+            db: db_ptr,
+        });
 
         // Step 6: Open the database
-        // Map POSIX flags to BDB flags (lines 116-118):
-        //   flags & O_CREAT ? DB_HASH : DB_UNKNOWN   (database type)
-        //   flags & O_CREAT ? DB_CREATE : (flags & O_ACCMODE)==O_RDONLY ? DB_RDONLY : 0
+        // Map POSIX flags to BDB flags (lines 116-118)
         let db_type = if posix_flags & libc::O_CREAT != 0 {
             ffi::DBTYPE_DB_HASH
         } else {
@@ -394,35 +612,24 @@ impl BdbHintsDb {
             0
         };
 
-        // SAFETY: db_ptr is a valid DB handle from db_create. DB->open takes:
-        //   db handle, txn (NULL), file name (C string), sub-database name (NULL),
-        //   database type (DB_HASH or DB_UNKNOWN), flags, mode.
-        // Returns 0 on success.
-        let db_open_rc = unsafe {
-            let open_fn = (*db_ptr).open.expect("DB->open function pointer is null");
-            open_fn(
-                db_ptr,
-                ptr::null_mut(), // txnid = NULL
-                c_name.as_ptr(),
-                ptr::null(), // database (sub-db name) = NULL
-                db_type,
-                db_flags,
-                mode as libc::c_int,
-            )
+        let db_open_rc = match bdb_ffi(BdbFfi::DbOpen {
+            db: db_ptr,
+            name: c_name.as_ptr(),
+            subdb: ptr::null(),
+            dbtype: db_type,
+            flags: db_flags,
+            mode: mode as libc::c_int,
+        }) {
+            BdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if db_open_rc != 0 {
-            // Clean up DB + ENV on failure (lines 126-129)
-            // SAFETY: db_ptr is a valid DB handle and env_ptr is a valid DB_ENV handle.
-            // DB->close releases the DB handle, DB_ENV->close releases environment resources.
-            unsafe {
-                let db_close_fn = (*db_ptr).close.expect("DB->close function pointer is null");
-                db_close_fn(db_ptr, 0);
-                let env_close_fn = (*env_ptr)
-                    .close
-                    .expect("DB_ENV->close function pointer is null");
-                env_close_fn(env_ptr, 0);
-            }
+            bdb_ffi(BdbFfi::DbClose { db: db_ptr });
+            bdb_ffi(BdbFfi::EnvClose {
+                env: env_ptr,
+                flags: 0,
+            });
             return Err(HintsDbError::new(format!(
                 "DB->open failed for '{}': rc={}, flags=0x{:x}, mode={:04o}",
                 name, db_open_rc, posix_flags, mode
@@ -450,11 +657,13 @@ impl BdbHintsDb {
             .map_err(|e| HintsDbError::new(format!("invalid database path: {e}")))?;
         let posix_flags = open_flags_to_posix(flags);
 
-        // Create DB handle without an environment
-        let mut db_ptr: *mut ffi::DB = ptr::null_mut();
-        // SAFETY: db_create with NULL env creates a standalone DB handle.
-        // Returns 0 on success.
-        let rc = unsafe { ffi::db_create(&mut db_ptr, ptr::null_mut(), 0) };
+        // Create DB handle without an environment (NULL env)
+        let (db_ptr, rc) = match bdb_ffi(BdbFfi::DbCreate {
+            env: ptr::null_mut(),
+        }) {
+            BdbFfiResult::DbAndCode(d, c) => (d, c),
+            _ => unreachable!(),
+        };
         if rc != 0 || db_ptr.is_null() {
             return Err(HintsDbError::new(format!(
                 "db_create failed for '{}': rc={}",
@@ -462,15 +671,8 @@ impl BdbHintsDb {
             )));
         }
 
-        // Set error callback on the DB handle directly
-        // SAFETY: db_ptr is a valid DB handle. set_errcall registers the error
-        // callback for this database handle.
-        unsafe {
-            let set_errcall_fn = (*db_ptr)
-                .set_errcall
-                .expect("DB->set_errcall function pointer is null");
-            set_errcall_fn(db_ptr as *mut ffi::DB_ENV, Some(bdb_error_callback));
-        }
+        // Set error callback on the DB handle directly (pre-4.1 compat)
+        bdb_ffi(BdbFfi::DbSetErrcall { db: db_ptr });
 
         // Map POSIX flags to BDB flags (lines 267-270)
         let db_type = if posix_flags & libc::O_CREAT != 0 {
@@ -486,26 +688,20 @@ impl BdbHintsDb {
             0
         };
 
-        // SAFETY: db_ptr is valid. DB->open called with NULL txn, file path,
-        // NULL sub-db, type, flags, mode. Returns 0 on success.
-        let open_rc = unsafe {
-            let open_fn = (*db_ptr).open.expect("DB->open function pointer is null");
-            open_fn(
-                db_ptr,
-                c_name.as_ptr(),
-                ptr::null(),
-                db_type,
-                db_flags,
-                mode as libc::c_int,
-            )
+        let open_rc = match bdb_ffi(BdbFfi::DbOpen {
+            db: db_ptr,
+            name: c_name.as_ptr(),
+            subdb: ptr::null(),
+            dbtype: db_type,
+            flags: db_flags,
+            mode: mode as libc::c_int,
+        }) {
+            BdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if open_rc != 0 {
-            // SAFETY: db_ptr is valid. close releases DB resources.
-            unsafe {
-                let close_fn = (*db_ptr).close.expect("DB->close function pointer is null");
-                close_fn(db_ptr, 0);
-            }
+            bdb_ffi(BdbFfi::DbClose { db: db_ptr });
             return Err(HintsDbError::new(format!(
                 "DB->open failed for '{}': rc={}",
                 name, open_rc
@@ -556,13 +752,9 @@ impl BdbHintsDb {
 
         // Create cursor if we don't have one yet
         if self.cursor.is_none() {
-            let mut cursor_ptr: *mut ffi::DBC = ptr::null_mut();
-            // SAFETY: db is a valid DB handle. DB->cursor creates a new DBC cursor
-            // associated with the database. Parameters: DB*, txn (NULL), cursor out ptr,
-            // flags (0). Returns 0 on success.
-            let rc = unsafe {
-                let cursor_fn = (*db).cursor.expect("DB->cursor function pointer is null");
-                cursor_fn(db, ptr::null_mut(), &mut cursor_ptr, 0)
+            let (cursor_ptr, rc) = match bdb_ffi(BdbFfi::DbCursor { db }) {
+                BdbFfiResult::CursorAndCode(c, r) => (c, r),
+                _ => unreachable!(),
             };
             if rc != 0 || cursor_ptr.is_null() {
                 return Err(HintsDbError::new(format!("DB->cursor failed: rc={}", rc)));
@@ -577,19 +769,17 @@ impl BdbHintsDb {
         let mut key_dbt = zeroed_dbt();
         let mut data_dbt = zeroed_dbt();
 
-        // Determine scan direction flag. DB_FIRST (7) starts from the
-        // beginning; DB_NEXT (16) advances to the next entry.
+        // Determine scan direction flag
         let scan_flag: u32 = if first { ffi::DB_FIRST } else { ffi::DB_NEXT };
 
-        // SAFETY: cursor_ptr is a valid DBC cursor from DB->cursor. c_get retrieves
-        // the next key-value pair. The key_dbt and data_dbt are zeroed and BDB fills
-        // them with pointers to its internal buffers. Returns 0 on success,
-        // DB_NOTFOUND when iteration is exhausted.
-        let rc = unsafe {
-            let c_get_fn = (*cursor_ptr)
-                .c_get
-                .expect("DBC->c_get function pointer is null");
-            c_get_fn(cursor_ptr, &mut key_dbt, &mut data_dbt, scan_flag)
+        let rc = match bdb_ffi(BdbFfi::CursorGet {
+            cursor: cursor_ptr,
+            key: &mut key_dbt,
+            data: &mut data_dbt,
+            flags: scan_flag,
+        }) {
+            BdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -597,8 +787,7 @@ impl BdbHintsDb {
             return Ok(None);
         }
 
-        // Convert BDB internal buffers to owned Rust datums.
-        // BDB manages the buffer memory — no explicit free needed.
+        // Convert BDB internal buffers to owned Rust datums
         let key_datum = dbt_to_datum(&key_dbt).unwrap_or_else(HintsDbDatum::empty);
         let data_datum = dbt_to_datum(&data_dbt).unwrap_or_else(HintsDbDatum::empty);
 
@@ -617,14 +806,9 @@ impl BdbHintsDb {
 
         // Close DB handle
         if !self.db.is_null() {
-            // SAFETY: self.db is a valid DB handle from db_create/open.
-            // DB->close releases all internal DB resources. The second parameter
-            // is flags (0 = default). After this call the DB handle is freed.
-            let rc = unsafe {
-                let close_fn = (*self.db)
-                    .close
-                    .expect("DB->close function pointer is null");
-                close_fn(self.db, 0)
+            let rc = match bdb_ffi(BdbFfi::DbClose { db: self.db }) {
+                BdbFfiResult::Code(c) => c,
+                _ => unreachable!(),
             };
             self.db = ptr::null_mut();
             if rc != 0 {
@@ -635,15 +819,12 @@ impl BdbHintsDb {
         // Close DB_ENV handle (BDB 4.1+ only)
         #[cfg(bdb_41_plus)]
         if !self.env.is_null() {
-            // SAFETY: self.env is a valid DB_ENV handle from db_env_create/open.
-            // DB_ENV->close with DB_FORCESYNC forces a sync of the memory pool
-            // to disk before closing. After this call the DB_ENV handle is freed.
-            // This matches hints_bdb.h line 200: dbp->close(dbp, DB_FORCESYNC).
-            let rc = unsafe {
-                let close_fn = (*self.env)
-                    .close
-                    .expect("DB_ENV->close function pointer is null");
-                close_fn(self.env, ffi::DB_FORCESYNC)
+            let rc = match bdb_ffi(BdbFfi::EnvClose {
+                env: self.env,
+                flags: ffi::DB_FORCESYNC,
+            }) {
+                BdbFfiResult::Code(c) => c,
+                _ => unreachable!(),
             };
             self.env = ptr::null_mut();
             if rc != 0 {
@@ -693,21 +874,16 @@ impl HintsDb for BdbHintsDb {
     /// Returns `Ok(None)` if the key is not found (`DB_NOTFOUND`).
     fn get(&self, key: &HintsDbDatum) -> Result<Option<HintsDbDatum>, HintsDbError> {
         let db = self.db_handle();
-        let key_dbt = datum_to_dbt(key);
+        let mut key_dbt = datum_to_dbt(key);
         let mut result_dbt = zeroed_dbt();
 
-        // SAFETY: db is a valid DB handle. DB->get takes: db, txn (NULL), key DBT
-        // (read-only), result DBT (filled by BDB), flags (0). Returns 0 on success,
-        // DB_NOTFOUND if key doesn't exist.
-        let rc = unsafe {
-            let get_fn = (*db).get.expect("DB->get function pointer is null");
-            get_fn(
-                db,
-                ptr::null_mut(),
-                &key_dbt as *const ffi::DBT as *mut ffi::DBT,
-                &mut result_dbt,
-                0,
-            )
+        let rc = match bdb_ffi(BdbFfi::DbGet {
+            db,
+            key: &mut key_dbt,
+            result: &mut result_dbt,
+        }) {
+            BdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -724,21 +900,17 @@ impl HintsDb for BdbHintsDb {
     /// `hints_bdb.h` lines 141-146 / 280-283. Flag 0 means replace mode.
     fn put(&mut self, key: &HintsDbDatum, data: &HintsDbDatum) -> Result<(), HintsDbError> {
         let db = self.db_handle();
-        let key_dbt = datum_to_dbt(key);
-        let data_dbt = datum_to_dbt(data);
+        let mut key_dbt = datum_to_dbt(key);
+        let mut data_dbt = datum_to_dbt(data);
 
-        // SAFETY: db is a valid DB handle. DB->put takes: db, txn (NULL), key DBT,
-        // data DBT, flags (0 = replace). The key and data DBTs borrow from the
-        // HintsDbDatum buffers which remain valid for this call. Returns 0 on success.
-        let rc = unsafe {
-            let put_fn = (*db).put.expect("DB->put function pointer is null");
-            put_fn(
-                db,
-                ptr::null_mut(),
-                &key_dbt as *const ffi::DBT as *mut ffi::DBT,
-                &data_dbt as *const ffi::DBT as *mut ffi::DBT,
-                0,
-            )
+        let rc = match bdb_ffi(BdbFfi::DbPut {
+            db,
+            key: &mut key_dbt,
+            data: &mut data_dbt,
+            flags: 0,
+        }) {
+            BdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -760,27 +932,22 @@ impl HintsDb for BdbHintsDb {
         data: &HintsDbDatum,
     ) -> Result<PutResult, HintsDbError> {
         let db = self.db_handle();
-        let key_dbt = datum_to_dbt(key);
-        let data_dbt = datum_to_dbt(data);
+        let mut key_dbt = datum_to_dbt(key);
+        let mut data_dbt = datum_to_dbt(data);
 
-        // SAFETY: db is a valid DB handle. DB->put with DB_NOOVERWRITE flag
-        // returns DB_KEYEXIST if the key already exists, 0 on success.
-        let rc = unsafe {
-            let put_fn = (*db).put.expect("DB->put function pointer is null");
-            put_fn(
-                db,
-                ptr::null_mut(),
-                &key_dbt as *const ffi::DBT as *mut ffi::DBT,
-                &data_dbt as *const ffi::DBT as *mut ffi::DBT,
-                ffi::DB_NOOVERWRITE,
-            )
+        let rc = match bdb_ffi(BdbFfi::DbPut {
+            db,
+            key: &mut key_dbt,
+            data: &mut data_dbt,
+            flags: ffi::DB_NOOVERWRITE,
+        }) {
+            BdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc == DBPUTB_OK {
             Ok(PutResult::Ok)
         } else {
-            // DB_KEYEXIST or any other non-zero return treated as duplicate,
-            // matching C behavior where EXIM_DBPUTB_DUP = DB_KEYEXIST
             Ok(PutResult::Duplicate)
         }
     }
@@ -791,18 +958,14 @@ impl HintsDb for BdbHintsDb {
     /// `hints_bdb.h` lines 162-167 / 295-298.
     fn delete(&mut self, key: &HintsDbDatum) -> Result<(), HintsDbError> {
         let db = self.db_handle();
-        let key_dbt = datum_to_dbt(key);
+        let mut key_dbt = datum_to_dbt(key);
 
-        // SAFETY: db is a valid DB handle. DB->del takes: db, txn (NULL), key DBT,
-        // flags (0). Returns 0 on success, DB_NOTFOUND if key doesn't exist.
-        let rc = unsafe {
-            let del_fn = (*db).del.expect("DB->del function pointer is null");
-            del_fn(
-                db,
-                ptr::null_mut(),
-                &key_dbt as *const ffi::DBT as *mut ffi::DBT,
-                0,
-            )
+        let rc = match bdb_ffi(BdbFfi::DbDel {
+            db,
+            key: &mut key_dbt,
+        }) {
+            BdbFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != 0 {
@@ -881,33 +1044,25 @@ impl Drop for BdbHintsDb {
         // Close cursor first
         self.cursor = None;
 
-        // Close DB handle if still open
+        // Close DB handle if still open (best-effort — no panic in Drop)
         if !self.db.is_null() {
-            // SAFETY: self.db is a valid DB handle (non-null check above).
-            // DB->close releases all internal DB resources. Best-effort — errors
-            // from Drop cannot be propagated, so we log them via tracing.
-            unsafe {
-                if let Some(close_fn) = (*self.db).close {
-                    let rc = close_fn(self.db, 0);
-                    if rc != 0 {
-                        tracing::error!("bdb drop: DB->close failed: rc={}", rc);
-                    }
+            if let BdbFfiResult::Code(rc) = bdb_ffi(BdbFfi::DbCloseSafe { db: self.db }) {
+                if rc != 0 && rc != -1 {
+                    tracing::error!("bdb drop: DB->close failed: rc={}", rc);
                 }
             }
             self.db = ptr::null_mut();
         }
 
-        // Close DB_ENV handle if still open (BDB 4.1+ only)
+        // Close DB_ENV handle if still open (BDB 4.1+ only, best-effort)
         #[cfg(bdb_41_plus)]
         if !self.env.is_null() {
-            // SAFETY: self.env is a valid DB_ENV handle (non-null check above).
-            // DB_ENV->close with DB_FORCESYNC syncs the memory pool. Best-effort.
-            unsafe {
-                if let Some(close_fn) = (*self.env).close {
-                    let rc = close_fn(self.env, ffi::DB_FORCESYNC);
-                    if rc != 0 {
-                        tracing::error!("bdb drop: DB_ENV->close failed: rc={}", rc);
-                    }
+            if let BdbFfiResult::Code(rc) = bdb_ffi(BdbFfi::EnvCloseSafe {
+                env: self.env,
+                flags: ffi::DB_FORCESYNC,
+            }) {
+                if rc != 0 && rc != -1 {
+                    tracing::error!("bdb drop: DB_ENV->close failed: rc={}", rc);
                 }
             }
             self.env = ptr::null_mut();

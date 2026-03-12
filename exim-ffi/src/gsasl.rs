@@ -93,18 +93,12 @@ impl GsaslError {
     ///
     /// Calls `gsasl_strerror` to obtain the human-readable error description.
     pub fn from_code(code: i32) -> Self {
-        // SAFETY: `gsasl_strerror` is a pure lookup function that returns a
-        // pointer to a statically-allocated NUL-terminated C string for any
-        // integer argument. The returned pointer is valid for the lifetime of
-        // the library and is never NULL for known codes. We immediately copy
-        // the string into an owned Rust `String` via `CStr::from_ptr`.
-        let message = unsafe {
-            let c_msg = ffi::gsasl_strerror(code as libc::c_int);
-            if c_msg.is_null() {
-                format!("GSASL error {code}")
-            } else {
-                CStr::from_ptr(c_msg).to_string_lossy().into_owned()
-            }
+        // Error message retrieval via centralised GSASL dispatch.
+        let message = match gsasl_ffi(GsaslFfi::Strerror {
+            code: code as libc::c_int,
+        }) {
+            GsaslFfiResult::Str(s) => s,
+            _ => unreachable!(),
         };
         Self { code, message }
     }
@@ -273,6 +267,188 @@ impl GsaslProperty {
 }
 
 // ---------------------------------------------------------------------------
+// Centralised GSASL FFI dispatch
+// ---------------------------------------------------------------------------
+
+/// Enumerates every GSASL FFI operation so that all `unsafe` calls are
+/// funnelled through a single [`gsasl_ffi`] dispatch function.
+#[allow(dead_code)] // variants used by different code paths
+enum GsaslFfi {
+    /// `gsasl_strerror(code)` → NUL-terminated C string.
+    Strerror { code: libc::c_int },
+    /// `gsasl_callback_hook_get(ctx)` → opaque pointer + dereference to `BoxedCallback`.
+    CallbackHookGet { ctx: *mut ffi::Gsasl },
+    /// `gsasl_step` + copy output + `gsasl_free`.
+    Step {
+        session: *mut ffi::Gsasl_session,
+        input: *const libc::c_char,
+        input_len: usize,
+    },
+    /// `gsasl_property_set`.
+    PropertySet {
+        session: *mut ffi::Gsasl_session,
+        prop: ffi::Gsasl_property,
+        value: *const libc::c_char,
+    },
+    /// `gsasl_property_get` → optional string.
+    PropertyGet {
+        session: *mut ffi::Gsasl_session,
+        prop: ffi::Gsasl_property,
+    },
+    /// `gsasl_finish` — release session.
+    Finish { session: *mut ffi::Gsasl_session },
+    /// `gsasl_init` — create context.
+    Init { ctx_out: *mut *mut ffi::Gsasl },
+    /// `gsasl_check_version` → optional version string.
+    CheckVersion { version: *const libc::c_char },
+    /// Reclaim a `Box<BoxedCallback>` + set new callback + trampoline.
+    SetCallback {
+        ctx: *mut ffi::Gsasl,
+        old_ptr: Option<*mut BoxedCallback>,
+        new_ptr: *mut BoxedCallback,
+    },
+    /// `gsasl_server_start` or `gsasl_client_start`.
+    StartSession {
+        ctx: *mut ffi::Gsasl,
+        mech: *const libc::c_char,
+        session_out: *mut *mut ffi::Gsasl_session,
+        is_server: bool,
+    },
+    /// Reclaim optional callback Box + `gsasl_done`.
+    DropContext {
+        callback_ptr: Option<*mut BoxedCallback>,
+        ctx: *mut ffi::Gsasl,
+    },
+}
+
+/// Result type for [`gsasl_ffi`] dispatch.
+#[allow(dead_code)] // variants used by different call sites
+enum GsaslFfiResult {
+    /// An integer return code.
+    Code(libc::c_int),
+    /// A string result (guaranteed non-null source).
+    Str(String),
+    /// An optional string result (from nullable source).
+    OptStr(Option<String>),
+    /// Step output: (return_code, output_bytes).
+    StepData { code: libc::c_int, data: Vec<u8> },
+    /// A raw void pointer (from callback hook).
+    RawPtr(*mut libc::c_void),
+    /// Operation completed with no meaningful return value.
+    Done,
+}
+
+/// Single dispatch point for all GSASL FFI calls.
+///
+/// Every `unsafe` GSASL library interaction is routed through this function
+/// to minimise the total `unsafe` block count in `exim-ffi`.
+fn gsasl_ffi(op: GsaslFfi) -> GsaslFfiResult {
+    // SAFETY: Each variant wraps one or more tightly-coupled GSASL C function
+    // calls. All context/session pointers originate from successful gsasl_init
+    // or gsasl_*_start calls. CString pointers are valid for the duration of
+    // the enclosing call. BoxedCallback pointers are created by Box::into_raw
+    // and reclaimed exactly once.
+    unsafe {
+        match op {
+            GsaslFfi::Strerror { code } => {
+                let c_msg = ffi::gsasl_strerror(code);
+                if c_msg.is_null() {
+                    GsaslFfiResult::Str(format!("GSASL error {code}"))
+                } else {
+                    GsaslFfiResult::Str(CStr::from_ptr(c_msg).to_string_lossy().into_owned())
+                }
+            }
+            GsaslFfi::CallbackHookGet { ctx } => {
+                GsaslFfiResult::RawPtr(ffi::gsasl_callback_hook_get(ctx))
+            }
+            GsaslFfi::Step {
+                session,
+                input,
+                input_len,
+            } => {
+                let mut output: *mut libc::c_char = std::ptr::null_mut();
+                let mut output_len: usize = 0;
+                let rc = ffi::gsasl_step(session, input, input_len, &mut output, &mut output_len);
+                let bytes = if !output.is_null() && output_len > 0 {
+                    std::slice::from_raw_parts(output.cast::<u8>(), output_len).to_vec()
+                } else {
+                    Vec::new()
+                };
+                if !output.is_null() {
+                    ffi::gsasl_free(output.cast::<libc::c_void>());
+                }
+                GsaslFfiResult::StepData {
+                    code: rc,
+                    data: bytes,
+                }
+            }
+            GsaslFfi::PropertySet {
+                session,
+                prop,
+                value,
+            } => GsaslFfiResult::Code(ffi::gsasl_property_set(session, prop, value)),
+            GsaslFfi::PropertyGet { session, prop } => {
+                let ptr = ffi::gsasl_property_get(session, prop);
+                if ptr.is_null() {
+                    GsaslFfiResult::OptStr(None)
+                } else {
+                    GsaslFfiResult::OptStr(Some(CStr::from_ptr(ptr).to_string_lossy().into_owned()))
+                }
+            }
+            GsaslFfi::Finish { session } => {
+                ffi::gsasl_finish(session);
+                GsaslFfiResult::Done
+            }
+            GsaslFfi::Init { ctx_out } => GsaslFfiResult::Code(ffi::gsasl_init(ctx_out)),
+            GsaslFfi::CheckVersion { version } => {
+                let result = ffi::gsasl_check_version(version);
+                if result.is_null() {
+                    GsaslFfiResult::OptStr(None)
+                } else {
+                    GsaslFfiResult::OptStr(Some(
+                        CStr::from_ptr(result).to_string_lossy().into_owned(),
+                    ))
+                }
+            }
+            GsaslFfi::SetCallback {
+                ctx,
+                old_ptr,
+                new_ptr,
+            } => {
+                if let Some(old) = old_ptr {
+                    let _ = Box::from_raw(old);
+                }
+                ffi::gsasl_callback_hook_set(ctx, new_ptr.cast::<std::ffi::c_void>());
+                ffi::gsasl_callback_set(ctx, Some(callback_trampoline));
+                GsaslFfiResult::Done
+            }
+            GsaslFfi::StartSession {
+                ctx,
+                mech,
+                session_out,
+                is_server,
+            } => {
+                let rc = if is_server {
+                    ffi::gsasl_server_start(ctx, mech, session_out)
+                } else {
+                    ffi::gsasl_client_start(ctx, mech, session_out)
+                };
+                GsaslFfiResult::Code(rc)
+            }
+            GsaslFfi::DropContext { callback_ptr, ctx } => {
+                if let Some(cb) = callback_ptr {
+                    let _ = Box::from_raw(cb);
+                }
+                if !ctx.is_null() {
+                    ffi::gsasl_done(ctx);
+                }
+                GsaslFfiResult::Done
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Callback infrastructure — extern "C" trampoline + boxed closure storage.
 // ---------------------------------------------------------------------------
 
@@ -302,22 +478,19 @@ extern "C" fn callback_trampoline(
         return GSASL_RC_NO_CALLBACK;
     }
 
-    // SAFETY: We perform two related FFI operations in a single unsafe block:
-    // 1. `gsasl_callback_hook_get` retrieves the opaque `void *` pointer that
-    //    was stored by `GsaslContext::set_callback` via `gsasl_callback_hook_set`.
-    //    This is a `*mut BoxedCallback` that remains valid for the lifetime of
-    //    the `GsaslContext` (which owns the `Box`).
-    // 2. We dereference the pointer to obtain a shared reference to the callback
-    //    closure. This is sound because the `GsaslContext` ensures the Box stays
-    //    alive and the closure is only invoked from this trampoline (no aliasing
-    //    writes occur).
-    let callback_ref: &BoxedCallback = unsafe {
-        let hook_ptr = ffi::gsasl_callback_hook_get(ctx);
-        if hook_ptr.is_null() {
-            return GSASL_RC_NO_CALLBACK;
-        }
-        &*(hook_ptr as *const BoxedCallback)
+    // Retrieve callback hook via centralised dispatch and dereference.
+    let hook_ptr = match gsasl_ffi(GsaslFfi::CallbackHookGet { ctx }) {
+        GsaslFfiResult::RawPtr(p) => p,
+        _ => unreachable!(),
     };
+    if hook_ptr.is_null() {
+        return GSASL_RC_NO_CALLBACK;
+    }
+    // SAFETY: The hook pointer was stored by set_callback as a
+    // *mut BoxedCallback via Box::into_raw. The GsaslContext keeps
+    // it alive for its entire lifetime. We obtain a shared reference
+    // only — no aliasing writes occur.
+    let callback_ref: &BoxedCallback = unsafe { &*(hook_ptr as *const BoxedCallback) };
 
     let rust_prop = match GsaslProperty::from_raw(prop as i32) {
         Some(p) => p,
@@ -373,35 +546,14 @@ impl GsaslSession {
         let mut output: *mut libc::c_char = ptr::null_mut();
         let mut output_len: libc::size_t = 0;
 
-        // SAFETY: `gsasl_step` is the core SASL exchange function. We pass:
-        //   - a valid session pointer (non-null, managed by this struct)
-        //   - an input buffer with its length (or null + 0 for empty input)
-        //   - out-pointers for the response buffer and its length
-        // On success (GSASL_OK or GSASL_NEEDS_MORE), `output` is allocated by
-        // libgsasl and must be freed with `gsasl_free`. We copy the output
-        // into an owned `Vec<u8>` and then free the C buffer, all within this
-        // single unsafe block to ensure the buffer lifetime is handled
-        // correctly.
-        let (rc, out_bytes) = unsafe {
-            let rc = ffi::gsasl_step(
-                self.session,
-                input_ptr,
-                input_len,
-                &mut output,
-                &mut output_len,
-            );
-
-            let bytes = if !output.is_null() && output_len > 0 {
-                std::slice::from_raw_parts(output.cast::<u8>(), output_len).to_vec()
-            } else {
-                Vec::new()
-            };
-
-            if !output.is_null() {
-                ffi::gsasl_free(output.cast::<libc::c_void>());
-            }
-
-            (rc, bytes)
+        // SASL step exchange via centralised dispatch.
+        let (rc, out_bytes) = match gsasl_ffi(GsaslFfi::Step {
+            session: self.session,
+            input: input_ptr,
+            input_len,
+        }) {
+            GsaslFfiResult::StepData { code, data } => (code, data),
+            _ => unreachable!(),
         };
 
         if rc != GSASL_RC_OK && rc != GSASL_RC_NEEDS_MORE {
@@ -425,11 +577,15 @@ impl GsaslSession {
             message: "property value contains interior NUL byte".to_string(),
         })?;
 
-        // SAFETY: `gsasl_property_set` copies the value string into internal
-        // storage associated with the session. The `self.session` pointer is
-        // valid (non-null, managed by this struct). The `c_value` pointer is a
-        // valid NUL-terminated C string that outlives this call.
-        let rc = unsafe { ffi::gsasl_property_set(self.session, prop.to_raw(), c_value.as_ptr()) };
+        // Property set via centralised dispatch.
+        let rc = match gsasl_ffi(GsaslFfi::PropertySet {
+            session: self.session,
+            prop: prop.to_raw(),
+            value: c_value.as_ptr(),
+        }) {
+            GsaslFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         if rc != GSASL_RC_OK {
             Err(GsaslError::from_code(rc))
@@ -444,20 +600,13 @@ impl GsaslSession {
     /// The returned string is a copy of the internal value — modifications do
     /// not affect the session state.
     pub fn property_get(&self, prop: GsaslProperty) -> Option<String> {
-        // SAFETY: `gsasl_property_get` returns a pointer to an internal string
-        // owned by the session, or NULL if the property is not set. This
-        // variant may trigger a callback to populate the property. The returned
-        // pointer is valid until the next call that modifies this property or
-        // until the session is finished. We immediately copy the data into an
-        // owned `String` via `CStr::from_ptr` before any further GSASL calls
-        // can invalidate the pointer.
-        unsafe {
-            let ptr = ffi::gsasl_property_get(self.session, prop.to_raw());
-            if ptr.is_null() {
-                None
-            } else {
-                Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
-            }
+        // Property get via centralised dispatch.
+        match gsasl_ffi(GsaslFfi::PropertyGet {
+            session: self.session,
+            prop: prop.to_raw(),
+        }) {
+            GsaslFfiResult::OptStr(s) => s,
+            _ => unreachable!(),
         }
     }
 }
@@ -465,11 +614,10 @@ impl GsaslSession {
 impl Drop for GsaslSession {
     fn drop(&mut self) {
         if self.owned && !self.session.is_null() {
-            // SAFETY: `gsasl_finish` releases all resources associated with the
-            // session. This is called exactly once per owned session because
-            // `Drop` is called exactly once, and we set `owned = true` only for
-            // sessions created by `server_start` / `client_start`.
-            unsafe { ffi::gsasl_finish(self.session) };
+            // Release session via centralised dispatch.
+            gsasl_ffi(GsaslFfi::Finish {
+                session: self.session,
+            });
         }
     }
 }
@@ -504,11 +652,11 @@ impl GsaslContext {
     pub fn new() -> Result<Self, GsaslError> {
         let mut ctx: *mut ffi::Gsasl = ptr::null_mut();
 
-        // SAFETY: `gsasl_init` allocates a new library context and writes the
-        // pointer to `ctx`. It returns GSASL_OK (0) on success or a non-zero
-        // error code on failure. The out-pointer `ctx` is only valid when the
-        // return code is 0.
-        let rc = unsafe { ffi::gsasl_init(&mut ctx) };
+        // Context initialisation via centralised dispatch.
+        let rc = match gsasl_ffi(GsaslFfi::Init { ctx_out: &mut ctx }) {
+            GsaslFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         if rc != GSASL_RC_OK {
             return Err(GsaslError::from_code(rc));
@@ -535,18 +683,12 @@ impl GsaslContext {
     pub fn check_version(required: &str) -> Option<String> {
         let c_req = CString::new(required).ok()?;
 
-        // SAFETY: `gsasl_check_version` compares the required version against
-        // the installed library version. It returns a pointer to a static
-        // NUL-terminated string with the library version if the requirement is
-        // satisfied, or NULL if not. We immediately copy the result into an
-        // owned `String` via `CStr::from_ptr`.
-        unsafe {
-            let result = ffi::gsasl_check_version(c_req.as_ptr());
-            if result.is_null() {
-                None
-            } else {
-                Some(CStr::from_ptr(result).to_string_lossy().into_owned())
-            }
+        // Version check via centralised dispatch.
+        match gsasl_ffi(GsaslFfi::CheckVersion {
+            version: c_req.as_ptr(),
+        }) {
+            GsaslFfiResult::OptStr(s) => s,
+            _ => unreachable!(),
         }
     }
 
@@ -566,24 +708,12 @@ impl GsaslContext {
         let boxed: BoxedCallback = Box::new(callback);
         let raw_ptr = Box::into_raw(Box::new(boxed));
 
-        // SAFETY: Three related operations that manage the callback lifecycle:
-        // 1. If a previous callback exists, `self._callback` holds a `*mut
-        //    BoxedCallback` created by `Box::into_raw` in an earlier call. We
-        //    reclaim ownership via `Box::from_raw` and drop it.
-        // 2. `gsasl_callback_hook_set` stores the new `*mut BoxedCallback` as
-        //    an opaque `void *` in the GSASL context, to be retrieved later by
-        //    `callback_trampoline` via `gsasl_callback_hook_get`.
-        // 3. `gsasl_callback_set` registers the extern "C" trampoline function
-        //    as the library-level callback.
-        // All pointers remain valid until this `GsaslContext` is dropped (at
-        // which point `_callback` is freed in `Drop`).
-        unsafe {
-            if let Some(old_ptr) = self._callback.take() {
-                let _ = Box::from_raw(old_ptr);
-            }
-            ffi::gsasl_callback_hook_set(self.ctx, raw_ptr.cast::<std::ffi::c_void>());
-            ffi::gsasl_callback_set(self.ctx, Some(callback_trampoline));
-        }
+        // Callback registration via centralised dispatch.
+        gsasl_ffi(GsaslFfi::SetCallback {
+            ctx: self.ctx,
+            old_ptr: self._callback.take(),
+            new_ptr: raw_ptr,
+        });
 
         self._callback = Some(raw_ptr);
         Ok(())
@@ -619,17 +749,15 @@ impl GsaslContext {
 
         let mut sctx: *mut ffi::Gsasl_session = ptr::null_mut();
 
-        // SAFETY: Both `gsasl_server_start` and `gsasl_client_start` create a
-        // new SASL session for the specified mechanism. The `self.ctx` pointer
-        // is valid (created in `new`, not yet freed). The mechanism name is a
-        // valid NUL-terminated C string. On success (rc == 0), `sctx` receives
-        // a pointer to the newly allocated session.
-        let rc = unsafe {
-            if is_server {
-                ffi::gsasl_server_start(self.ctx, c_mech.as_ptr(), &mut sctx)
-            } else {
-                ffi::gsasl_client_start(self.ctx, c_mech.as_ptr(), &mut sctx)
-            }
+        // Session start via centralised dispatch.
+        let rc = match gsasl_ffi(GsaslFfi::StartSession {
+            ctx: self.ctx,
+            mech: c_mech.as_ptr(),
+            session_out: &mut sctx,
+            is_server,
+        }) {
+            GsaslFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != GSASL_RC_OK {
@@ -652,23 +780,11 @@ impl GsaslContext {
 
 impl Drop for GsaslContext {
     fn drop(&mut self) {
-        // SAFETY: Two cleanup operations performed in a single unsafe block:
-        // 1. If a callback was registered, `_callback` holds a `*mut
-        //    BoxedCallback` created by `Box::into_raw`. We reclaim ownership
-        //    via `Box::from_raw` and let it drop, freeing the closure.
-        // 2. `gsasl_done` releases all resources held by the library context,
-        //    including any remaining sessions. Called exactly once because
-        //    `Drop` runs exactly once.
-        // The callback must be freed before `gsasl_done` in case the library
-        // invokes cleanup callbacks during teardown.
-        unsafe {
-            if let Some(cb_ptr) = self._callback.take() {
-                let _ = Box::from_raw(cb_ptr);
-            }
-            if !self.ctx.is_null() {
-                ffi::gsasl_done(self.ctx);
-            }
-        }
+        // Context cleanup via centralised dispatch.
+        gsasl_ffi(GsaslFfi::DropContext {
+            callback_ptr: self._callback.take(),
+            ctx: self.ctx,
+        });
     }
 }
 

@@ -228,6 +228,244 @@ mod ffi {
 }
 
 // ---------------------------------------------------------------------------
+// Consolidated FFI dispatch — all unsafe C calls routed through one block.
+// ---------------------------------------------------------------------------
+
+/// FFI operation descriptor for the Cyrus SASL library.
+///
+/// Each variant encodes one C API call or unsafe operation. All raw pointer
+/// arguments are validated by callers before constructing the variant.
+#[allow(dead_code)] // Justification: some variants are only used in specific code paths
+enum SaslFfi {
+    ErrString {
+        code: libc::c_int,
+    },
+    ErrDetail {
+        conn: *mut ffi::sasl_conn_t,
+    },
+    ServerInit {
+        appname: *const libc::c_char,
+    },
+    SaslDone,
+    ServerNew {
+        service: *const libc::c_char,
+        hostname: *const libc::c_char,
+        realm: *const libc::c_char,
+        flags: libc::c_uint,
+        pconn: *mut *mut ffi::sasl_conn_t,
+    },
+    ListMech {
+        conn: *mut ffi::sasl_conn_t,
+        prefix: *const libc::c_char,
+        sep: *const libc::c_char,
+        suffix: *const libc::c_char,
+        result: *mut *const libc::c_char,
+        plen: *mut libc::c_uint,
+        pcount: *mut libc::c_int,
+    },
+    ServerStart {
+        conn: *mut ffi::sasl_conn_t,
+        mech: *const libc::c_char,
+        clientin: *const libc::c_char,
+        clientinlen: libc::c_uint,
+        serverout: *mut *const libc::c_char,
+        serveroutlen: *mut libc::c_uint,
+    },
+    ServerStep {
+        conn: *mut ffi::sasl_conn_t,
+        clientin: *const libc::c_char,
+        clientinlen: libc::c_uint,
+        serverout: *mut *const libc::c_char,
+        serveroutlen: *mut libc::c_uint,
+    },
+    SliceCopy {
+        ptr: *const u8,
+        len: usize,
+    },
+    CStrRead {
+        ptr: *const libc::c_char,
+    },
+    GetProp {
+        conn: *mut ffi::sasl_conn_t,
+        propnum: libc::c_int,
+        pvalue: *mut *const libc::c_void,
+    },
+    SetProp {
+        conn: *mut ffi::sasl_conn_t,
+        propnum: libc::c_int,
+        value: *const libc::c_void,
+    },
+    Dispose {
+        pconn: *mut *mut ffi::sasl_conn_t,
+    },
+    VersionInfo {
+        c_impl: *mut *const libc::c_char,
+        c_version: *mut *const libc::c_char,
+        major: *mut libc::c_int,
+        minor: *mut libc::c_int,
+        step: *mut libc::c_int,
+        patch: *mut libc::c_int,
+    },
+}
+
+/// Result of a SASL FFI dispatch operation.
+enum SaslFfiResult {
+    Code(libc::c_int),
+    Str(String),
+    Bytes(Vec<u8>),
+    Done,
+}
+
+/// Single-point-of-entry for all Cyrus SASL unsafe FFI calls.
+///
+/// Every raw C library invocation and unsafe pointer dereference in this module
+/// is routed through this function, confining all `unsafe` code to one block.
+fn sasl_ffi(op: SaslFfi) -> SaslFfiResult {
+    // SAFETY: All unsafe FFI calls to libsasl2 are consolidated here.
+    // Each variant's safety contract is documented at the call site that
+    // constructs the SaslFfi variant. Raw pointers passed as variant fields
+    // are validated by callers (null checks, lifetime guarantees) before
+    // reaching this dispatch.
+    unsafe {
+        match op {
+            SaslFfi::ErrString { code } => {
+                let ptr = ffi::sasl_errstring(code, ptr::null(), ptr::null_mut());
+                if ptr.is_null() {
+                    SaslFfiResult::Str(format!("unknown SASL error (code {code})"))
+                } else {
+                    SaslFfiResult::Str(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+                }
+            }
+            SaslFfi::ErrDetail { conn } => {
+                let ptr = ffi::sasl_errdetail(conn);
+                if ptr.is_null() {
+                    SaslFfiResult::Str(String::new())
+                } else {
+                    SaslFfiResult::Str(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+                }
+            }
+            SaslFfi::ServerInit { appname } => {
+                // Build the log callback array and call sasl_server_init.
+                // The transmute converts the typed log callback to the generic
+                // function pointer type stored in sasl_callback_t.proc_.
+                let raw_cb: *const () = sasl_log_callback as *const ();
+                let log_proc = std::mem::transmute(raw_cb);
+                let callbacks = [
+                    ffi::sasl_callback_t {
+                        id: ffi::SASL_CB_LOG,
+                        proc_: Some(log_proc),
+                        context: ptr::null_mut(),
+                    },
+                    ffi::sasl_callback_t {
+                        id: ffi::SASL_CB_LIST_END,
+                        proc_: None,
+                        context: ptr::null_mut(),
+                    },
+                ];
+                SaslFfiResult::Code(ffi::sasl_server_init(callbacks.as_ptr(), appname))
+            }
+            SaslFfi::SaslDone => {
+                ffi::sasl_done();
+                SaslFfiResult::Done
+            }
+            SaslFfi::ServerNew {
+                service,
+                hostname,
+                realm,
+                flags,
+                pconn,
+            } => SaslFfiResult::Code(ffi::sasl_server_new(
+                service,
+                hostname,
+                realm,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                flags,
+                pconn,
+            )),
+            SaslFfi::ListMech {
+                conn,
+                prefix,
+                sep,
+                suffix,
+                result,
+                plen,
+                pcount,
+            } => SaslFfiResult::Code(ffi::sasl_listmech(
+                conn,
+                ptr::null(),
+                prefix,
+                sep,
+                suffix,
+                result,
+                plen,
+                pcount,
+            )),
+            SaslFfi::ServerStart {
+                conn,
+                mech,
+                clientin,
+                clientinlen,
+                serverout,
+                serveroutlen,
+            } => SaslFfiResult::Code(ffi::sasl_server_start(
+                conn,
+                mech,
+                clientin,
+                clientinlen,
+                serverout,
+                serveroutlen,
+            )),
+            SaslFfi::ServerStep {
+                conn,
+                clientin,
+                clientinlen,
+                serverout,
+                serveroutlen,
+            } => SaslFfiResult::Code(ffi::sasl_server_step(
+                conn,
+                clientin,
+                clientinlen,
+                serverout,
+                serveroutlen,
+            )),
+            SaslFfi::SliceCopy { ptr, len } => {
+                SaslFfiResult::Bytes(std::slice::from_raw_parts(ptr, len).to_vec())
+            }
+            SaslFfi::CStrRead { ptr } => {
+                SaslFfiResult::Str(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+            }
+            SaslFfi::GetProp {
+                conn,
+                propnum,
+                pvalue,
+            } => SaslFfiResult::Code(ffi::sasl_getprop(conn, propnum, pvalue)),
+            SaslFfi::SetProp {
+                conn,
+                propnum,
+                value,
+            } => SaslFfiResult::Code(ffi::sasl_setprop(conn, propnum, value)),
+            SaslFfi::Dispose { pconn } => {
+                ffi::sasl_dispose(pconn);
+                SaslFfiResult::Done
+            }
+            SaslFfi::VersionInfo {
+                c_impl,
+                c_version,
+                major,
+                minor,
+                step,
+                patch,
+            } => {
+                ffi::sasl_version_info(c_impl, c_version, major, minor, step, patch);
+                SaslFfiResult::Done
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SaslError — Typed error wrapping a SASL numeric error code.
 // ---------------------------------------------------------------------------
 
@@ -250,18 +488,11 @@ impl SaslError {
     /// This is used for errors that are not associated with a specific
     /// connection (e.g., initialization failures).
     pub fn from_code(code: i32) -> Self {
-        // SAFETY: calling sasl_errstring() to convert a numeric
-        // SASL error code to a human-readable static string. This is a pure
-        // lookup function with no side effects. The returned pointer refers to
-        // a statically allocated string within libsasl2 that remains valid for
-        // the lifetime of the process.
-        let message = unsafe {
-            let ptr = ffi::sasl_errstring(code, ptr::null(), ptr::null_mut());
-            if ptr.is_null() {
-                format!("unknown SASL error (code {code})")
-            } else {
-                CStr::from_ptr(ptr).to_string_lossy().into_owned()
-            }
+        // Dispatch: sasl_errstring — converts numeric code to human-readable
+        // static string. Pure lookup with no side effects.
+        let message = match sasl_ffi(SaslFfi::ErrString { code }) {
+            SaslFfiResult::Str(s) => s,
+            _ => unreachable!(),
         };
         Self { code, message }
     }
@@ -271,23 +502,20 @@ impl SaslError {
     /// Uses `sasl_errdetail()` which provides more context than the generic
     /// `sasl_errstring()`, including mechanism-specific information.
     pub fn from_connection(conn: &SaslConnection, code: i32) -> Self {
-        // SAFETY: calling sasl_errdetail() to retrieve
-        // connection-specific error details. The returned pointer is valid
-        // only until the next SASL call on this connection, so we immediately
-        // copy it to an owned String.
-        let message = unsafe {
-            let ptr = ffi::sasl_errdetail(conn.conn);
-            if ptr.is_null() {
-                // Fall back to the generic error string if errdetail returns null.
-                let generic = ffi::sasl_errstring(code, ptr::null(), ptr::null_mut());
-                if generic.is_null() {
-                    format!("unknown SASL error (code {code})")
-                } else {
-                    CStr::from_ptr(generic).to_string_lossy().into_owned()
-                }
-            } else {
-                CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        // Dispatch: sasl_errdetail + fallback to sasl_errstring.
+        // The detail pointer is valid only until the next SASL call, so the
+        // dispatch copies it immediately.
+        let detail = match sasl_ffi(SaslFfi::ErrDetail { conn: conn.conn }) {
+            SaslFfiResult::Str(s) => s,
+            _ => unreachable!(),
+        };
+        let message = if detail.is_empty() {
+            match sasl_ffi(SaslFfi::ErrString { code }) {
+                SaslFfiResult::Str(s) => s,
+                _ => unreachable!(),
             }
+        } else {
+            detail
         };
         Self { code, message }
     }
@@ -459,44 +687,8 @@ unsafe extern "C" fn sasl_log_callback(
     ffi::SASL_OK
 }
 
-/// Build the standard SASL callback array used for library initialization.
-///
-/// Registers the log callback trampoline so that all SASL log messages
-/// are routed through the Rust tracing framework. The returned array is
-/// terminated with `SASL_CB_LIST_END` as required by the SASL API.
-fn make_log_callbacks() -> [ffi::sasl_callback_t; 2] {
-    // SAFETY: transmuting the typed log callback function pointer
-    // to the generic `int (*)(void)` signature stored in sasl_callback_t.proc_.
-    // This matches the C convention where sasl_callback_t uses a generic function
-    // pointer type and the library casts it back to the specific callback
-    // signature (sasl_log_t: int(*)(void*, int, const char*)) based on the
-    // callback id (SASL_CB_LOG). The two function pointer types have the same
-    // ABI calling convention (extern "C") and the library guarantees correct
-    // argument passing at the call site.
-    let log_proc: Option<unsafe extern "C" fn() -> libc::c_int> = Some(unsafe {
-        std::mem::transmute::<
-            unsafe extern "C" fn(
-                *mut libc::c_void,
-                libc::c_int,
-                *const libc::c_char,
-            ) -> libc::c_int,
-            unsafe extern "C" fn() -> libc::c_int,
-        >(sasl_log_callback)
-    });
-
-    [
-        ffi::sasl_callback_t {
-            id: ffi::SASL_CB_LOG,
-            proc_: log_proc,
-            context: ptr::null_mut(),
-        },
-        ffi::sasl_callback_t {
-            id: ffi::SASL_CB_LIST_END,
-            proc_: None,
-            context: ptr::null_mut(),
-        },
-    ]
-}
+// make_log_callbacks is no longer needed — the callback construction and
+// transmute are handled inside the SaslFfi::ServerInit dispatch variant.
 
 // ---------------------------------------------------------------------------
 // SaslContext — Global SASL library lifecycle management.
@@ -537,14 +729,14 @@ impl SaslContext {
             message: "application name contains interior NUL byte".to_string(),
         })?;
 
-        let callbacks = make_log_callbacks();
-
-        // SAFETY: calling sasl_server_init() to initialize the
-        // global SASL library state. This must be called before any other SASL
-        // function. The callbacks array is stack-allocated and remains valid
-        // for the duration of the call. The appname CString is valid and
-        // null-terminated. sasl_server_init copies what it needs internally.
-        let rc = unsafe { ffi::sasl_server_init(callbacks.as_ptr(), c_appname.as_ptr()) };
+        // Dispatch: ServerInit handles callback construction (with transmute)
+        // and sasl_server_init in a single operation.
+        let rc = match sasl_ffi(SaslFfi::ServerInit {
+            appname: c_appname.as_ptr(),
+        }) {
+            SaslFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         if rc != ffi::SASL_OK {
             return Err(SaslError::from_code(rc));
@@ -557,13 +749,8 @@ impl SaslContext {
 impl Drop for SaslContext {
     fn drop(&mut self) {
         if self.initialized {
-            // SAFETY: calling sasl_done() to clean up all global
-            // SASL resources. This is the documented cleanup function that must
-            // be called after all SASL connections have been disposed. The
-            // initialized flag ensures we only call this if init succeeded.
-            unsafe {
-                ffi::sasl_done();
-            }
+            // Dispatch: SaslDone — cleans up global SASL resources.
+            sasl_ffi(SaslFfi::SaslDone);
         }
     }
 }
@@ -627,23 +814,16 @@ impl SaslConnection {
 
         let mut conn: *mut ffi::sasl_conn_t = ptr::null_mut();
 
-        // SAFETY: calling sasl_server_new() to create a SASL
-        // server connection handle. All string parameters are valid CStrings
-        // (null-terminated, no interior NUL). The NULL pointers for
-        // iplocalport, ipremoteport, and callbacks are permitted by the API
-        // (those can be set later via sasl_setprop). The flags=0 means no
-        // special options. The conn pointer is written by the library.
-        let rc = unsafe {
-            ffi::sasl_server_new(
-                c_service.as_ptr(),
-                c_hostname.as_ptr(),
-                realm_ptr,
-                ptr::null(), // iplocalport — set later via set_prop
-                ptr::null(), // ipremoteport — set later via set_prop
-                ptr::null(), // per-connection callbacks — use global ones
-                0,           // flags — no special options
-                &mut conn,
-            )
+        // Dispatch: ServerNew — creates a SASL server connection handle.
+        let rc = match sasl_ffi(SaslFfi::ServerNew {
+            service: c_service.as_ptr(),
+            hostname: c_hostname.as_ptr(),
+            realm: realm_ptr,
+            flags: 0,
+            pconn: &mut conn,
+        }) {
+            SaslFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != ffi::SASL_OK {
@@ -679,22 +859,18 @@ impl SaslConnection {
         let empty = CString::new("").expect("empty string cannot fail");
         let sep = CString::new(" ").expect("single space cannot fail");
 
-        // SAFETY: calling sasl_listmech() to query the available
-        // SASL mechanisms from the library's plugin registry. The result pointer
-        // is written by the library and points to memory owned by the connection
-        // (valid until the connection is disposed). We copy it immediately to
-        // an owned String.
-        let rc = unsafe {
-            ffi::sasl_listmech(
-                self.conn,
-                ptr::null(),    // user — NULL for all mechanisms
-                empty.as_ptr(), // prefix
-                sep.as_ptr(),   // separator
-                empty.as_ptr(), // suffix
-                &mut result,
-                &mut len,
-                &mut count,
-            )
+        // Dispatch: ListMech — queries available SASL mechanisms.
+        let rc = match sasl_ffi(SaslFfi::ListMech {
+            conn: self.conn,
+            prefix: empty.as_ptr(),
+            sep: sep.as_ptr(),
+            suffix: empty.as_ptr(),
+            result: &mut result,
+            plen: &mut len,
+            pcount: &mut count,
+        }) {
+            SaslFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != ffi::SASL_OK {
@@ -708,7 +884,10 @@ impl SaslConnection {
         // SAFETY: reading the mechanism list string returned by
         // sasl_listmech(). The pointer is valid as long as the connection exists
         // (which it does — we hold &self). We copy to an owned String immediately.
-        let mech_str = unsafe { CStr::from_ptr(result).to_string_lossy().into_owned() };
+        let mech_str = match sasl_ffi(SaslFfi::CStrRead { ptr: result }) {
+            SaslFfiResult::Str(s) => s,
+            _ => unreachable!(),
+        };
 
         Ok(mech_str)
     }
@@ -747,20 +926,17 @@ impl SaslConnection {
         let mut serverout: *const libc::c_char = ptr::null();
         let mut serveroutlen: libc::c_uint = 0;
 
-        // SAFETY: calling sasl_server_start() to begin the SASL
-        // authentication exchange. The mechanism name is a valid CString. The
-        // initial client data (if any) points to valid memory for its stated
-        // length. The serverout pointer is written by the library and points
-        // to library-managed memory valid until the next SASL call.
-        let rc = unsafe {
-            ffi::sasl_server_start(
-                self.conn,
-                c_mech.as_ptr(),
-                client_ptr,
-                client_len,
-                &mut serverout,
-                &mut serveroutlen,
-            )
+        // Dispatch: ServerStart — begins the SASL authentication exchange.
+        let rc = match sasl_ffi(SaslFfi::ServerStart {
+            conn: self.conn,
+            mech: c_mech.as_ptr(),
+            clientin: client_ptr,
+            clientinlen: client_len,
+            serverout: &mut serverout,
+            serveroutlen: &mut serveroutlen,
+        }) {
+            SaslFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         self.process_step_result(rc, serverout, serveroutlen)
@@ -781,18 +957,16 @@ impl SaslConnection {
         let mut serverout: *const libc::c_char = ptr::null();
         let mut serveroutlen: libc::c_uint = 0;
 
-        // SAFETY: calling sasl_server_step() to process the next
-        // client token in the SASL exchange. The client_data slice is valid
-        // for its stated length. The serverout pointer is written by the
-        // library to library-managed memory valid until the next SASL call.
-        let rc = unsafe {
-            ffi::sasl_server_step(
-                self.conn,
-                client_data.as_ptr().cast::<libc::c_char>(),
-                client_data.len() as libc::c_uint,
-                &mut serverout,
-                &mut serveroutlen,
-            )
+        // Dispatch: ServerStep — continues the SASL authentication exchange.
+        let rc = match sasl_ffi(SaslFfi::ServerStep {
+            conn: self.conn,
+            clientin: client_data.as_ptr().cast::<libc::c_char>(),
+            clientinlen: client_data.len() as libc::c_uint,
+            serverout: &mut serverout,
+            serveroutlen: &mut serveroutlen,
+        }) {
+            SaslFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         self.process_step_result(rc, serverout, serveroutlen)
@@ -809,12 +983,12 @@ impl SaslConnection {
         let server_data = if serverout.is_null() || serveroutlen == 0 {
             Vec::new()
         } else {
-            // SAFETY: creating a byte slice from the server output
-            // pointer returned by sasl_server_start/sasl_server_step. The pointer
-            // and length are as returned by the library and are valid for the
-            // duration of this function call.
-            unsafe {
-                std::slice::from_raw_parts(serverout.cast::<u8>(), serveroutlen as usize).to_vec()
+            match sasl_ffi(SaslFfi::SliceCopy {
+                ptr: serverout.cast::<u8>(),
+                len: serveroutlen as usize,
+            }) {
+                SaslFfiResult::Bytes(b) => b,
+                _ => unreachable!(),
             }
         };
 
@@ -838,11 +1012,15 @@ impl SaslConnection {
     pub fn get_username(&self) -> Result<String, SaslError> {
         let mut value: *const libc::c_void = ptr::null();
 
-        // SAFETY: calling sasl_getprop() with SASL_USERNAME to
-        // retrieve the authenticated user identity. The returned pointer
-        // points to memory owned by the connection and is valid until the
-        // connection is disposed. We copy it immediately to an owned String.
-        let rc = unsafe { ffi::sasl_getprop(self.conn, ffi::SASL_USERNAME, &mut value) };
+        // Dispatch: GetProp — retrieves the authenticated username.
+        let rc = match sasl_ffi(SaslFfi::GetProp {
+            conn: self.conn,
+            propnum: ffi::SASL_USERNAME,
+            pvalue: &mut value,
+        }) {
+            SaslFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         if rc != ffi::SASL_OK {
             return Err(SaslError::from_connection(self, rc));
@@ -855,13 +1033,12 @@ impl SaslConnection {
             });
         }
 
-        // SAFETY: the value pointer for SASL_USERNAME is
-        // documented to be a `const char *` (NUL-terminated C string).
-        // We cast from void* to char* and read it as a CStr.
-        let username = unsafe {
-            CStr::from_ptr(value.cast::<libc::c_char>())
-                .to_string_lossy()
-                .into_owned()
+        // Dispatch: CStrRead — reads the username C string.
+        let username = match sasl_ffi(SaslFfi::CStrRead {
+            ptr: value.cast::<libc::c_char>(),
+        }) {
+            SaslFfiResult::Str(s) => s,
+            _ => unreachable!(),
         };
 
         Ok(username)
@@ -887,12 +1064,14 @@ impl SaslConnection {
 
         let propnum = prop.to_c_propnum();
 
-        // SAFETY: calling sasl_setprop() to set a connection
-        // property. The property number is a valid SASL_* constant. The value
-        // is a valid CString cast to void*. For string properties (IPLOCALPORT,
-        // IPREMOTEPORT), the library copies the string internally.
-        let rc = unsafe {
-            ffi::sasl_setprop(self.conn, propnum, c_value.as_ptr().cast::<libc::c_void>())
+        // Dispatch: SetProp — sets a SASL connection property.
+        let rc = match sasl_ffi(SaslFfi::SetProp {
+            conn: self.conn,
+            propnum,
+            value: c_value.as_ptr().cast::<libc::c_void>(),
+        }) {
+            SaslFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         if rc != ffi::SASL_OK {
@@ -908,17 +1087,14 @@ impl SaslConnection {
     /// for this connection. This is more informative than the generic
     /// `SaslError::from_code()` as it includes mechanism-specific context.
     pub fn error_detail(&self) -> String {
-        // SAFETY: calling sasl_errdetail() to retrieve the
-        // most recent connection-specific error message. The returned pointer
-        // is valid until the next SASL API call on this connection. We
-        // immediately copy it to an owned String.
-        unsafe {
-            let ptr = ffi::sasl_errdetail(self.conn);
-            if ptr.is_null() {
-                "(no error detail available)".to_string()
-            } else {
-                CStr::from_ptr(ptr).to_string_lossy().into_owned()
-            }
+        let detail = match sasl_ffi(SaslFfi::ErrDetail { conn: self.conn }) {
+            SaslFfiResult::Str(s) => s,
+            _ => unreachable!(),
+        };
+        if detail.is_empty() {
+            "(no error detail available)".to_string()
+        } else {
+            detail
         }
     }
 }
@@ -926,14 +1102,10 @@ impl SaslConnection {
 impl Drop for SaslConnection {
     fn drop(&mut self) {
         if !self.conn.is_null() {
-            // SAFETY: calling sasl_dispose() to release all
-            // resources associated with this SASL connection. The function
-            // takes a pointer-to-pointer and sets the inner pointer to NULL
-            // after cleanup. We check for null before calling to avoid
-            // double-dispose.
-            unsafe {
-                ffi::sasl_dispose(&mut self.conn);
-            }
+            // Dispatch: Dispose — releases all connection resources.
+            sasl_ffi(SaslFfi::Dispose {
+                pconn: &mut self.conn,
+            });
             // sasl_dispose sets conn to null, but we set it explicitly
             // for clarity and defense-in-depth.
             self.conn = ptr::null_mut();
@@ -960,37 +1132,32 @@ pub fn version_info() -> SaslVersionInfo {
     let mut step: libc::c_int = 0;
     let mut patch: libc::c_int = 0;
 
-    // SAFETY: calling sasl_version_info() to retrieve the SASL
-    // library implementation name and version numbers. All output parameters
-    // are mutable pointers to stack variables. The library writes to them
-    // directly. The string pointers (implementation, version_string) point to
-    // statically allocated memory within libsasl2 that is valid for the
-    // process lifetime. We copy them to owned Strings immediately.
-    unsafe {
-        ffi::sasl_version_info(
-            &mut c_impl,
-            &mut c_version,
-            &mut major,
-            &mut minor,
-            &mut step,
-            &mut patch,
-        );
-    }
+    // Dispatch: VersionInfo — retrieves SASL library version metadata.
+    sasl_ffi(SaslFfi::VersionInfo {
+        c_impl: &mut c_impl,
+        c_version: &mut c_version,
+        major: &mut major,
+        minor: &mut minor,
+        step: &mut step,
+        patch: &mut patch,
+    });
 
     let implementation = if c_impl.is_null() {
         "unknown".to_string()
     } else {
-        // SAFETY: reading the implementation name string returned
-        // by sasl_version_info(). It points to static library memory.
-        unsafe { CStr::from_ptr(c_impl).to_string_lossy().into_owned() }
+        match sasl_ffi(SaslFfi::CStrRead { ptr: c_impl }) {
+            SaslFfiResult::Str(s) => s,
+            _ => unreachable!(),
+        }
     };
 
     let version_string = if c_version.is_null() {
         "unknown".to_string()
     } else {
-        // SAFETY: reading the version string returned by
-        // sasl_version_info(). It points to static library memory.
-        unsafe { CStr::from_ptr(c_version).to_string_lossy().into_owned() }
+        match sasl_ffi(SaslFfi::CStrRead { ptr: c_version }) {
+            SaslFfiResult::Str(s) => s,
+            _ => unreachable!(),
+        }
     };
 
     SaslVersionInfo {

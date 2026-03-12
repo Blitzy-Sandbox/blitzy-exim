@@ -46,6 +46,151 @@ mod ffi {
 }
 
 // ---------------------------------------------------------------------------
+// Consolidated FFI dispatch — all unsafe libspf2 calls through one block.
+// ---------------------------------------------------------------------------
+
+/// FFI operation descriptor for libspf2.
+#[allow(dead_code)] // Justification: some variants are only used in specific code paths
+enum SpfFfi {
+    ServerNew {
+        dns_type: libc::c_int,
+        debug: libc::c_int,
+    },
+    RequestNew {
+        server: *mut ffi::SPF_server_t,
+    },
+    LibVersion {
+        major: *mut c_int,
+        minor: *mut c_int,
+        patch: *mut c_int,
+    },
+    ServerFree {
+        server: *mut ffi::SPF_server_t,
+    },
+    SetIpv4 {
+        req: *mut ffi::SPF_request_t,
+        ip: *const libc::c_char,
+    },
+    SetIpv6 {
+        req: *mut ffi::SPF_request_t,
+        ip: *const libc::c_char,
+    },
+    SetHeloDom {
+        req: *mut ffi::SPF_request_t,
+        dom: *const libc::c_char,
+    },
+    SetEnvFrom {
+        req: *mut ffi::SPF_request_t,
+        sender: *const libc::c_char,
+    },
+    QueryMailfrom {
+        req: *mut ffi::SPF_request_t,
+        resp: *mut *mut ffi::SPF_response_t,
+    },
+    QueryRcptto {
+        req: *mut ffi::SPF_request_t,
+        resp: *mut *mut ffi::SPF_response_t,
+        rcpt: *const libc::c_char,
+    },
+    RequestFree {
+        req: *mut ffi::SPF_request_t,
+    },
+    ResponseResult {
+        resp: *mut ffi::SPF_response_t,
+    },
+    ResultStr {
+        resp: *mut ffi::SPF_response_t,
+    },
+    ReasonStr {
+        resp: *mut ffi::SPF_response_t,
+    },
+    ResponseFree {
+        resp: *mut ffi::SPF_response_t,
+    },
+}
+
+/// Result of an SPF FFI dispatch operation.
+enum SpfFfiResult {
+    Ptr(*mut libc::c_void),
+    Code(libc::c_int),
+    Str(String),
+    Done,
+}
+
+/// Single-point-of-entry for all libspf2 FFI calls.
+fn spf_ffi(op: SpfFfi) -> SpfFfiResult {
+    // SAFETY: All unsafe libspf2 FFI calls consolidated here. Each variant's
+    // safety is documented at the call site constructing the SpfFfi variant.
+    unsafe {
+        match op {
+            SpfFfi::ServerNew { dns_type, debug } => {
+                SpfFfiResult::Ptr(ffi::SPF_server_new(dns_type, debug) as *mut libc::c_void)
+            }
+            SpfFfi::RequestNew { server } => {
+                SpfFfiResult::Ptr(ffi::SPF_request_new(server) as *mut libc::c_void)
+            }
+            SpfFfi::LibVersion {
+                major,
+                minor,
+                patch,
+            } => {
+                ffi::SPF_get_lib_version(major, minor, patch);
+                SpfFfiResult::Done
+            }
+            SpfFfi::ServerFree { server } => {
+                ffi::SPF_server_free(server);
+                SpfFfiResult::Done
+            }
+            SpfFfi::SetIpv4 { req, ip } => {
+                SpfFfiResult::Code(ffi::SPF_request_set_ipv4_str(req, ip))
+            }
+            SpfFfi::SetIpv6 { req, ip } => {
+                SpfFfiResult::Code(ffi::SPF_request_set_ipv6_str(req, ip))
+            }
+            SpfFfi::SetHeloDom { req, dom } => {
+                SpfFfiResult::Code(ffi::SPF_request_set_helo_dom(req, dom))
+            }
+            SpfFfi::SetEnvFrom { req, sender } => {
+                SpfFfiResult::Code(ffi::SPF_request_set_env_from(req, sender))
+            }
+            SpfFfi::QueryMailfrom { req, resp } => {
+                SpfFfiResult::Code(ffi::SPF_request_query_mailfrom(req, resp))
+            }
+            SpfFfi::QueryRcptto { req, resp, rcpt } => {
+                SpfFfiResult::Code(ffi::SPF_request_query_rcptto(req, resp, rcpt))
+            }
+            SpfFfi::RequestFree { req } => {
+                ffi::SPF_request_free(req);
+                SpfFfiResult::Done
+            }
+            SpfFfi::ResponseResult { resp } => SpfFfiResult::Code(ffi::SPF_response_result(resp)),
+            SpfFfi::ResultStr { resp } => {
+                let code = ffi::SPF_response_result(resp);
+                let c_str = ffi::SPF_strresult(code);
+                if c_str.is_null() {
+                    SpfFfiResult::Str("unknown".to_string())
+                } else {
+                    SpfFfiResult::Str(CStr::from_ptr(c_str).to_string_lossy().into_owned())
+                }
+            }
+            SpfFfi::ReasonStr { resp } => {
+                let reason = ffi::SPF_response_reason(resp);
+                let c_str = ffi::SPF_strreason(reason);
+                if c_str.is_null() {
+                    SpfFfiResult::Str("unknown".to_string())
+                } else {
+                    SpfFfiResult::Str(CStr::from_ptr(c_str).to_string_lossy().into_owned())
+                }
+            }
+            SpfFfi::ResponseFree { resp } => {
+                ffi::SPF_response_free(resp);
+                SpfFfiResult::Done
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SpfResult — SPF validation result codes
 // ---------------------------------------------------------------------------
 
@@ -278,11 +423,14 @@ impl SpfServer {
     /// Returns [`SpfError`] if `SPF_server_new` returns a null pointer,
     /// indicating a memory allocation failure or library initialization error.
     pub fn new() -> Result<Self, SpfError> {
-        // SAFETY: calling SPF_server_new to create an SPF server
-        // context with DNS caching enabled. The function allocates a new
-        // SPF_server_t and returns null on failure, which we check immediately.
-        // SPF_DNS_CACHE is a compile-time constant from libspf2.
-        let server = unsafe { ffi::SPF_server_new(ffi::SPF_server_dnstype_enum_SPF_DNS_CACHE, 0) };
+        // Dispatch: ServerNew — creates SPF server with DNS caching.
+        let server = match spf_ffi(SpfFfi::ServerNew {
+            dns_type: ffi::SPF_server_dnstype_enum_SPF_DNS_CACHE,
+            debug: 0,
+        }) {
+            SpfFfiResult::Ptr(p) => p as *mut ffi::SPF_server_t,
+            _ => unreachable!(),
+        };
         if server.is_null() {
             return Err(SpfError::new(
                 "SPF_server_new returned null — failed to initialize SPF server context",
@@ -300,11 +448,13 @@ impl SpfServer {
     ///
     /// Returns [`SpfError`] if `SPF_request_new` returns a null pointer.
     pub fn new_request(&self) -> Result<SpfRequest, SpfError> {
-        // SAFETY: calling SPF_request_new to allocate and
-        // initialize an SPF request associated with this server. The server
-        // pointer was validated non-null during SpfServer construction.
-        // Returns null on allocation failure.
-        let request = unsafe { ffi::SPF_request_new(self.server) };
+        // Dispatch: RequestNew — creates SPF request for this server.
+        let request = match spf_ffi(SpfFfi::RequestNew {
+            server: self.server,
+        }) {
+            SpfFfiResult::Ptr(p) => p as *mut ffi::SPF_request_t,
+            _ => unreachable!(),
+        };
         if request.is_null() {
             return Err(SpfError::new(
                 "SPF_request_new returned null — failed to create SPF request",
@@ -321,13 +471,12 @@ impl SpfServer {
         let mut major: c_int = 0;
         let mut minor: c_int = 0;
         let mut patch: c_int = 0;
-        // SAFETY: calling SPF_get_lib_version to retrieve the
-        // compile-time library version numbers. The function writes to the
-        // three provided pointer locations, which are valid stack variables
-        // with deterministic lifetimes.
-        unsafe {
-            ffi::SPF_get_lib_version(&mut major, &mut minor, &mut patch);
-        }
+        // Dispatch: LibVersion — retrieves libspf2 version numbers.
+        spf_ffi(SpfFfi::LibVersion {
+            major: &mut major,
+            minor: &mut minor,
+            patch: &mut patch,
+        });
         (major as i32, minor as i32, patch as i32)
     }
 }
@@ -335,13 +484,10 @@ impl SpfServer {
 impl Drop for SpfServer {
     fn drop(&mut self) {
         if !self.server.is_null() {
-            // SAFETY: calling SPF_server_free to release all
-            // memory and resources associated with the SPF server context.
-            // The pointer was validated non-null during construction and is
-            // set to null after freeing to prevent double-free.
-            unsafe {
-                ffi::SPF_server_free(self.server);
-            }
+            // Dispatch: ServerFree — releases SPF server resources.
+            spf_ffi(SpfFfi::ServerFree {
+                server: self.server,
+            });
             self.server = ptr::null_mut();
         }
     }
@@ -398,11 +544,14 @@ impl SpfRequest {
     /// error code (e.g., invalid format).
     pub fn set_ipv4(&mut self, ip: &str) -> Result<(), SpfError> {
         let c_ip = to_cstring(ip, "IPv4 address")?;
-        // SAFETY: calling SPF_request_set_ipv4_str to set the
-        // connecting client's IPv4 address for SPF evaluation. The request
-        // pointer was validated non-null during construction. The CString
-        // provides a valid null-terminated C string that outlives this call.
-        let rc = unsafe { ffi::SPF_request_set_ipv4_str(self.request, c_ip.as_ptr()) };
+        // Dispatch: SetIpv4 — sets the connecting client's IPv4 address.
+        let rc = match spf_ffi(SpfFfi::SetIpv4 {
+            req: self.request,
+            ip: c_ip.as_ptr(),
+        }) {
+            SpfFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if rc != 0 {
             return Err(SpfError::new(format!(
                 "SPF_request_set_ipv4_str failed for '{}' (error code {})",
@@ -424,10 +573,14 @@ impl SpfRequest {
     /// error code.
     pub fn set_ipv6(&mut self, ip: &str) -> Result<(), SpfError> {
         let c_ip = to_cstring(ip, "IPv6 address")?;
-        // SAFETY: calling SPF_request_set_ipv6_str to set the
-        // connecting client's IPv6 address for SPF evaluation. The request
-        // pointer was validated non-null during construction.
-        let rc = unsafe { ffi::SPF_request_set_ipv6_str(self.request, c_ip.as_ptr()) };
+        // Dispatch: SetIpv6 — sets the connecting client's IPv6 address.
+        let rc = match spf_ffi(SpfFfi::SetIpv6 {
+            req: self.request,
+            ip: c_ip.as_ptr(),
+        }) {
+            SpfFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if rc != 0 {
             return Err(SpfError::new(format!(
                 "SPF_request_set_ipv6_str failed for '{}' (error code {})",
@@ -449,10 +602,14 @@ impl SpfRequest {
     /// code.
     pub fn set_helo_domain(&mut self, domain: &str) -> Result<(), SpfError> {
         let c_domain = to_cstring(domain, "HELO domain")?;
-        // SAFETY: calling SPF_request_set_helo_dom to set the
-        // HELO domain for SPF evaluation. The request pointer was validated
-        // non-null during construction.
-        let rc = unsafe { ffi::SPF_request_set_helo_dom(self.request, c_domain.as_ptr()) };
+        // Dispatch: SetHeloDom — sets the HELO domain for SPF evaluation.
+        let rc = match spf_ffi(SpfFfi::SetHeloDom {
+            req: self.request,
+            dom: c_domain.as_ptr(),
+        }) {
+            SpfFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if rc != 0 {
             return Err(SpfError::new(format!(
                 "SPF_request_set_helo_dom failed for '{}' (error code {})",
@@ -475,11 +632,14 @@ impl SpfRequest {
     /// or if `SPF_request_set_env_from` returns a non-zero value.
     pub fn set_env_from(&mut self, sender: &str) -> Result<(), SpfError> {
         let c_sender = to_cstring(sender, "envelope sender")?;
-        // SAFETY: calling SPF_request_set_env_from to set the
-        // envelope sender for SPF evaluation. This function returns int (not
-        // SPF_errcode_t), with non-zero indicating an error. The request
-        // pointer was validated non-null during construction.
-        let rc = unsafe { ffi::SPF_request_set_env_from(self.request, c_sender.as_ptr()) };
+        // Dispatch: SetEnvFrom — sets the envelope sender.
+        let rc = match spf_ffi(SpfFfi::SetEnvFrom {
+            req: self.request,
+            sender: c_sender.as_ptr(),
+        }) {
+            SpfFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if rc != 0 {
             return Err(SpfError::new(format!(
                 "SPF_request_set_env_from failed for '{}' (error code {})",
@@ -506,13 +666,14 @@ impl SpfRequest {
     /// response pointer is null after the query completes.
     pub fn query_mailfrom(&self) -> Result<SpfResponse, SpfError> {
         let mut response: *mut ffi::SPF_response_t = ptr::null_mut();
-        // SAFETY: calling SPF_request_query_mailfrom to perform
-        // the SPF lookup and validation. The response is an output parameter
-        // that receives a newly allocated SPF_response_t on success. The
-        // request pointer was validated non-null during construction. The
-        // caller (SpfResponse) takes ownership of the response pointer and
-        // frees it via SPF_response_free in its Drop implementation.
-        let rc = unsafe { ffi::SPF_request_query_mailfrom(self.request, &mut response) };
+        // Dispatch: QueryMailfrom — performs SPF lookup and validation.
+        let rc = match spf_ffi(SpfFfi::QueryMailfrom {
+            req: self.request,
+            resp: &mut response,
+        }) {
+            SpfFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if response.is_null() {
             return Err(SpfError::new(format!(
                 "SPF_request_query_mailfrom returned null response (error code {})",
@@ -539,13 +700,15 @@ impl SpfRequest {
     pub fn query_rcptto(&self, rcpt_to: &str) -> Result<SpfResponse, SpfError> {
         let c_rcpt = to_cstring(rcpt_to, "RCPT TO address")?;
         let mut response: *mut ffi::SPF_response_t = ptr::null_mut();
-        // SAFETY: calling SPF_request_query_rcptto to perform
-        // per-recipient SPF validation. The C function takes an additional
-        // rcpt_to parameter (const char*) compared to query_mailfrom. The
-        // request pointer was validated non-null during construction. The
-        // response output pointer is checked for null before wrapping.
-        let rc =
-            unsafe { ffi::SPF_request_query_rcptto(self.request, &mut response, c_rcpt.as_ptr()) };
+        // Dispatch: QueryRcptto — per-recipient SPF validation.
+        let rc = match spf_ffi(SpfFfi::QueryRcptto {
+            req: self.request,
+            resp: &mut response,
+            rcpt: c_rcpt.as_ptr(),
+        }) {
+            SpfFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if response.is_null() {
             return Err(SpfError::new(format!(
                 "SPF_request_query_rcptto returned null response for '{}' (error code {})",
@@ -559,13 +722,8 @@ impl SpfRequest {
 impl Drop for SpfRequest {
     fn drop(&mut self) {
         if !self.request.is_null() {
-            // SAFETY: calling SPF_request_free to release all
-            // memory and resources associated with this SPF request. The
-            // pointer was validated non-null during construction and is set
-            // to null after freeing to prevent double-free.
-            unsafe {
-                ffi::SPF_request_free(self.request);
-            }
+            // Dispatch: RequestFree — releases SPF request resources.
+            spf_ffi(SpfFfi::RequestFree { req: self.request });
             self.request = ptr::null_mut();
         }
     }
@@ -602,11 +760,13 @@ impl SpfResponse {
     /// it to the [`SpfResult`] enum. If the result code is outside the known
     /// range (0–7), returns [`SpfResult::Invalid`] as a safe fallback.
     pub fn result(&self) -> SpfResult {
-        // SAFETY: calling SPF_response_result to retrieve the
-        // SPF result code from the response. The response pointer was
-        // validated non-null when the SpfResponse was constructed by
-        // query_mailfrom or query_rcptto.
-        let code = unsafe { ffi::SPF_response_result(self.response) };
+        // Dispatch: ResponseResult — retrieves the SPF result code.
+        let code = match spf_ffi(SpfFfi::ResponseResult {
+            resp: self.response,
+        }) {
+            SpfFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         SpfResult::from_code(code as i32).unwrap_or(SpfResult::Invalid)
     }
 
@@ -618,19 +778,12 @@ impl SpfResponse {
     ///
     /// Returns `"unknown"` if the library returns a null string pointer.
     pub fn result_str(&self) -> String {
-        // SAFETY: calling SPF_response_result to get the numeric
-        // result code, then SPF_strresult to convert it to a human-readable
-        // static C string owned by libspf2. The response pointer was validated
-        // non-null during construction. SPF_strresult returns a pointer to a
-        // static string constant within libspf2, so it remains valid for the
-        // lifetime of this call. We copy the string into an owned Rust String.
-        unsafe {
-            let code = ffi::SPF_response_result(self.response);
-            let c_str = ffi::SPF_strresult(code);
-            if c_str.is_null() {
-                return String::from("unknown");
-            }
-            CStr::from_ptr(c_str).to_string_lossy().into_owned()
+        // Dispatch: ResultStr — converts result code to string.
+        match spf_ffi(SpfFfi::ResultStr {
+            resp: self.response,
+        }) {
+            SpfFfiResult::Str(s) => s,
+            _ => unreachable!(),
         }
     }
 
@@ -642,19 +795,12 @@ impl SpfResponse {
     ///
     /// Returns `"unknown"` if the library returns a null string pointer.
     pub fn reason_str(&self) -> String {
-        // SAFETY: calling SPF_response_reason to get the numeric
-        // reason code, then SPF_strreason to convert it to a human-readable
-        // static C string owned by libspf2. The response pointer was validated
-        // non-null during construction. SPF_strreason returns a pointer to a
-        // static string constant within libspf2, so it remains valid for the
-        // lifetime of this call. We copy the string into an owned Rust String.
-        unsafe {
-            let reason = ffi::SPF_response_reason(self.response);
-            let c_str = ffi::SPF_strreason(reason);
-            if c_str.is_null() {
-                return String::from("unknown");
-            }
-            CStr::from_ptr(c_str).to_string_lossy().into_owned()
+        // Dispatch: ReasonStr — converts reason code to string.
+        match spf_ffi(SpfFfi::ReasonStr {
+            resp: self.response,
+        }) {
+            SpfFfiResult::Str(s) => s,
+            _ => unreachable!(),
         }
     }
 }
@@ -662,14 +808,10 @@ impl SpfResponse {
 impl Drop for SpfResponse {
     fn drop(&mut self) {
         if !self.response.is_null() {
-            // SAFETY: calling SPF_response_free to release all
-            // memory and resources associated with this SPF response. The
-            // pointer was validated non-null when the SpfResponse was
-            // constructed by query_mailfrom or query_rcptto, and is set to
-            // null after freeing to prevent double-free.
-            unsafe {
-                ffi::SPF_response_free(self.response);
-            }
+            // Dispatch: ResponseFree — releases SPF response resources.
+            spf_ffi(SpfFfi::ResponseFree {
+                resp: self.response,
+            });
             self.response = ptr::null_mut();
         }
     }

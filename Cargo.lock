@@ -819,6 +819,7 @@ dependencies = [
  "libloading 0.9.0",
  "nix",
  "pkg-config",
+ "thiserror 2.0.18",
  "tracing",
 ]
 

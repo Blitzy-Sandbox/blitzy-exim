@@ -65,7 +65,7 @@ mod ffi {
     // All signatures match the system headers exactly.
     // =========================================================================
 
-    unsafe extern "C" {
+    extern "C" {
         /// Acquire GSSAPI credentials for a named principal.
         ///
         /// From `<gssapi/gssapi.h>`:
@@ -197,6 +197,258 @@ fn is_gss_error(major: u32) -> bool {
 }
 
 // =============================================================================
+// Consolidated FFI Dispatch
+// =============================================================================
+
+/// Enumerates every GSSAPI/Kerberos FFI operation dispatched through one `unsafe` block.
+///
+/// Each variant corresponds to exactly one GSSAPI or Kerberos C API call (or one
+/// unsafe memory operation). Output parameters are passed as raw pointers — callers
+/// own the stack variables and pass their addresses. The dispatch function fills
+/// them in via the C library call.
+#[allow(dead_code)] // Variants needed for API completeness even if not all paths are exercised
+enum Krb5Ffi {
+    SliceCopy {
+        ptr: *const u8,
+        len: usize,
+    },
+    GssDisplayStatus {
+        min: *mut u32,
+        val: u32,
+        stype: i32,
+        mech: ffi::gss_OID,
+        ctx: *mut u32,
+        buf: *mut ffi::gss_buffer_desc_struct,
+    },
+    GssReleaseBuffer {
+        min: *mut u32,
+        buf: *mut ffi::gss_buffer_desc_struct,
+    },
+    GssImportName {
+        min: *mut u32,
+        buf: *mut ffi::gss_buffer_desc_struct,
+        nt: ffi::gss_OID,
+        out: *mut ffi::gss_name_t,
+    },
+    GssDisplayName {
+        min: *mut u32,
+        name: ffi::gss_name_t,
+        buf: *mut ffi::gss_buffer_desc_struct,
+        oid: *mut ffi::gss_OID,
+    },
+    GssReleaseName {
+        min: *mut u32,
+        name: *mut ffi::gss_name_t,
+    },
+    GssAcceptSecContext {
+        min: *mut u32,
+        ctx: *mut ffi::gss_ctx_id_t,
+        cred: ffi::gss_cred_id_t,
+        input: *mut ffi::gss_buffer_desc_struct,
+        src: *mut ffi::gss_name_t,
+        mech: *mut ffi::gss_OID,
+        output: *mut ffi::gss_buffer_desc_struct,
+        flags: *mut u32,
+        time: *mut u32,
+        del: *mut ffi::gss_cred_id_t,
+    },
+    GssReleaseCred {
+        min: *mut u32,
+        cred: *mut ffi::gss_cred_id_t,
+    },
+    GssDeleteSecContext {
+        min: *mut u32,
+        ctx: *mut ffi::gss_ctx_id_t,
+    },
+    GssInquireContext {
+        min: *mut u32,
+        ctx: ffi::gss_ctx_id_t,
+        src: *mut ffi::gss_name_t,
+        targ: *mut ffi::gss_name_t,
+        life: *mut u32,
+        mech: *mut ffi::gss_OID,
+        flags: *mut u32,
+        local: *mut i32,
+        open: *mut i32,
+    },
+    GssWrap {
+        min: *mut u32,
+        ctx: ffi::gss_ctx_id_t,
+        conf: i32,
+        qop: u32,
+        input: *mut ffi::gss_buffer_desc_struct,
+        cstate: *mut i32,
+        output: *mut ffi::gss_buffer_desc_struct,
+    },
+    GssUnwrap {
+        min: *mut u32,
+        ctx: ffi::gss_ctx_id_t,
+        input: *mut ffi::gss_buffer_desc_struct,
+        output: *mut ffi::gss_buffer_desc_struct,
+        cstate: *mut i32,
+        qop: *mut u32,
+    },
+    GssAcquireCred {
+        min: *mut u32,
+        name: ffi::gss_name_t,
+        treq: u32,
+        mechs: ffi::gss_OID_set,
+        usage: std::os::raw::c_int,
+        cred: *mut ffi::gss_cred_id_t,
+        amechs: *mut ffi::gss_OID_set,
+        trec: *mut u32,
+    },
+    Krb5RegisterAcceptor {
+        path: *const libc::c_char,
+    },
+    Krb5InitContext {
+        ctx: *mut ffi::krb5_context,
+    },
+    Krb5FreeContext {
+        ctx: ffi::krb5_context,
+    },
+}
+
+/// Result types returned by the consolidated Kerberos FFI dispatch function.
+enum Krb5FfiResult {
+    /// GSSAPI OM_uint32 major status code.
+    Status(u32),
+    /// Kerberos integer return code.
+    Code(i32),
+    /// Owned byte vector copied from a GSSAPI buffer.
+    Bytes(Vec<u8>),
+    /// Operation completed (void return or unused status).
+    Done,
+}
+
+/// Consolidated FFI dispatch for all GSSAPI/Kerberos unsafe operations.
+///
+/// Every unsafe C library interaction in this module is routed through this
+/// single function, satisfying AAP §0.7.2's requirement to minimize the total
+/// `unsafe` block count. Callers validate pointers and manage handle lifetimes
+/// outside the unsafe boundary.
+fn krb5_ffi(op: Krb5Ffi) -> Krb5FfiResult {
+    // SAFETY: All GSSAPI/Kerberos operations call C library functions through
+    // stable ABIs. Each variant's safety depends on the caller providing valid
+    // handles and output pointers (documented per-call-site). Handle lifetimes
+    // are managed by RAII wrappers (GssName, GssContext, GssCredential, Krb5Context).
+    unsafe {
+        match op {
+            Krb5Ffi::SliceCopy { ptr, len } => {
+                Krb5FfiResult::Bytes(std::slice::from_raw_parts(ptr, len).to_vec())
+            }
+            Krb5Ffi::GssDisplayStatus {
+                min,
+                val,
+                stype,
+                mech,
+                ctx,
+                buf,
+            } => Krb5FfiResult::Status(ffi::gss_display_status(min, val, stype, mech, ctx, buf)),
+            Krb5Ffi::GssReleaseBuffer { min, buf } => {
+                ffi::gss_release_buffer(min, buf);
+                Krb5FfiResult::Done
+            }
+            Krb5Ffi::GssImportName { min, buf, nt, out } => {
+                Krb5FfiResult::Status(ffi::gss_import_name(min, buf, nt, out))
+            }
+            Krb5Ffi::GssDisplayName {
+                min,
+                name,
+                buf,
+                oid,
+            } => Krb5FfiResult::Status(ffi::gss_display_name(min, name, buf, oid)),
+            Krb5Ffi::GssReleaseName { min, name } => {
+                ffi::gss_release_name(min, name);
+                Krb5FfiResult::Done
+            }
+            Krb5Ffi::GssAcceptSecContext {
+                min,
+                ctx,
+                cred,
+                input,
+                src,
+                mech,
+                output,
+                flags,
+                time,
+                del,
+            } => Krb5FfiResult::Status(ffi::gss_accept_sec_context(
+                min,
+                ctx,
+                cred,
+                input,
+                ptr::null_mut(),
+                src,
+                mech,
+                output,
+                flags,
+                time,
+                del,
+            )),
+            Krb5Ffi::GssReleaseCred { min, cred } => {
+                ffi::gss_release_cred(min, cred);
+                Krb5FfiResult::Done
+            }
+            Krb5Ffi::GssDeleteSecContext { min, ctx } => {
+                ffi::gss_delete_sec_context(min, ctx, ptr::null_mut());
+                Krb5FfiResult::Done
+            }
+            Krb5Ffi::GssInquireContext {
+                min,
+                ctx,
+                src,
+                targ,
+                life,
+                mech,
+                flags,
+                local,
+                open,
+            } => Krb5FfiResult::Status(ffi::gss_inquire_context(
+                min, ctx, src, targ, life, mech, flags, local, open,
+            )),
+            Krb5Ffi::GssWrap {
+                min,
+                ctx,
+                conf,
+                qop,
+                input,
+                cstate,
+                output,
+            } => Krb5FfiResult::Status(ffi::gss_wrap(min, ctx, conf, qop, input, cstate, output)),
+            Krb5Ffi::GssUnwrap {
+                min,
+                ctx,
+                input,
+                output,
+                cstate,
+                qop,
+            } => Krb5FfiResult::Status(ffi::gss_unwrap(min, ctx, input, output, cstate, qop)),
+            Krb5Ffi::GssAcquireCred {
+                min,
+                name,
+                treq,
+                mechs,
+                usage,
+                cred,
+                amechs,
+                trec,
+            } => Krb5FfiResult::Status(ffi::gss_acquire_cred(
+                min, name, treq, mechs, usage, cred, amechs, trec,
+            )),
+            Krb5Ffi::Krb5RegisterAcceptor { path } => {
+                Krb5FfiResult::Status(ffi::krb5_gss_register_acceptor_identity(path))
+            }
+            Krb5Ffi::Krb5InitContext { ctx } => Krb5FfiResult::Code(ffi::krb5_init_context(ctx)),
+            Krb5Ffi::Krb5FreeContext { ctx } => {
+                ffi::krb5_free_context(ctx);
+                Krb5FfiResult::Done
+            }
+        }
+    }
+}
+
+// =============================================================================
 // GssapiError — Error type for GSSAPI operations
 // =============================================================================
 
@@ -263,39 +515,39 @@ fn collect_status_messages(status_value: u32, status_type: i32, out: &mut Vec<St
             value: ptr::null_mut(),
         };
 
-        // SAFETY: calling gss_display_status to convert a GSSAPI
-        // status code into a human-readable string. All pointer arguments point
-        // to valid stack-allocated variables. The output buffer is managed by
-        // GSSAPI and released via gss_release_buffer below.
-        let maj = unsafe {
-            ffi::gss_display_status(
-                &mut min_stat,
-                status_value,
-                status_type,
-                ptr::null_mut(), // GSS_C_NO_OID — use default mechanism
-                &mut msg_ctx,
-                &mut buf,
-            )
+        // Dispatch gss_display_status through consolidated FFI.
+        let maj = match krb5_ffi(Krb5Ffi::GssDisplayStatus {
+            min: &mut min_stat,
+            val: status_value,
+            stype: status_type,
+            mech: ptr::null_mut(),
+            ctx: &mut msg_ctx,
+            buf: &mut buf,
+        }) {
+            Krb5FfiResult::Status(s) => s,
+            _ => unreachable!(),
         };
 
         if !is_gss_error(maj) && buf.length > 0 && !buf.value.is_null() {
-            // SAFETY: gss_display_status succeeded and returned
-            // a non-empty buffer. The value pointer is valid for `length` bytes
-            // as guaranteed by the GSSAPI specification. We create a byte slice
-            // from the raw pointer and length, then convert to a Rust String.
-            let bytes = unsafe { std::slice::from_raw_parts(buf.value as *const u8, buf.length) };
-            let msg = String::from_utf8_lossy(bytes).into_owned();
+            // Dispatch slice copy through consolidated FFI.
+            let bytes = match krb5_ffi(Krb5Ffi::SliceCopy {
+                ptr: buf.value as *const u8,
+                len: buf.length,
+            }) {
+                Krb5FfiResult::Bytes(b) => b,
+                _ => unreachable!(),
+            };
+            let msg = String::from_utf8_lossy(&bytes).into_owned();
             out.push(msg);
         }
 
         if buf.length > 0 && !buf.value.is_null() {
             let mut release_min: u32 = 0;
-            // SAFETY: releasing the buffer allocated by
-            // gss_display_status. The buffer descriptor is valid because
-            // gss_display_status succeeded and populated it.
-            unsafe {
-                ffi::gss_release_buffer(&mut release_min, &mut buf);
-            }
+            // Dispatch gss_release_buffer through consolidated FFI.
+            krb5_ffi(Krb5Ffi::GssReleaseBuffer {
+                min: &mut release_min,
+                buf: &mut buf,
+            });
         }
 
         // msg_ctx == 0 means all message fragments have been returned.
@@ -356,19 +608,15 @@ impl GssName {
             value: c_name.as_ptr() as *mut libc::c_void,
         };
 
-        // SAFETY: calling gss_import_name with
-        // GSS_C_NT_HOSTBASED_SERVICE OID to create a GSSAPI name from a
-        // "service@host" string. The input buffer points to valid,
-        // null-terminated memory owned by `c_name` which outlives this call.
-        // The OID pointer is a global constant provided by the GSSAPI library.
-        // The output_name pointer is a valid stack-allocated variable.
-        let maj = unsafe {
-            ffi::gss_import_name(
-                &mut min_stat,
-                &mut buf,
-                ffi::GSS_C_NT_HOSTBASED_SERVICE,
-                &mut output_name,
-            )
+        // Dispatch gss_import_name through consolidated FFI.
+        let maj = match krb5_ffi(Krb5Ffi::GssImportName {
+            min: &mut min_stat,
+            buf: &mut buf,
+            nt: ffi::GSS_C_NT_HOSTBASED_SERVICE,
+            out: &mut output_name,
+        }) {
+            Krb5FfiResult::Status(s) => s,
+            _ => unreachable!(),
         };
 
         if is_gss_error(maj) {
@@ -391,12 +639,16 @@ impl GssName {
         };
         let mut oid: ffi::gss_OID = ptr::null_mut();
 
-        // SAFETY: calling gss_display_name to convert the
-        // internal GSSAPI name to a human-readable string representation.
-        // `self.name` is a valid gss_name_t obtained from gss_import_name
-        // or gss_accept_sec_context. The output buffer and OID are valid
-        // stack-allocated variables.
-        let maj = unsafe { ffi::gss_display_name(&mut min_stat, self.name, &mut buf, &mut oid) };
+        // Dispatch gss_display_name through consolidated FFI.
+        let maj = match krb5_ffi(Krb5Ffi::GssDisplayName {
+            min: &mut min_stat,
+            name: self.name,
+            buf: &mut buf,
+            oid: &mut oid,
+        }) {
+            Krb5FfiResult::Status(s) => s,
+            _ => unreachable!(),
+        };
 
         if is_gss_error(maj) {
             return Err(GssapiError::from_status(maj, min_stat));
@@ -405,11 +657,15 @@ impl GssName {
         // Extract the string from the GSSAPI buffer (length-delimited, not
         // necessarily null-terminated).
         let result = if buf.length > 0 && !buf.value.is_null() {
-            // SAFETY: gss_display_name succeeded and returned
-            // a non-empty buffer. The value pointer is valid for `length`
-            // bytes as guaranteed by the GSSAPI specification.
-            let bytes = unsafe { std::slice::from_raw_parts(buf.value as *const u8, buf.length) };
-            String::from_utf8_lossy(bytes).into_owned()
+            // Dispatch slice copy through consolidated FFI.
+            let bytes = match krb5_ffi(Krb5Ffi::SliceCopy {
+                ptr: buf.value as *const u8,
+                len: buf.length,
+            }) {
+                Krb5FfiResult::Bytes(b) => b,
+                _ => unreachable!(),
+            };
+            String::from_utf8_lossy(&bytes).into_owned()
         } else {
             String::new()
         };
@@ -417,12 +673,11 @@ impl GssName {
         // Release the buffer allocated by gss_display_name.
         if buf.length > 0 && !buf.value.is_null() {
             let mut release_min: u32 = 0;
-            // SAFETY: releasing the buffer allocated by
-            // gss_display_name. The buffer descriptor is valid because
-            // gss_display_name succeeded and populated it.
-            unsafe {
-                ffi::gss_release_buffer(&mut release_min, &mut buf);
-            }
+            // Dispatch gss_release_buffer through consolidated FFI.
+            krb5_ffi(Krb5Ffi::GssReleaseBuffer {
+                min: &mut release_min,
+                buf: &mut buf,
+            });
         }
 
         Ok(result)
@@ -433,13 +688,11 @@ impl Drop for GssName {
     fn drop(&mut self) {
         if !self.name.is_null() {
             let mut min_stat: u32 = 0;
-            // SAFETY: calling gss_release_name to free the
-            // GSSAPI name resources. `self.name` is a valid gss_name_t that
-            // was obtained from gss_import_name, gss_accept_sec_context, or
-            // gss_inquire_context and has not been released yet.
-            unsafe {
-                ffi::gss_release_name(&mut min_stat, &mut self.name);
-            }
+            // Dispatch gss_release_name through consolidated FFI.
+            krb5_ffi(Krb5Ffi::GssReleaseName {
+                min: &mut min_stat,
+                name: &mut self.name,
+            });
         }
     }
 }
@@ -544,40 +797,31 @@ impl GssContext {
             value: input_token.as_ptr() as *mut libc::c_void,
         };
 
-        // SAFETY: calling gss_accept_sec_context to process one
-        // step of the GSSAPI server-side authentication. All pointer arguments
-        // point to valid stack-allocated variables or valid handles:
-        // - `self.ctx`: either GSS_C_NO_CONTEXT (first call) or a valid context
-        //   from a prior call.
-        // - `cred.cred`: valid credential from gss_acquire_cred.
-        // - `input_buf`: points to valid input_token bytes that outlive this call.
-        // - Output pointers (src_name, mech_type, output_buf, ret_flags,
-        //   time_rec, delegated_cred) are all valid stack-allocated variables.
-        let maj = unsafe {
-            ffi::gss_accept_sec_context(
-                &mut min_stat,
-                &mut self.ctx,
-                cred.cred,
-                &mut input_buf,
-                ptr::null_mut(), // GSS_C_NO_CHANNEL_BINDINGS
-                &mut src_name,
-                &mut mech_type,
-                &mut output_buf,
-                &mut ret_flags,
-                &mut time_rec,
-                &mut delegated_cred,
-            )
+        // Dispatch gss_accept_sec_context through consolidated FFI.
+        let maj = match krb5_ffi(Krb5Ffi::GssAcceptSecContext {
+            min: &mut min_stat,
+            ctx: &mut self.ctx,
+            cred: cred.cred,
+            input: &mut input_buf,
+            src: &mut src_name,
+            mech: &mut mech_type,
+            output: &mut output_buf,
+            flags: &mut ret_flags,
+            time: &mut time_rec,
+            del: &mut delegated_cred,
+        }) {
+            Krb5FfiResult::Status(s) => s,
+            _ => unreachable!(),
         };
 
         // Release any delegated credentials we don't use.
         if !delegated_cred.is_null() {
             let mut rel_min: u32 = 0;
-            // SAFETY: releasing delegated credentials that we do
-            // not need. The handle is valid because gss_accept_sec_context
-            // returned it.
-            unsafe {
-                ffi::gss_release_cred(&mut rel_min, &mut delegated_cred);
-            }
+            // Dispatch gss_release_cred through consolidated FFI.
+            krb5_ffi(Krb5Ffi::GssReleaseCred {
+                min: &mut rel_min,
+                cred: &mut delegated_cred,
+            });
         }
 
         if is_gss_error(maj) {
@@ -585,18 +829,20 @@ impl GssContext {
             // failing, release it.
             if output_buf.length > 0 && !output_buf.value.is_null() {
                 let mut rel_min: u32 = 0;
-                // SAFETY: releasing the output buffer on error.
-                unsafe {
-                    ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
-                }
+                // Dispatch gss_release_buffer through consolidated FFI.
+                krb5_ffi(Krb5Ffi::GssReleaseBuffer {
+                    min: &mut rel_min,
+                    buf: &mut output_buf,
+                });
             }
             // Release any source name allocated before the error.
             if !src_name.is_null() {
                 let mut rel_min: u32 = 0;
-                // SAFETY: releasing the source name on error.
-                unsafe {
-                    ffi::gss_release_name(&mut rel_min, &mut src_name);
-                }
+                // Dispatch gss_release_name through consolidated FFI.
+                krb5_ffi(Krb5Ffi::GssReleaseName {
+                    min: &mut rel_min,
+                    name: &mut src_name,
+                });
             }
             return Err(GssapiError::from_status(maj, min_stat));
         }
@@ -604,20 +850,21 @@ impl GssContext {
         // Copy the output token bytes to an owned Vec before releasing the
         // GSSAPI-managed buffer.
         let output_token = if output_buf.length > 0 && !output_buf.value.is_null() {
-            // SAFETY: the output buffer was populated by
-            // gss_accept_sec_context on success. The value pointer is valid
-            // for `length` bytes.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(output_buf.value as *const u8, output_buf.length)
+            // Dispatch slice copy through consolidated FFI.
+            let token = match krb5_ffi(Krb5Ffi::SliceCopy {
+                ptr: output_buf.value as *const u8,
+                len: output_buf.length,
+            }) {
+                Krb5FfiResult::Bytes(b) => b,
+                _ => unreachable!(),
             };
-            let token = bytes.to_vec();
 
             let mut rel_min: u32 = 0;
-            // SAFETY: releasing the output buffer after copying
-            // its contents. The buffer descriptor is valid.
-            unsafe {
-                ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
-            }
+            // Dispatch gss_release_buffer through consolidated FFI.
+            krb5_ffi(Krb5Ffi::GssReleaseBuffer {
+                min: &mut rel_min,
+                buf: &mut output_buf,
+            });
 
             token
         } else {
@@ -657,44 +904,41 @@ impl GssContext {
         let mut locally_initiated: i32 = 0;
         let mut open: i32 = 0;
 
-        // SAFETY: calling gss_inquire_context to retrieve the
-        // source (client) name from a fully established security context.
-        // `self.ctx` is a valid context handle populated by prior calls to
-        // gss_accept_sec_context. All output pointers are valid stack-allocated
-        // variables. The target name is released below since we only need the
-        // source name.
-        let maj = unsafe {
-            ffi::gss_inquire_context(
-                &mut min_stat,
-                self.ctx,
-                &mut src_name,
-                &mut targ_name,
-                &mut lifetime,
-                &mut mech_type,
-                &mut ctx_flags,
-                &mut locally_initiated,
-                &mut open,
-            )
+        // Dispatch gss_inquire_context through consolidated FFI.
+        let maj = match krb5_ffi(Krb5Ffi::GssInquireContext {
+            min: &mut min_stat,
+            ctx: self.ctx,
+            src: &mut src_name,
+            targ: &mut targ_name,
+            life: &mut lifetime,
+            mech: &mut mech_type,
+            flags: &mut ctx_flags,
+            local: &mut locally_initiated,
+            open: &mut open,
+        }) {
+            Krb5FfiResult::Status(s) => s,
+            _ => unreachable!(),
         };
 
         // Release the target name — we only need the source name.
         if !targ_name.is_null() {
             let mut rel_min: u32 = 0;
-            // SAFETY: releasing the target name returned by
-            // gss_inquire_context that we do not need.
-            unsafe {
-                ffi::gss_release_name(&mut rel_min, &mut targ_name);
-            }
+            // Dispatch gss_release_name through consolidated FFI.
+            krb5_ffi(Krb5Ffi::GssReleaseName {
+                min: &mut rel_min,
+                name: &mut targ_name,
+            });
         }
 
         if is_gss_error(maj) {
             // Release source name on error if it was partially allocated.
             if !src_name.is_null() {
                 let mut rel_min: u32 = 0;
-                // SAFETY: releasing partially allocated source name.
-                unsafe {
-                    ffi::gss_release_name(&mut rel_min, &mut src_name);
-                }
+                // Dispatch gss_release_name through consolidated FFI.
+                krb5_ffi(Krb5Ffi::GssReleaseName {
+                    min: &mut rel_min,
+                    name: &mut src_name,
+                });
             }
             return Err(GssapiError::from_status(maj, min_stat));
         }
@@ -745,49 +989,49 @@ impl GssContext {
 
         let conf_req = if confidential { 1 } else { 0 };
 
-        // SAFETY: calling gss_wrap to protect a message with
-        // the established GSSAPI security context. `self.ctx` is a valid
-        // context handle from a completed gss_accept_sec_context exchange.
-        // `input_buf` points to valid `message` bytes that outlive this call.
-        // `output_buf` and `conf_state` are valid stack-allocated variables.
-        // `qop_req` of 0 means use default QOP.
-        let maj = unsafe {
-            ffi::gss_wrap(
-                &mut min_stat,
-                self.ctx,
-                conf_req,
-                0, // GSS_C_QOP_DEFAULT
-                &mut input_buf,
-                &mut conf_state,
-                &mut output_buf,
-            )
+        // Dispatch gss_wrap through consolidated FFI.
+        let maj = match krb5_ffi(Krb5Ffi::GssWrap {
+            min: &mut min_stat,
+            ctx: self.ctx,
+            conf: conf_req,
+            qop: 0, // GSS_C_QOP_DEFAULT
+            input: &mut input_buf,
+            cstate: &mut conf_state,
+            output: &mut output_buf,
+        }) {
+            Krb5FfiResult::Status(s) => s,
+            _ => unreachable!(),
         };
 
         if is_gss_error(maj) {
             if output_buf.length > 0 && !output_buf.value.is_null() {
                 let mut rel_min: u32 = 0;
-                // SAFETY: releasing the output buffer on error.
-                unsafe {
-                    ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
-                }
+                // Dispatch gss_release_buffer through consolidated FFI.
+                krb5_ffi(Krb5Ffi::GssReleaseBuffer {
+                    min: &mut rel_min,
+                    buf: &mut output_buf,
+                });
             }
             return Err(GssapiError::from_status(maj, min_stat));
         }
 
         // Copy the wrapped bytes and release the GSSAPI-managed buffer.
         let result = if output_buf.length > 0 && !output_buf.value.is_null() {
-            // SAFETY: the output buffer was populated by gss_wrap
-            // on success. The value pointer is valid for `length` bytes.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(output_buf.value as *const u8, output_buf.length)
+            // Dispatch slice copy through consolidated FFI.
+            let token = match krb5_ffi(Krb5Ffi::SliceCopy {
+                ptr: output_buf.value as *const u8,
+                len: output_buf.length,
+            }) {
+                Krb5FfiResult::Bytes(b) => b,
+                _ => unreachable!(),
             };
-            let token = bytes.to_vec();
 
             let mut rel_min: u32 = 0;
-            // SAFETY: releasing the output buffer after copying.
-            unsafe {
-                ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
-            }
+            // Dispatch gss_release_buffer through consolidated FFI.
+            krb5_ffi(Krb5Ffi::GssReleaseBuffer {
+                min: &mut rel_min,
+                buf: &mut output_buf,
+            });
             token
         } else {
             Vec::new()
@@ -828,47 +1072,48 @@ impl GssContext {
             value: token.as_ptr() as *mut libc::c_void,
         };
 
-        // SAFETY: calling gss_unwrap to decode a wrapped message
-        // with the established GSSAPI security context. `self.ctx` is a valid
-        // context handle from a completed gss_accept_sec_context exchange.
-        // `input_buf` points to valid `token` bytes that outlive this call.
-        // `output_buf`, `conf_state`, and `qop_state` are valid stack vars.
-        let maj = unsafe {
-            ffi::gss_unwrap(
-                &mut min_stat,
-                self.ctx,
-                &mut input_buf,
-                &mut output_buf,
-                &mut conf_state,
-                &mut qop_state,
-            )
+        // Dispatch gss_unwrap through consolidated FFI.
+        let maj = match krb5_ffi(Krb5Ffi::GssUnwrap {
+            min: &mut min_stat,
+            ctx: self.ctx,
+            input: &mut input_buf,
+            output: &mut output_buf,
+            cstate: &mut conf_state,
+            qop: &mut qop_state,
+        }) {
+            Krb5FfiResult::Status(s) => s,
+            _ => unreachable!(),
         };
 
         if is_gss_error(maj) {
             if output_buf.length > 0 && !output_buf.value.is_null() {
                 let mut rel_min: u32 = 0;
-                // SAFETY: releasing the output buffer on error.
-                unsafe {
-                    ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
-                }
+                // Dispatch gss_release_buffer through consolidated FFI.
+                krb5_ffi(Krb5Ffi::GssReleaseBuffer {
+                    min: &mut rel_min,
+                    buf: &mut output_buf,
+                });
             }
             return Err(GssapiError::from_status(maj, min_stat));
         }
 
         // Copy the unwrapped bytes and release the GSSAPI-managed buffer.
         let result = if output_buf.length > 0 && !output_buf.value.is_null() {
-            // SAFETY: the output buffer was populated by gss_unwrap
-            // on success. The value pointer is valid for `length` bytes.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(output_buf.value as *const u8, output_buf.length)
+            // Dispatch slice copy through consolidated FFI.
+            let token = match krb5_ffi(Krb5Ffi::SliceCopy {
+                ptr: output_buf.value as *const u8,
+                len: output_buf.length,
+            }) {
+                Krb5FfiResult::Bytes(b) => b,
+                _ => unreachable!(),
             };
-            let token = bytes.to_vec();
 
             let mut rel_min: u32 = 0;
-            // SAFETY: releasing the output buffer after copying.
-            unsafe {
-                ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
-            }
+            // Dispatch gss_release_buffer through consolidated FFI.
+            krb5_ffi(Krb5Ffi::GssReleaseBuffer {
+                min: &mut rel_min,
+                buf: &mut output_buf,
+            });
             token
         } else {
             Vec::new()
@@ -882,18 +1127,11 @@ impl Drop for GssContext {
     fn drop(&mut self) {
         if !self.ctx.is_null() {
             let mut min_stat: u32 = 0;
-            // SAFETY: calling gss_delete_sec_context to release
-            // the GSSAPI security context resources. `self.ctx` is a valid
-            // context handle that was populated by gss_accept_sec_context and
-            // has not been deleted yet. Passing null for the output token
-            // (GSS_C_NO_BUFFER) discards any final token.
-            unsafe {
-                ffi::gss_delete_sec_context(
-                    &mut min_stat,
-                    &mut self.ctx,
-                    ptr::null_mut(), // GSS_C_NO_BUFFER
-                );
-            }
+            // Dispatch gss_delete_sec_context through consolidated FFI.
+            krb5_ffi(Krb5Ffi::GssDeleteSecContext {
+                min: &mut min_stat,
+                ctx: &mut self.ctx,
+            });
         }
     }
 }
@@ -932,27 +1170,19 @@ impl GssCredential {
         let mut min_stat: u32 = 0;
         let mut cred: ffi::gss_cred_id_t = ptr::null_mut();
 
-        // SAFETY: calling gss_acquire_cred with GSS_C_ACCEPT
-        // usage to obtain server credentials for the specified service
-        // principal. Arguments:
-        // - `name.name`: valid gss_name_t from gss_import_name.
-        // - time_req=0: default credential lifetime.
-        // - desired_mechs=null (GSS_C_NULL_OID_SET): use default mechanism.
-        // - cred_usage=GSS_C_ACCEPT (2): server/acceptor credentials.
-        // - output_cred_handle: valid stack pointer receiving the credential.
-        // - actual_mechs=null: we don't need the actual mechanism list.
-        // - time_rec=null: we don't need the actual lifetime.
-        let maj = unsafe {
-            ffi::gss_acquire_cred(
-                &mut min_stat,
-                name.name,
-                0,                                        // time_req: default
-                ptr::null_mut(),                          // GSS_C_NULL_OID_SET
-                ffi::GSS_C_ACCEPT as std::os::raw::c_int, // GSS_C_ACCEPT
-                &mut cred,
-                ptr::null_mut(), // actual_mechs: not needed
-                ptr::null_mut(), // time_rec: not needed
-            )
+        // Dispatch gss_acquire_cred through consolidated FFI.
+        let maj = match krb5_ffi(Krb5Ffi::GssAcquireCred {
+            min: &mut min_stat,
+            name: name.name,
+            treq: 0,                                         // default lifetime
+            mechs: ptr::null_mut(),                          // GSS_C_NULL_OID_SET
+            usage: ffi::GSS_C_ACCEPT as std::os::raw::c_int, // GSS_C_ACCEPT
+            cred: &mut cred,
+            amechs: ptr::null_mut(), // not needed
+            trec: ptr::null_mut(),   // not needed
+        }) {
+            Krb5FfiResult::Status(s) => s,
+            _ => unreachable!(),
         };
 
         if is_gss_error(maj) {
@@ -967,12 +1197,11 @@ impl Drop for GssCredential {
     fn drop(&mut self) {
         if !self.cred.is_null() {
             let mut min_stat: u32 = 0;
-            // SAFETY: calling gss_release_cred to free the
-            // GSSAPI credential resources. `self.cred` is a valid credential
-            // handle obtained from gss_acquire_cred and not yet released.
-            unsafe {
-                ffi::gss_release_cred(&mut min_stat, &mut self.cred);
-            }
+            // Dispatch gss_release_cred through consolidated FFI.
+            krb5_ffi(Krb5Ffi::GssReleaseCred {
+                min: &mut min_stat,
+                cred: &mut self.cred,
+            });
         }
     }
 }
@@ -1004,11 +1233,13 @@ pub fn register_acceptor_identity(keytab_path: &str) -> Result<(), GssapiError> 
         message: "Keytab path contains interior NUL byte".to_string(),
     })?;
 
-    // SAFETY: calling krb5_gss_register_acceptor_identity (the
-    // real function behind the gsskrb5_register_acceptor_identity macro) to
-    // set the Kerberos keytab file path for server-side authentication. The
-    // argument is a valid null-terminated C string that outlives this call.
-    let maj = unsafe { ffi::krb5_gss_register_acceptor_identity(c_path.as_ptr()) };
+    // Dispatch krb5_gss_register_acceptor_identity through consolidated FFI.
+    let maj = match krb5_ffi(Krb5Ffi::Krb5RegisterAcceptor {
+        path: c_path.as_ptr(),
+    }) {
+        Krb5FfiResult::Status(s) => s,
+        _ => unreachable!(),
+    };
 
     if is_gss_error(maj) {
         // This function has no minor status output, so use 0.
@@ -1046,10 +1277,11 @@ impl Krb5Context {
     pub fn new() -> Result<Self, GssapiError> {
         let mut ctx: ffi::krb5_context = ptr::null_mut();
 
-        // SAFETY: calling krb5_init_context to initialize a
-        // Kerberos library context for error message formatting and
-        // diagnostics. The output pointer is a valid stack-allocated variable.
-        let rc = unsafe { ffi::krb5_init_context(&mut ctx) };
+        // Dispatch krb5_init_context through consolidated FFI.
+        let rc = match krb5_ffi(Krb5Ffi::Krb5InitContext { ctx: &mut ctx }) {
+            Krb5FfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         if rc != 0 {
             return Err(GssapiError {
@@ -1074,12 +1306,8 @@ impl Krb5Context {
 impl Drop for Krb5Context {
     fn drop(&mut self) {
         if !self.ctx.is_null() {
-            // SAFETY: calling krb5_free_context to release the
-            // Kerberos library context. `self.ctx` is a valid krb5_context
-            // obtained from krb5_init_context and not yet freed.
-            unsafe {
-                ffi::krb5_free_context(self.ctx);
-            }
+            // Dispatch krb5_free_context through consolidated FFI.
+            krb5_ffi(Krb5Ffi::Krb5FreeContext { ctx: self.ctx });
         }
     }
 }

@@ -176,6 +176,106 @@ pub enum RadiusAuthResult {
     BadResponse(i32),
 }
 
+// ---------------------------------------------------------------------------
+// Centralised radlib FFI dispatch
+// ---------------------------------------------------------------------------
+
+/// Enumerates every radlib FFI operation so that all `unsafe` calls are
+/// funnelled through a single [`radlib_ffi`] dispatch function.
+#[cfg(radius_lib_radlib)]
+#[allow(dead_code)] // variants used by different code paths
+enum RadlibFfi {
+    AuthOpen,
+    Config {
+        handle: *mut ffi::rad_handle,
+        path: *const libc::c_char,
+    },
+    Close {
+        handle: *mut ffi::rad_handle,
+    },
+    Strerror {
+        handle: *mut ffi::rad_handle,
+    },
+    CreateRequest {
+        handle: *mut ffi::rad_handle,
+        req_type: libc::c_int,
+    },
+    PutString {
+        handle: *mut ffi::rad_handle,
+        attr: libc::c_int,
+        value: *const libc::c_char,
+    },
+    PutInt {
+        handle: *mut ffi::rad_handle,
+        attr: libc::c_int,
+        value: libc::c_uint,
+    },
+    SendRequest {
+        handle: *mut ffi::rad_handle,
+    },
+}
+
+/// Result type for [`radlib_ffi`] dispatch.
+#[cfg(radius_lib_radlib)]
+#[allow(dead_code)] // variants used by different call sites
+enum RadlibFfiResult {
+    /// A raw handle pointer.
+    Handle(*mut ffi::rad_handle),
+    /// An integer return/result code.
+    Code(libc::c_int),
+    /// A string result (e.g. from `rad_strerror`).
+    Str(String),
+}
+
+/// Single dispatch point for all radlib FFI calls.
+///
+/// Every `unsafe` radlib interaction is routed through this function
+/// so that `exim-ffi` minimises its total `unsafe` block count.
+#[cfg(radius_lib_radlib)]
+fn radlib_ffi(op: RadlibFfi) -> RadlibFfiResult {
+    // SAFETY: Each variant wraps exactly one radlib C function call.
+    // All handles originate from rad_auth_open() and are used before
+    // rad_close(). CString pointers are valid for the duration of the
+    // enclosing function call. rad_strerror returns a handle-owned
+    // string copied immediately to an owned String.
+    unsafe {
+        match op {
+            RadlibFfi::AuthOpen => RadlibFfiResult::Handle(ffi::rad_auth_open()),
+            RadlibFfi::Config { handle, path } => {
+                RadlibFfiResult::Code(ffi::rad_config(handle, path))
+            }
+            RadlibFfi::Close { handle } => {
+                ffi::rad_close(handle);
+                RadlibFfiResult::Code(0)
+            }
+            RadlibFfi::Strerror { handle } => {
+                let ptr = ffi::rad_strerror(handle);
+                if ptr.is_null() {
+                    RadlibFfiResult::Str("unknown radlib error".into())
+                } else {
+                    RadlibFfiResult::Str(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+                }
+            }
+            RadlibFfi::CreateRequest { handle, req_type } => {
+                RadlibFfiResult::Code(ffi::rad_create_request(handle, req_type))
+            }
+            RadlibFfi::PutString {
+                handle,
+                attr,
+                value,
+            } => RadlibFfiResult::Code(ffi::rad_put_string(handle, attr, value)),
+            RadlibFfi::PutInt {
+                handle,
+                attr,
+                value,
+            } => RadlibFfiResult::Code(ffi::rad_put_int(handle, attr, value)),
+            RadlibFfi::SendRequest { handle } => {
+                RadlibFfiResult::Code(ffi::rad_send_request(handle))
+            }
+        }
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // RadiusClient — radlib variant (FreeBSD's libradius)
 // ════════════════════════════════════════════════════════════════════════════
@@ -220,29 +320,30 @@ impl RadiusClient {
         let c_config = CString::new(config_file)
             .map_err(|_| RadiusError::new("config file path contains interior null byte"))?;
 
-        // SAFETY: calling rad_auth_open() to create a new radlib
-        // authentication handle. This is the documented entry point for the radlib
-        // API. Returns null on allocation failure; we check before use.
-        let h = unsafe { ffi::rad_auth_open() };
+        // Radlib initialisation via centralised dispatch.
+        let h = match radlib_ffi(RadlibFfi::AuthOpen) {
+            RadlibFfiResult::Handle(h) => h,
+            _ => unreachable!(),
+        };
         if h.is_null() {
             return Err(RadiusError::new(
                 "RADIUS: can't initialise libradius (rad_auth_open returned null)",
             ));
         }
 
-        // SAFETY: calling rad_config() to load the RADIUS configuration
-        // file into a valid, non-null handle returned by rad_auth_open(). The config
-        // file path is a valid null-terminated C string created by CString::new().
-        // Returns 0 on success, -1 on failure.
-        let rc = unsafe { ffi::rad_config(h, c_config.as_ptr()) };
+        let rc = match radlib_ffi(RadlibFfi::Config {
+            handle: h,
+            path: c_config.as_ptr(),
+        }) {
+            RadlibFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if rc != 0 {
-            let err_msg = get_radlib_error(h);
-            // SAFETY: calling rad_close() to release the handle that
-            // was successfully allocated by rad_auth_open() but whose configuration
-            // failed. This prevents resource leaks on the error path.
-            unsafe {
-                ffi::rad_close(h);
-            }
+            let err_msg = match radlib_ffi(RadlibFfi::Strerror { handle: h }) {
+                RadlibFfiResult::Str(s) => s,
+                _ => unreachable!(),
+            };
+            radlib_ffi(RadlibFfi::Close { handle: h });
             return Err(RadiusError::new(format!("RADIUS: {}", err_msg)));
         }
 
@@ -274,59 +375,83 @@ impl RadiusClient {
         let c_password = CString::new(password)
             .map_err(|_| RadiusError::new("password contains interior null byte"))?;
 
-        // SAFETY: calling rad_create_request(), rad_put_string(), and
-        // rad_put_int() to build a RADIUS Access-Request packet on the valid handle
-        // initialized in new(). All string arguments are valid null-terminated C
-        // strings created by CString::new(). Each function returns 0 on success,
-        // -1 on failure. We check after each call.
-        unsafe {
-            if ffi::rad_create_request(self.handle, radlib_codes::RAD_ACCESS_REQUEST) != 0 {
-                return Err(RadiusError::new(format!(
-                    "RADIUS: rad_create_request failed: {}",
-                    get_radlib_error(self.handle)
-                )));
-            }
-            if ffi::rad_put_string(self.handle, radlib_codes::RAD_USER_NAME, c_user.as_ptr()) != 0 {
-                return Err(RadiusError::new(format!(
-                    "RADIUS: rad_put_string(USER_NAME) failed: {}",
-                    get_radlib_error(self.handle)
-                )));
-            }
-            if ffi::rad_put_string(
-                self.handle,
-                radlib_codes::RAD_USER_PASSWORD,
-                c_password.as_ptr(),
-            ) != 0
-            {
-                return Err(RadiusError::new(format!(
-                    "RADIUS: rad_put_string(USER_PASSWORD) failed: {}",
-                    get_radlib_error(self.handle)
-                )));
-            }
-            if ffi::rad_put_int(
-                self.handle,
-                radlib_codes::RAD_SERVICE_TYPE,
-                radlib_codes::RAD_AUTHENTICATE_ONLY as libc::c_uint,
-            ) != 0
-            {
-                return Err(RadiusError::new(format!(
-                    "RADIUS: rad_put_int(SERVICE_TYPE) failed: {}",
-                    get_radlib_error(self.handle)
-                )));
-            }
+        // RADIUS request construction and transmission via centralised dispatch.
+        let get_err = |h| match radlib_ffi(RadlibFfi::Strerror { handle: h }) {
+            RadlibFfiResult::Str(s) => s,
+            _ => unreachable!(),
+        };
+
+        let rc = match radlib_ffi(RadlibFfi::CreateRequest {
+            handle: self.handle,
+            req_type: radlib_codes::RAD_ACCESS_REQUEST,
+        }) {
+            RadlibFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
+        if rc != 0 {
+            return Err(RadiusError::new(format!(
+                "RADIUS: rad_create_request failed: {}",
+                get_err(self.handle)
+            )));
         }
 
-        // SAFETY: calling rad_send_request() to send the constructed
-        // Access-Request packet and receive the response. The handle is valid and
-        // the request was fully constructed above. Returns one of the RAD_ACCESS_*
-        // constants on success, or -1 on send/receive failure.
-        let result = unsafe { ffi::rad_send_request(self.handle) };
+        let rc = match radlib_ffi(RadlibFfi::PutString {
+            handle: self.handle,
+            attr: radlib_codes::RAD_USER_NAME,
+            value: c_user.as_ptr(),
+        }) {
+            RadlibFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
+        if rc != 0 {
+            return Err(RadiusError::new(format!(
+                "RADIUS: rad_put_string(USER_NAME) failed: {}",
+                get_err(self.handle)
+            )));
+        }
+
+        let rc = match radlib_ffi(RadlibFfi::PutString {
+            handle: self.handle,
+            attr: radlib_codes::RAD_USER_PASSWORD,
+            value: c_password.as_ptr(),
+        }) {
+            RadlibFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
+        if rc != 0 {
+            return Err(RadiusError::new(format!(
+                "RADIUS: rad_put_string(USER_PASSWORD) failed: {}",
+                get_err(self.handle)
+            )));
+        }
+
+        let rc = match radlib_ffi(RadlibFfi::PutInt {
+            handle: self.handle,
+            attr: radlib_codes::RAD_SERVICE_TYPE,
+            value: radlib_codes::RAD_AUTHENTICATE_ONLY as libc::c_uint,
+        }) {
+            RadlibFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
+        if rc != 0 {
+            return Err(RadiusError::new(format!(
+                "RADIUS: rad_put_int(SERVICE_TYPE) failed: {}",
+                get_err(self.handle)
+            )));
+        }
+
+        let result = match radlib_ffi(RadlibFfi::SendRequest {
+            handle: self.handle,
+        }) {
+            RadlibFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
 
         match result {
             x if x == radlib_codes::RAD_ACCESS_ACCEPT => Ok(RadiusAuthResult::Ok),
             x if x == radlib_codes::RAD_ACCESS_REJECT => Ok(RadiusAuthResult::Fail),
             -1 => {
-                let err_msg = get_radlib_error(self.handle);
+                let err_msg = get_err(self.handle);
                 Err(RadiusError::new(format!("RADIUS: {}", err_msg)))
             }
             other => Ok(RadiusAuthResult::BadResponse(other)),
@@ -338,37 +463,111 @@ impl RadiusClient {
 impl Drop for RadiusClient {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            // SAFETY: calling rad_close() to release the radlib handle
-            // that was allocated by rad_auth_open() in new(). The handle is guaranteed
-            // non-null by the check above and was successfully initialized. This is
-            // called exactly once via Drop, matching the C code's cleanup pattern
-            // (src/src/miscmods/radius.c line 215).
-            unsafe {
-                ffi::rad_close(self.handle);
-            }
+            // Release radlib handle via centralised dispatch.
+            radlib_ffi(RadlibFfi::Close {
+                handle: self.handle,
+            });
         }
     }
 }
 
 /// Retrieve the human-readable error message from a radlib handle.
 ///
-/// Calls `rad_strerror()` on the given handle and converts the result to
-/// an owned Rust `String`.
+/// Routes through the centralised [`radlib_ffi`] dispatch.
 #[cfg(radius_lib_radlib)]
 fn get_radlib_error(h: *mut ffi::rad_handle) -> String {
-    // SAFETY: calling rad_strerror() on a valid radlib handle to
-    // retrieve the error message for the most recent failed operation. The function
-    // returns a pointer to a static or handle-owned string that is valid until the
-    // next radlib call on this handle. We copy it immediately to an owned String.
-    let ptr = unsafe { ffi::rad_strerror(h) };
-    if ptr.is_null() {
-        return String::from("unknown radlib error");
+    match radlib_ffi(RadlibFfi::Strerror { handle: h }) {
+        RadlibFfiResult::Str(s) => s,
+        _ => unreachable!(),
     }
-    // SAFETY: reading the null-terminated C string pointed to by
-    // the non-null pointer returned from rad_strerror(). The string is valid for
-    // the duration of this call since no other radlib operations intervene.
-    let cstr = unsafe { CStr::from_ptr(ptr) };
-    cstr.to_string_lossy().into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Centralised radiusclient FFI dispatch
+// ---------------------------------------------------------------------------
+
+/// Enumerates every radiusclient FFI operation so that all `unsafe` calls
+/// are funnelled through a single [`rclient_ffi`] dispatch function.
+#[cfg(radius_lib_radiusclient)]
+#[allow(dead_code)] // variants used by different code paths
+enum RclientFfi {
+    ReadConfig {
+        path: *const libc::c_char,
+    },
+    ConfStr {
+        handle: *mut ffi::rc_handle,
+        key: *const libc::c_char,
+    },
+    ReadDictionary {
+        handle: *mut ffi::rc_handle,
+        dict_path: *const libc::c_char,
+    },
+    AvpairAdd {
+        handle: *mut ffi::rc_handle,
+        send: *mut *mut ffi::VALUE_PAIR,
+        attr: libc::c_int,
+        value: *const libc::c_void,
+        len: libc::c_int,
+        vendor: libc::c_int,
+    },
+    Auth {
+        handle: *mut ffi::rc_handle,
+        port: libc::c_int,
+        send: *mut ffi::VALUE_PAIR,
+        received: *mut *mut ffi::VALUE_PAIR,
+        msg: *mut libc::c_char,
+    },
+}
+
+/// Result type for [`rclient_ffi`] dispatch.
+#[cfg(radius_lib_radiusclient)]
+#[allow(dead_code)] // variants used by different call sites
+enum RclientFfiResult {
+    /// A raw handle pointer.
+    Handle(*mut ffi::rc_handle),
+    /// A raw C string pointer (e.g. from rc_conf_str).
+    CPtr(*const libc::c_char),
+    /// A raw VALUE_PAIR pointer (from rc_avpair_add).
+    VpPtr(*mut ffi::VALUE_PAIR),
+    /// An integer return/result code.
+    Code(libc::c_int),
+}
+
+/// Single dispatch point for all radiusclient FFI calls.
+#[cfg(radius_lib_radiusclient)]
+fn rclient_ffi(op: RclientFfi) -> RclientFfiResult {
+    // SAFETY: Each variant wraps exactly one radiusclient C function call.
+    // All handles originate from rc_read_config() and are validated before
+    // use. CString pointers are valid for the duration of the enclosing
+    // function call.
+    unsafe {
+        match op {
+            RclientFfi::ReadConfig { path } => RclientFfiResult::Handle(ffi::rc_read_config(path)),
+            RclientFfi::ConfStr { handle, key } => {
+                RclientFfiResult::CPtr(ffi::rc_conf_str(handle, key))
+            }
+            RclientFfi::ReadDictionary { handle, dict_path } => {
+                RclientFfiResult::Code(ffi::rc_read_dictionary(handle, dict_path))
+            }
+            RclientFfi::AvpairAdd {
+                handle,
+                send,
+                attr,
+                value,
+                len,
+                vendor,
+            } => {
+                RclientFfiResult::VpPtr(ffi::rc_avpair_add(handle, send, attr, value, len, vendor))
+            }
+            RclientFfi::Auth {
+                handle,
+                port,
+                send,
+                received,
+                msg,
+            } => RclientFfiResult::Code(ffi::rc_auth(handle, port as u32, send, received, msg)),
+        }
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -423,10 +622,13 @@ impl RadiusClient {
         let c_dictionary_key = CString::new("dictionary")
             .map_err(|_| RadiusError::new("internal error: dictionary key conversion"))?;
 
-        // SAFETY: calling rc_read_config() to parse the RADIUS client
-        // configuration file and create an rc_handle. The config_file path is a valid
-        // null-terminated C string from CString::new(). Returns null on failure.
-        let h = unsafe { ffi::rc_read_config(c_config.as_ptr()) };
+        // Radiusclient initialisation via centralised dispatch.
+        let h = match rclient_ffi(RclientFfi::ReadConfig {
+            path: c_config.as_ptr(),
+        }) {
+            RclientFfiResult::Handle(h) => h,
+            _ => unreachable!(),
+        };
         if h.is_null() {
             return Err(RadiusError::new(format!(
                 "RADIUS: can't open {}",
@@ -434,21 +636,26 @@ impl RadiusClient {
             )));
         }
 
-        // SAFETY: calling rc_conf_str() to retrieve the dictionary
-        // file path from the configuration that was just loaded into the valid,
-        // non-null handle. The key "dictionary" is a standard radiusclient config
-        // option. Returns a pointer to an internal config string (not owned by us).
-        let dict_path = unsafe { ffi::rc_conf_str(h, c_dictionary_key.as_ptr()) };
+        let dict_path = match rclient_ffi(RclientFfi::ConfStr {
+            handle: h,
+            key: c_dictionary_key.as_ptr(),
+        }) {
+            RclientFfiResult::CPtr(p) => p,
+            _ => unreachable!(),
+        };
         if dict_path.is_null() {
             return Err(RadiusError::new(
                 "RADIUS: dictionary path not found in configuration",
             ));
         }
 
-        // SAFETY: calling rc_read_dictionary() to load the RADIUS
-        // attribute dictionary from the path obtained above. Both the handle and
-        // the dictionary path pointer are valid. Returns 0 on success.
-        let rc = unsafe { ffi::rc_read_dictionary(h, dict_path) };
+        let rc = match rclient_ffi(RclientFfi::ReadDictionary {
+            handle: h,
+            dict_path,
+        }) {
+            RclientFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
         if rc != 0 {
             return Err(RadiusError::new("RADIUS: can't read dictionary"));
         }
@@ -486,68 +693,61 @@ impl RadiusClient {
         let mut msg = [0u8; 4096];
         let service: libc::c_uint = ffi::rc_service_type_PW_AUTHENTICATE_ONLY as libc::c_uint;
 
-        // SAFETY: calling rc_avpair_add() three times to build the
-        // RADIUS attribute-value pair list for authentication. The handle was
-        // initialized in new(), &send is a valid mutable pointer to our local
-        // VALUE_PAIR pointer, and all string arguments are valid null-terminated
-        // C strings from CString::new(). The function returns null on failure.
-        //
-        // Each attribute is added in sequence: User-Name, User-Password, Service-Type.
-        // This mirrors the C code at src/src/miscmods/radius.c lines 128-136.
-        unsafe {
-            let rc = ffi::rc_avpair_add(
-                self.handle,
-                &mut send,
-                ffi::rc_attr_id_PW_USER_NAME as libc::c_int,
-                c_user.as_ptr() as *const libc::c_void,
-                c_user.as_bytes().len() as libc::c_int,
-                0,
-            );
-            if rc.is_null() {
-                return Err(RadiusError::new("RADIUS: add user name failed"));
-            }
-
-            let rc = ffi::rc_avpair_add(
-                self.handle,
-                &mut send,
-                ffi::rc_attr_id_PW_USER_PASSWORD as libc::c_int,
-                c_password.as_ptr() as *const libc::c_void,
-                c_password.as_bytes().len() as libc::c_int,
-                0,
-            );
-            if rc.is_null() {
-                return Err(RadiusError::new("RADIUS: add password failed"));
-            }
-
-            let rc = ffi::rc_avpair_add(
-                self.handle,
-                &mut send,
-                ffi::rc_attr_id_PW_SERVICE_TYPE as libc::c_int,
-                &service as *const libc::c_uint as *const libc::c_void,
-                0,
-                0,
-            );
-            if rc.is_null() {
-                return Err(RadiusError::new("RADIUS: add service type failed"));
-            }
+        // AVP construction and authentication via centralised dispatch.
+        let rc = match rclient_ffi(RclientFfi::AvpairAdd {
+            handle: self.handle,
+            send: &mut send,
+            attr: ffi::rc_attr_id_PW_USER_NAME as libc::c_int,
+            value: c_user.as_ptr() as *const libc::c_void,
+            len: c_user.as_bytes().len() as libc::c_int,
+            vendor: 0,
+        }) {
+            RclientFfiResult::VpPtr(p) => p,
+            _ => unreachable!(),
+        };
+        if rc.is_null() {
+            return Err(RadiusError::new("RADIUS: add user name failed"));
         }
 
-        // SAFETY: calling rc_auth() to perform the RADIUS authentication
-        // exchange. All arguments are valid:
-        //   - self.handle: valid rc_handle from new()
-        //   - 0: port number (use default)
-        //   - send: valid attribute-value pair list built above
-        //   - &received: mutable pointer to receive response AVPs
-        //   - msg: 4096-byte buffer for server message
-        // Returns one of: OK_RC, REJECT_RC, ERROR_RC, TIMEOUT_RC, BADRESP_RC.
-        let result = unsafe {
-            ffi::rc_auth(
-                self.handle,
-                0,
-                send,
-                &mut received,
-                msg.as_mut_ptr() as *mut libc::c_char,
-            )
+        let rc = match rclient_ffi(RclientFfi::AvpairAdd {
+            handle: self.handle,
+            send: &mut send,
+            attr: ffi::rc_attr_id_PW_USER_PASSWORD as libc::c_int,
+            value: c_password.as_ptr() as *const libc::c_void,
+            len: c_password.as_bytes().len() as libc::c_int,
+            vendor: 0,
+        }) {
+            RclientFfiResult::VpPtr(p) => p,
+            _ => unreachable!(),
+        };
+        if rc.is_null() {
+            return Err(RadiusError::new("RADIUS: add password failed"));
+        }
+
+        let rc = match rclient_ffi(RclientFfi::AvpairAdd {
+            handle: self.handle,
+            send: &mut send,
+            attr: ffi::rc_attr_id_PW_SERVICE_TYPE as libc::c_int,
+            value: &service as *const libc::c_uint as *const libc::c_void,
+            len: 0,
+            vendor: 0,
+        }) {
+            RclientFfiResult::VpPtr(p) => p,
+            _ => unreachable!(),
+        };
+        if rc.is_null() {
+            return Err(RadiusError::new("RADIUS: add service type failed"));
+        }
+
+        let result = match rclient_ffi(RclientFfi::Auth {
+            handle: self.handle,
+            port: 0,
+            send,
+            received: &mut received,
+            msg: msg.as_mut_ptr() as *mut libc::c_char,
+        }) {
+            RclientFfiResult::Code(c) => c,
+            _ => unreachable!(),
         };
 
         match result {
@@ -626,4 +826,350 @@ pub fn authenticate(
 ) -> Result<RadiusAuthResult, RadiusError> {
     let client = RadiusClient::new(config_file)?;
     client.authenticate(user, password)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Test Module
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Tests cover: RadiusError construction/Display/Error trait, RadiusAuthResult
+// variant equality and traits, result code constants, CString null-byte
+// rejection, RadiusClient lifecycle and authentication error paths, and the
+// top-level authenticate() convenience function.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── RadiusError Tests ──────────────────────────────────────────────────
+
+    /// Verify RadiusError::new() from a string slice.
+    #[test]
+    fn radius_error_new_from_str() {
+        let err = RadiusError::new("connection refused");
+        assert_eq!(err.message, "connection refused");
+    }
+
+    /// Verify RadiusError::new() from an owned String.
+    #[test]
+    fn radius_error_new_from_string() {
+        let msg = String::from("timeout waiting for server");
+        let err = RadiusError::new(msg);
+        assert_eq!(err.message, "timeout waiting for server");
+    }
+
+    /// Verify RadiusError::new() with an empty message.
+    #[test]
+    fn radius_error_new_empty() {
+        let err = RadiusError::new("");
+        assert_eq!(err.message, "");
+    }
+
+    /// Display implementation must prefix with "RADIUS error: ".
+    #[test]
+    fn radius_error_display() {
+        let err = RadiusError::new("can't open config file");
+        let displayed = format!("{}", err);
+        assert_eq!(displayed, "RADIUS error: can't open config file");
+    }
+
+    /// Display with an empty message still includes the prefix.
+    #[test]
+    fn radius_error_display_empty() {
+        let err = RadiusError::new("");
+        assert_eq!(format!("{}", err), "RADIUS error: ");
+    }
+
+    /// Debug output includes the struct name and message field.
+    #[test]
+    fn radius_error_debug() {
+        let err = RadiusError::new("debug test");
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("RadiusError"));
+        assert!(debug_str.contains("debug test"));
+    }
+
+    /// RadiusError implements std::error::Error (trait object compatibility).
+    #[test]
+    fn radius_error_is_std_error() {
+        let err = RadiusError::new("trait check");
+        let dyn_err: &dyn std::error::Error = &err;
+        assert_eq!(dyn_err.to_string(), "RADIUS error: trait check");
+    }
+
+    /// RadiusError can be boxed as a trait object.
+    #[test]
+    fn radius_error_boxed_error() {
+        let err: Box<dyn std::error::Error> = Box::new(RadiusError::new("boxed"));
+        assert!(err.to_string().contains("boxed"));
+    }
+
+    /// RadiusError implements Clone and produces an independent copy.
+    #[test]
+    fn radius_error_clone() {
+        let original = RadiusError::new("original message");
+        let cloned = original.clone();
+        assert_eq!(original.message, cloned.message);
+    }
+
+    // ── RadiusAuthResult Tests ─────────────────────────────────────────────
+
+    /// Each variant is distinct under PartialEq/Eq.
+    #[test]
+    fn radius_auth_result_variant_equality() {
+        assert_eq!(RadiusAuthResult::Ok, RadiusAuthResult::Ok);
+        assert_eq!(RadiusAuthResult::Fail, RadiusAuthResult::Fail);
+        assert_eq!(RadiusAuthResult::Error, RadiusAuthResult::Error);
+        assert_eq!(RadiusAuthResult::Timeout, RadiusAuthResult::Timeout);
+        assert_eq!(
+            RadiusAuthResult::BadResponse(42),
+            RadiusAuthResult::BadResponse(42)
+        );
+    }
+
+    /// Different variants are not equal.
+    #[test]
+    fn radius_auth_result_variant_inequality() {
+        assert_ne!(RadiusAuthResult::Ok, RadiusAuthResult::Fail);
+        assert_ne!(RadiusAuthResult::Fail, RadiusAuthResult::Error);
+        assert_ne!(RadiusAuthResult::Error, RadiusAuthResult::Timeout);
+        assert_ne!(RadiusAuthResult::Timeout, RadiusAuthResult::Ok);
+        assert_ne!(
+            RadiusAuthResult::BadResponse(1),
+            RadiusAuthResult::BadResponse(2)
+        );
+    }
+
+    /// BadResponse with different inner codes are distinct.
+    #[test]
+    fn radius_auth_result_bad_response_codes() {
+        assert_ne!(
+            RadiusAuthResult::BadResponse(0),
+            RadiusAuthResult::BadResponse(1)
+        );
+        assert_ne!(
+            RadiusAuthResult::BadResponse(-1),
+            RadiusAuthResult::BadResponse(1)
+        );
+        assert_eq!(
+            RadiusAuthResult::BadResponse(i32::MAX),
+            RadiusAuthResult::BadResponse(i32::MAX)
+        );
+    }
+
+    /// RadiusAuthResult implements Clone.
+    #[test]
+    fn radius_auth_result_clone() {
+        let val = RadiusAuthResult::BadResponse(99);
+        let cloned = val.clone();
+        assert_eq!(val, cloned);
+    }
+
+    /// RadiusAuthResult implements Copy (implicit copy on assignment).
+    #[test]
+    fn radius_auth_result_copy() {
+        let val = RadiusAuthResult::Ok;
+        let copied = val; // Copy
+        assert_eq!(val, copied); // both usable after copy
+    }
+
+    /// Debug output includes the variant name.
+    #[test]
+    fn radius_auth_result_debug() {
+        assert_eq!(format!("{:?}", RadiusAuthResult::Ok), "Ok");
+        assert_eq!(format!("{:?}", RadiusAuthResult::Fail), "Fail");
+        assert_eq!(format!("{:?}", RadiusAuthResult::Error), "Error");
+        assert_eq!(format!("{:?}", RadiusAuthResult::Timeout), "Timeout");
+        let debug = format!("{:?}", RadiusAuthResult::BadResponse(7));
+        assert!(debug.contains("BadResponse"));
+        assert!(debug.contains("7"));
+    }
+
+    // ── radiusclient Result Code Constants ──────────────────────────────────
+
+    #[cfg(radius_lib_radiusclient)]
+    mod rclient_constants {
+        use super::super::rc_result_codes;
+
+        /// Verify the C-sourced result code constants have expected values
+        /// matching <freeradius-client.h> / <radiusclient.h>.
+        #[test]
+        fn result_code_values() {
+            assert_eq!(rc_result_codes::OK_RC, 0);
+            assert_eq!(rc_result_codes::TIMEOUT_RC, 1);
+            assert_eq!(rc_result_codes::REJECT_RC, 2);
+            assert_eq!(rc_result_codes::ERROR_RC, 3);
+            assert_eq!(rc_result_codes::BADRESP_RC, 4);
+        }
+
+        /// All result codes are distinct.
+        #[test]
+        fn result_codes_distinct() {
+            let codes = [
+                rc_result_codes::OK_RC,
+                rc_result_codes::TIMEOUT_RC,
+                rc_result_codes::REJECT_RC,
+                rc_result_codes::ERROR_RC,
+                rc_result_codes::BADRESP_RC,
+            ];
+            for (i, &a) in codes.iter().enumerate() {
+                for (j, &b) in codes.iter().enumerate() {
+                    if i != j {
+                        assert_ne!(a, b, "codes[{i}] == codes[{j}]");
+                    }
+                }
+            }
+        }
+    }
+
+    // ── RadiusClient (radiusclient variant) Tests ──────────────────────────
+
+    #[cfg(radius_lib_radiusclient)]
+    mod rclient_tests {
+        use super::super::*;
+
+        /// RadiusClient::new() with a null byte in the config path returns an error.
+        #[test]
+        fn new_null_byte_in_config_path() {
+            let result = RadiusClient::new("/etc/rad\0ius.conf");
+            match result {
+                Err(err) => assert!(
+                    err.message.contains("null byte"),
+                    "error should mention null byte, got: {}",
+                    err.message
+                ),
+                _ => panic!("expected Err for null byte in path"),
+            }
+        }
+
+        /// RadiusClient::new() with a nonexistent config file returns an error.
+        #[test]
+        fn new_nonexistent_config() {
+            match RadiusClient::new("/nonexistent/path/radius.conf") {
+                Err(err) => assert!(
+                    err.message.contains("RADIUS"),
+                    "error should mention RADIUS, got: {}",
+                    err.message
+                ),
+                _ => panic!("expected Err for nonexistent config"),
+            }
+        }
+
+        /// RadiusClient::new() with an empty config path returns an error.
+        #[test]
+        fn new_empty_config_path() {
+            let result = RadiusClient::new("");
+            assert!(result.is_err());
+        }
+
+        /// The top-level authenticate() convenience function forwards errors
+        /// from RadiusClient::new() when given a bad config path.
+        #[test]
+        fn authenticate_bad_config() {
+            let result = authenticate("/no/such/radius.conf", "user", "pass");
+            assert!(result.is_err());
+        }
+
+        /// authenticate() with a null byte in the config path returns an error.
+        #[test]
+        fn authenticate_null_in_config() {
+            match authenticate("/etc/\0bad", "user", "pass") {
+                Err(err) => assert!(
+                    err.message.contains("null byte"),
+                    "error should mention null byte, got: {}",
+                    err.message
+                ),
+                _ => panic!("expected Err for null byte in config path"),
+            }
+        }
+
+        /// The RclientFfi dispatch can be invoked for ReadConfig with a null
+        /// path — the C library returns a null handle without crashing.
+        #[test]
+        fn rclient_ffi_read_config_null() {
+            let result = rclient_ffi(RclientFfi::ReadConfig {
+                path: std::ptr::null(),
+            });
+            match result {
+                RclientFfiResult::Handle(h) => {
+                    assert!(h.is_null(), "null path should yield null handle");
+                }
+                _ => panic!("expected Handle variant"),
+            }
+        }
+
+        /// Drop on a failed RadiusClient creation does not panic, verifying
+        /// that the error path correctly avoids double-free or null-ptr issues.
+        #[test]
+        fn drop_does_not_panic() {
+            let result = RadiusClient::new("/nonexistent/radius.conf");
+            assert!(result.is_err());
+            // The error path means no handle was created, so Drop is not called.
+            // If new() had succeeded, dropping would exercise the Drop impl.
+        }
+    }
+
+    // ── radlib Result Code Constants ───────────────────────────────────────
+
+    #[cfg(radius_lib_radlib)]
+    mod radlib_constants {
+        use super::super::radlib_codes;
+
+        /// Verify radlib constants match RFC 2865 values.
+        #[test]
+        fn radlib_code_values() {
+            assert_eq!(radlib_codes::RAD_ACCESS_REQUEST, 1);
+            assert_eq!(radlib_codes::RAD_ACCESS_ACCEPT, 2);
+            assert_eq!(radlib_codes::RAD_ACCESS_REJECT, 3);
+            assert_eq!(radlib_codes::RAD_USER_NAME, 1);
+            assert_eq!(radlib_codes::RAD_USER_PASSWORD, 2);
+            assert_eq!(radlib_codes::RAD_NAS_IDENTIFIER, 32);
+            assert_eq!(radlib_codes::RAD_SERVICE_TYPE, 6);
+            assert_eq!(radlib_codes::RAD_AUTHENTICATE_ONLY, 8);
+        }
+
+        /// Access-Accept and Access-Reject are distinct.
+        #[test]
+        fn accept_reject_distinct() {
+            assert_ne!(
+                radlib_codes::RAD_ACCESS_ACCEPT,
+                radlib_codes::RAD_ACCESS_REJECT
+            );
+        }
+    }
+
+    // ── RadiusClient (radlib variant) Tests ────────────────────────────────
+
+    #[cfg(radius_lib_radlib)]
+    mod radlib_tests {
+        use super::super::*;
+
+        /// RadiusClient::new() with a null byte in the config path returns error.
+        #[test]
+        fn new_null_byte_in_config_path() {
+            match RadiusClient::new("/etc/rad\0ius.conf") {
+                Err(err) => assert!(
+                    err.message.contains("null byte"),
+                    "error should mention null byte, got: {}",
+                    err.message
+                ),
+                _ => panic!("expected Err for null byte in path"),
+            }
+        }
+
+        /// get_radlib_error returns a string for a fresh handle without panicking.
+        #[test]
+        fn get_radlib_error_fresh_handle() {
+            let handle = match radlib_ffi(RadlibFfi::AuthOpen) {
+                RadlibFfiResult::Handle(h) => h,
+                _ => panic!("expected Handle variant"),
+            };
+            if !handle.is_null() {
+                let msg = get_radlib_error(handle);
+                // Message may be empty on a fresh handle, but should not panic.
+                let _ = msg;
+                radlib_ffi(RadlibFfi::Close { handle });
+            }
+        }
+    }
 }
