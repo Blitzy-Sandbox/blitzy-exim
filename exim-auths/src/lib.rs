@@ -56,3 +56,12 @@ pub mod external;
 /// domain socket, relaying SASL exchanges to the Dovecot authentication daemon.
 #[cfg(feature = "auth-dovecot")]
 pub mod dovecot;
+
+/// Cyrus SASL authenticator driver (generic, mechanism-independent).
+/// Replaces C `src/src/auths/cyrus_sasl.c` + `cyrus_sasl.h` — delegates
+/// server-side SASL authentication to the Cyrus SASL library (libsasl2) via
+/// `exim-ffi`. Supports all mechanisms installed as libsasl2 plugins
+/// (PLAIN, LOGIN, CRAM-MD5, DIGEST-MD5, SCRAM, GSSAPI, etc.).
+/// Client-side auth is explicitly a stub (not implemented in C either).
+#[cfg(feature = "auth-cyrus-sasl")]
+pub mod cyrus_sasl;

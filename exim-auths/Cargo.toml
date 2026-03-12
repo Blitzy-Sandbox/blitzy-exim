@@ -74,7 +74,7 @@ auth-cram-md5 = []
 # Cyrus SASL: Delegates authentication to the Cyrus SASL library (libsasl2).
 # Requires FFI bindings from exim-ffi for libsasl2 interop.
 # Replaces AUTH_CYRUS_SASL / cyrus_sasl.c from the C build.
-auth-cyrus-sasl = ["dep:exim-ffi"]
+auth-cyrus-sasl = ["dep:exim-ffi", "exim-ffi/ffi-cyrus-sasl"]
 
 # Dovecot: Authenticates via the Dovecot auth socket protocol.
 # Pure Rust implementation using Unix domain socket I/O.
