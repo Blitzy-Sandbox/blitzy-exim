@@ -31,6 +31,7 @@
 pub mod bounce;
 pub mod journal;
 pub mod orchestrator;
+pub mod parallel;
 pub mod retry;
 pub mod routing;
 
@@ -45,6 +46,10 @@ pub use orchestrator::{
     common_error, deliver_make_addr, deliver_message, deliver_msglog, deliver_set_expansions,
     deliver_split_address, post_process_one, AddressFlags, AddressItem, AddressLists,
     AddressProperties, DeliveryError, DeliveryResult, ProcessRecipients,
+};
+pub use parallel::{
+    sort_remote_deliveries, write_delivery_result, ParData, ParallelDeliveryManager,
+    PipeMessageType, PIPE_HEADER_SIZE,
 };
 pub use retry::{
     retry_add_item, retry_check_address, retry_find_config, retry_host_key_build,

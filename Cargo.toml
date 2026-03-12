@@ -112,7 +112,7 @@ log = "0.4.29"
 
 # ── System interfaces and FFI ─────────────────────────────────────────────
 libc = "0.2.183"
-nix = { version = "0.31.2", features = ["signal", "process", "socket", "user"] }
+nix = { version = "0.31.2", features = ["signal", "process", "socket", "user", "poll", "fs"] }
 
 # ── Bitflag types ─────────────────────────────────────────────────────────
 bitflags = "2.10.0"
