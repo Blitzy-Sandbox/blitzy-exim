@@ -7,5 +7,7 @@
 //! # Submodules
 //!
 //! - [`pipelining`] — PIPELINING support and custom buffered I/O
+//! - [`chunking`] — CHUNKING/BDAT support (RFC 3030)
 
+pub mod chunking;
 pub mod pipelining;
