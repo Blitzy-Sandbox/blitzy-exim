@@ -40,3 +40,12 @@ pub mod heimdal_gssapi;
 /// configuration via libgsasl through `exim-ffi`.
 #[cfg(feature = "auth-gsasl")]
 pub mod gsasl;
+
+/// SASL EXTERNAL mechanism authenticator driver.
+/// Replaces C `src/src/auths/external.c` + `external.h` — implements
+/// RFC 4422 Appendix A with both server and client sides.  Server side
+/// parses initial response into $authN variables, expands server_param2/3,
+/// and evaluates server_condition.  Client side sends AUTH EXTERNAL
+/// with an expanded initial response.
+#[cfg(feature = "auth-external")]
+pub mod external;
