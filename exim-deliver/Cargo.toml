@@ -137,6 +137,12 @@ prdr = []
 
 [dependencies]
 
+# bitflags: Bitflag type macro for RetryItemFlags, defining combinable flags
+# DELETE (0x0001), HOST (0x0002), MESSAGE (0x0004) that map to C rf_delete,
+# rf_host, rf_message constants used in retry_add_item() and retry_update()
+# to control retry item behavior.
+bitflags = { workspace = true }
+
 # ── Workspace-internal crate dependencies ────────────────────────────────────
 
 # exim-routers: Router chain evaluation via the RouterDriver trait. The

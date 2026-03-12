@@ -734,6 +734,7 @@ name = "exim-deliver"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitflags",
  "exim-config",
  "exim-drivers",
  "exim-expand",

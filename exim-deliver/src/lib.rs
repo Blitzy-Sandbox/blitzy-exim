@@ -31,6 +31,7 @@
 pub mod bounce;
 pub mod journal;
 pub mod orchestrator;
+pub mod retry;
 
 // Re-export primary public types for ergonomic access
 pub use bounce::{
@@ -43,4 +44,9 @@ pub use orchestrator::{
     common_error, deliver_make_addr, deliver_message, deliver_msglog, deliver_set_expansions,
     deliver_split_address, post_process_one, AddressFlags, AddressItem, AddressLists,
     AddressProperties, DeliveryError, DeliveryResult, ProcessRecipients,
+};
+pub use retry::{
+    retry_add_item, retry_check_address, retry_find_config, retry_host_key_build,
+    retry_ultimate_address_timeout, retry_update, HostStatus, HostWhyUnusable, RetryConfig,
+    RetryError, RetryItem, RetryItemFlags, RetryRecord, RetryRule, RetryRuleType,
 };
