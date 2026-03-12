@@ -235,6 +235,22 @@ pcre2 = { workspace = true }
 # IPV6_TCLASS). The "net" feature enables IpTos / Ipv6TClass socket options.
 nix = { workspace = true, features = ["net"] }
 
+# Bitflag types — type-safe bitflags for PDKIM context flags
+# (MODE_SIGN, DOT_TERM, SEEN_CR, SEEN_LF, PAST_HDRS, SEEN_EOD).
+bitflags = { workspace = true }
+
+# Base64 encoding/decoding — DKIM signature b=/bh= tag values,
+# DNS TXT record p= public key data, private key PEM content.
+base64 = { workspace = true }
+
+# SHA-1 hashing — legacy DKIM body/header hash computation.
+# Required for backward compatibility with older DKIM signatures (RFC 6376).
+sha1 = { workspace = true }
+
+# SHA-2 hashing (SHA-256, SHA-512) — primary DKIM body/header hash
+# computation. SHA-256 is the most common DKIM hash algorithm.
+sha2 = { workspace = true }
+
 # C type definitions — required for low-level operations in DSCP (setsockopt
 # with IPPROTO_IP/IPV6_TCLASS) and PROXY protocol (socket address structures).
 libc = { workspace = true }
