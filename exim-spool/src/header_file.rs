@@ -29,13 +29,15 @@
 //! # Source origins
 //!
 //! - `src/src/spool_out.c` — `spool_write_header()`
-//! - `src/src/spool_in.c` — `spool_read_header()`, `spool_open_datafile()`
+//! - `src/src/spool_in.c` — `spool_read_header()`, `spool_clear_header_globals()`
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
-use crate::format;
+use tracing::{debug, trace, warn};
+
+use crate::format::{self, MESSAGE_ID_LENGTH, MESSAGE_ID_LENGTH_OLD};
 
 // =============================================================================
 // Data Types
@@ -257,6 +259,10 @@ pub struct SpoolHeaderFile {
     pub body_zerocount: i64,
     /// Maximum line length received.
     pub max_received_linelength: i64,
+    /// Total message line count (header lines + body_linecount).
+    pub message_linecount: i64,
+    /// Message size in bytes (excluding rewritten headers and spool overhead).
+    pub message_size: i64,
 
     // -- Boolean flags --
     /// Envelope boolean flags.
@@ -377,7 +383,6 @@ impl From<io::Error> for SpoolHeaderError {
 }
 
 // =============================================================================
-// =============================================================================
 // Reading (-H file parsing)
 // =============================================================================
 
@@ -413,35 +418,67 @@ impl SpoolHeaderFile {
                 section: "identity".into(),
             });
         }
-        hdr.message_id = trimmed[..trimmed.len() - 2].to_string();
+        let msg_id = &trimmed[..trimmed.len() - 2];
+        // Validate message ID length against known formats
+        let id_len = msg_id.len();
+        if id_len != MESSAGE_ID_LENGTH && id_len != MESSAGE_ID_LENGTH_OLD {
+            trace!(
+                id_len,
+                expected_new = MESSAGE_ID_LENGTH,
+                expected_old = MESSAGE_ID_LENGTH_OLD,
+                "message ID length does not match standard formats"
+            );
+        }
+        hdr.message_id = msg_id.to_string();
+        debug!(message_id = %hdr.message_id, "parsing spool header");
 
         // ---- Line 2: Originator ("{login} {uid} {gid}\n") ----
+        // C code (spool_in.c lines 428-452) parses RIGHT-TO-LEFT because
+        // the login name can contain spaces. We do the same: extract gid
+        // from the rightmost space-separated field, then uid, remainder is login.
         line.clear();
         buf.read_line(&mut line)?;
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-        let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
-        if parts.len() < 3 {
-            return Err(SpoolHeaderError::FormatError {
-                message: format!("originator line needs 3 fields, got {}", parts.len()),
-                section: "originator".into(),
-            });
+        {
+            let gid_pos = trimmed
+                .rfind(' ')
+                .ok_or_else(|| SpoolHeaderError::FormatError {
+                    message: format!("originator line missing space: '{}'", trimmed),
+                    section: "originator".into(),
+                })?;
+            let gid_str = &trimmed[gid_pos + 1..];
+            hdr.originator_gid =
+                gid_str
+                    .parse::<i64>()
+                    .map_err(|_| SpoolHeaderError::FormatError {
+                        message: format!("invalid gid: '{}'", gid_str),
+                        section: "originator".into(),
+                    })?;
+
+            let before_gid = &trimmed[..gid_pos];
+            let uid_pos = before_gid
+                .rfind(' ')
+                .ok_or_else(|| SpoolHeaderError::FormatError {
+                    message: format!("originator line missing uid: '{}'", trimmed),
+                    section: "originator".into(),
+                })?;
+            let uid_str = &before_gid[uid_pos + 1..];
+            hdr.originator_uid =
+                uid_str
+                    .parse::<i64>()
+                    .map_err(|_| SpoolHeaderError::FormatError {
+                        message: format!("invalid uid: '{}'", uid_str),
+                        section: "originator".into(),
+                    })?;
+
+            hdr.originator_login = before_gid[..uid_pos].to_string();
         }
-        // Login is limited to 63 chars in C (%.63s)
-        hdr.originator_login = parts[0].to_string();
-        hdr.originator_uid =
-            parts[1]
-                .parse::<i64>()
-                .map_err(|_| SpoolHeaderError::FormatError {
-                    message: format!("invalid uid: '{}'", parts[1]),
-                    section: "originator".into(),
-                })?;
-        hdr.originator_gid =
-            parts[2]
-                .parse::<i64>()
-                .map_err(|_| SpoolHeaderError::FormatError {
-                    message: format!("invalid gid: '{}'", parts[2]),
-                    section: "originator".into(),
-                })?;
+        trace!(
+            login = %hdr.originator_login,
+            uid = hdr.originator_uid,
+            gid = hdr.originator_gid,
+            "parsed originator"
+        );
 
         // ---- Line 3: Sender ("<{address}>\n") ----
         line.clear();
@@ -454,6 +491,7 @@ impl SpoolHeaderFile {
             });
         }
         hdr.sender_address = trimmed[1..trimmed.len() - 1].to_string();
+        trace!(sender = %hdr.sender_address, "parsed sender");
 
         // ---- Line 4: Received time + warning count ----
         line.clear();
@@ -479,10 +517,13 @@ impl SpoolHeaderFile {
                 message: format!("invalid warning count: '{}'", parts[1]),
                 section: "received_time".into(),
             })?;
+        // Initialize complete time from base time (C: received_time_complete = received_time)
+        hdr.received_time_complete_sec = hdr.received_time_sec;
+        hdr.received_time_complete_usec = 0;
 
         // ---- Variable and flag lines (start with '-') ----
         // Read lines until we get one that does NOT start with '-'.
-        // That line is the start of the non-recipients section.
+        // Special handling for ACL variables which have binary data on the next line.
         let non_recip_line;
         loop {
             line.clear();
@@ -499,14 +540,26 @@ impl SpoolHeaderFile {
                 non_recip_line = trimmed.to_string();
                 break;
             }
-            Self::parse_variable_line(&mut hdr, trimmed)?;
+
+            // Detect ACL variable lines that need binary data from the next line(s).
+            // After stripping taint prefix, check if the variable name is aclc/aclm/acl.
+            let var_name = Self::extract_var_name(trimmed);
+            if var_name == "aclc" || var_name == "aclm" {
+                Self::handle_new_acl_variable(&mut hdr, trimmed, &mut buf)?;
+            } else if var_name == "acl" {
+                Self::handle_legacy_acl_variable(&mut hdr, trimmed, &mut buf)?;
+            } else {
+                Self::parse_variable_line(&mut hdr, trimmed)?;
+            }
         }
 
         // ---- Non-recipients tree ----
         if non_recip_line == "XX" {
             hdr.non_recipients = None;
+            trace!("no non-recipients tree");
         } else {
             hdr.non_recipients = Some(Self::read_non_recipient_tree(&non_recip_line, &mut buf)?);
+            trace!("parsed non-recipients tree");
         }
 
         // ---- Recipient count ----
@@ -523,6 +576,7 @@ impl SpoolHeaderFile {
                 section: "recipient count".into(),
             });
         }
+        trace!(count = rcount, "parsing recipients");
 
         // ---- Recipient lines ----
         for _ in 0..rcount {
@@ -554,7 +608,210 @@ impl SpoolHeaderFile {
             Self::read_headers_section(&mut hdr, &mut buf)?;
         }
 
+        // Compute message_linecount = header line count + body_linecount
+        // (matching C: message_linecount += body_linecount at end of read)
+        hdr.message_linecount += hdr.body_linecount;
+
+        debug!(
+            message_id = %hdr.message_id,
+            recipients = hdr.recipients.len(),
+            headers = hdr.headers.len(),
+            "spool header parsed successfully"
+        );
+
         Ok(hdr)
+    }
+
+    /// Extract the variable name from a variable line (after stripping all
+    /// dash prefixes and optional taint quoter).
+    ///
+    /// For `-aclc myvar 42` returns `"aclc"`.
+    /// For `--host_name example.com` returns `"host_name"`.
+    /// For `--(sql)host_name example.com` returns `"host_name"`.
+    fn extract_var_name(line: &str) -> &str {
+        let rest = &line[1..]; // skip leading '-'
+        let content = if let Some(after_dash) = rest.strip_prefix('-') {
+            // Tainted — check for quoter
+            if after_dash.starts_with('(') {
+                if let Some(close) = after_dash.find(')') {
+                    &after_dash[close + 1..]
+                } else {
+                    after_dash
+                }
+            } else {
+                after_dash
+            }
+        } else {
+            rest
+        };
+        // Return the first word (up to the first space, or the whole thing)
+        if let Some(sp) = content.find(' ') {
+            &content[..sp]
+        } else {
+            content
+        }
+    }
+
+    /// Handle a new-format ACL variable line (`-aclc {name} {count}` or `-aclm {name} {count}`).
+    ///
+    /// After parsing the header line, reads `count + 1` bytes from the reader
+    /// for the binary value data (matching the C `fread(ptr, 1, count+1, fp)` call).
+    fn handle_new_acl_variable<R: BufRead>(
+        hdr: &mut SpoolHeaderFile,
+        header_line: &str,
+        reader: &mut R,
+    ) -> Result<(), SpoolHeaderError> {
+        // Parse taint prefix
+        let rest = &header_line[1..];
+        let (taint, content) = Self::parse_taint_prefix(rest);
+
+        // content is "aclc {name} {count}" or "aclm {name} {count}"
+        let parts: Vec<&str> = content.splitn(3, ' ').collect();
+        if parts.len() < 3 {
+            return Err(SpoolHeaderError::FormatError {
+                message: format!("malformed ACL variable line: '{}'", header_line),
+                section: "variables".into(),
+            });
+        }
+
+        let var_type = if parts[0] == "aclc" { 'c' } else { 'm' };
+        let acl_name = parts[1].to_string();
+        let count: usize = parts[2]
+            .parse()
+            .map_err(|_| SpoolHeaderError::FormatError {
+                message: format!("invalid ACL data count: '{}'", parts[2]),
+                section: "variables".into(),
+            })?;
+
+        // Read count + 1 bytes: the value data plus a trailing newline/NUL
+        let mut data = vec![0u8; count + 1];
+        reader.read_exact(&mut data).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                SpoolHeaderError::FormatError {
+                    message: format!(
+                        "ACL variable '{}' data shorter than count {}",
+                        acl_name, count
+                    ),
+                    section: "variables".into(),
+                }
+            } else {
+                SpoolHeaderError::Io(e)
+            }
+        })?;
+
+        // The value is the first `count` bytes (the +1 byte is a trailing newline)
+        let value = String::from_utf8_lossy(&data[..count]).to_string();
+
+        let map = if var_type == 'c' {
+            &mut hdr.acl_c_vars
+        } else {
+            &mut hdr.acl_m_vars
+        };
+        map.insert(acl_name.clone(), value);
+
+        // Store taint info
+        hdr.variable_taints
+            .insert(format!("acl{}{}", var_type, acl_name), taint);
+
+        trace!(var_type = %var_type, name = %acl_name, count, "parsed ACL variable");
+        Ok(())
+    }
+
+    /// Handle a legacy ACL variable line (`-acl {index} {count}`).
+    ///
+    /// Index 0-9 maps to connection variables (c0-c9), 10-19 to message
+    /// variables (m0-m9). After parsing, reads `count + 1` bytes for the data.
+    fn handle_legacy_acl_variable<R: BufRead>(
+        hdr: &mut SpoolHeaderFile,
+        header_line: &str,
+        reader: &mut R,
+    ) -> Result<(), SpoolHeaderError> {
+        // Parse taint prefix
+        let rest = &header_line[1..];
+        let (_taint, content) = Self::parse_taint_prefix(rest);
+
+        // content is "acl {index} {count}"
+        let parts: Vec<&str> = content.splitn(3, ' ').collect();
+        if parts.len() < 3 {
+            return Err(SpoolHeaderError::FormatError {
+                message: format!("malformed legacy ACL variable line: '{}'", header_line),
+                section: "variables".into(),
+            });
+        }
+
+        let index: u32 = parts[1]
+            .parse()
+            .map_err(|_| SpoolHeaderError::FormatError {
+                message: format!("invalid ACL index: '{}'", parts[1]),
+                section: "variables".into(),
+            })?;
+        let count: usize = parts[2]
+            .parse()
+            .map_err(|_| SpoolHeaderError::FormatError {
+                message: format!("invalid ACL data count: '{}'", parts[2]),
+                section: "variables".into(),
+            })?;
+
+        if index >= 20 {
+            warn!(index, "legacy ACL variable index out of range (0-19)");
+            // Still need to consume the data bytes
+            let mut discard = vec![0u8; count + 1];
+            reader.read_exact(&mut discard)?;
+            return Ok(());
+        }
+
+        // Read count + 1 bytes
+        let mut data = vec![0u8; count + 1];
+        reader.read_exact(&mut data)?;
+        let value = String::from_utf8_lossy(&data[..count]).to_string();
+
+        let (var_type, idx) = if index < 10 {
+            ('c', index)
+        } else {
+            ('m', index - 10)
+        };
+        let acl_name = idx.to_string();
+
+        let map = if var_type == 'c' {
+            &mut hdr.acl_c_vars
+        } else {
+            &mut hdr.acl_m_vars
+        };
+        map.insert(acl_name.clone(), value);
+
+        trace!(
+            var_type = %var_type,
+            index,
+            count,
+            "parsed legacy ACL variable"
+        );
+        Ok(())
+    }
+
+    /// Parse the taint prefix from a variable line fragment (after the leading '-').
+    ///
+    /// Returns `(TaintInfo, remaining_content)`.
+    fn parse_taint_prefix(rest: &str) -> (TaintInfo, &str) {
+        if let Some(after_dash) = rest.strip_prefix('-') {
+            // Tainted
+            if after_dash.starts_with('(') {
+                if let Some(close_paren) = after_dash.find(')') {
+                    let quoter_name = &after_dash[1..close_paren];
+                    (
+                        TaintInfo::Tainted {
+                            quoter: Some(quoter_name.to_string()),
+                        },
+                        &after_dash[close_paren + 1..],
+                    )
+                } else {
+                    (TaintInfo::Tainted { quoter: None }, after_dash)
+                }
+            } else {
+                (TaintInfo::Tainted { quoter: None }, after_dash)
+            }
+        } else {
+            (TaintInfo::Untainted, rest)
+        }
     }
 
     /// Parse a single variable/flag line from the envelope section.
@@ -566,45 +823,20 @@ impl SpoolHeaderFile {
     ///
     /// Flag lines have the format:
     /// - `-{flag_name}` (no value, just the name)
+    ///
+    /// ACL variable lines (`-aclc`, `-aclm`, `-acl`) are handled separately
+    /// by `handle_new_acl_variable()` / `handle_legacy_acl_variable()` and
+    /// should NOT be passed to this function.
     fn parse_variable_line(hdr: &mut SpoolHeaderFile, line: &str) -> Result<(), SpoolHeaderError> {
         // Skip the leading '-'
         let rest = &line[1..];
-
-        // Determine taint status
-        let (is_tainted, quoter, var_start) = if let Some(after_dash) = rest.strip_prefix('-') {
-            // Tainted value
-            if after_dash.starts_with('(') {
-                // Has quoter: --({quoter_name}){name} {value}
-                if let Some(close_paren) = after_dash.find(')') {
-                    let quoter_name = &after_dash[1..close_paren];
-                    (true, Some(quoter_name.to_string()), 1 + close_paren + 1)
-                } else {
-                    // Malformed quoter — treat rest as variable name
-                    (true, None, 1)
-                }
-            } else {
-                (true, None, 1)
-            }
-        } else {
-            (false, None, 0)
-        };
-
-        let var_content = &rest[var_start..];
+        let (taint, var_content) = Self::parse_taint_prefix(rest);
 
         // Parse the variable name and value
-        // The first character after the taint prefix determines the variable
-        // Some variables are just flags (no space/value after the name)
         if let Some(space_pos) = var_content.find(' ') {
             let name = &var_content[..space_pos];
             let value = &var_content[space_pos + 1..];
-
-            let taint_info = if is_tainted {
-                TaintInfo::Tainted { quoter }
-            } else {
-                TaintInfo::Untainted
-            };
-
-            Self::assign_variable(hdr, name, value, &taint_info)?;
+            Self::assign_variable(hdr, name, value, &taint)?;
         } else {
             // Flag-only line (no value)
             Self::assign_flag(hdr, var_content)?;
@@ -625,59 +857,49 @@ impl SpoolHeaderFile {
 
         match name {
             "received_time_usec" => {
-                // Value starts with '.' followed by 6 digits
+                // Value starts with '.' followed by digits
                 let usec_str = value.trim_start_matches('.');
                 if let Ok(usec) = usec_str.parse::<u32>() {
                     hdr.received_time_usec = usec;
-                    if hdr.received_time_complete_sec == 0 {
+                    // If complete time hasn't been set yet, propagate
+                    if hdr.received_time_complete_usec == 0 {
                         hdr.received_time_complete_usec = usec;
                     }
                 }
             }
             "received_time_complete" => {
                 // Format: "{sec}.{usec}"
-                let parts: Vec<&str> = value.splitn(2, '.').collect();
-                if parts.len() == 2 {
-                    if let (Ok(sec), Ok(usec)) = (parts[0].parse::<i64>(), parts[1].parse::<u32>())
-                    {
+                if let Some(dot_pos) = value.find('.') {
+                    if let (Ok(sec), Ok(usec)) = (
+                        value[..dot_pos].parse::<i64>(),
+                        value[dot_pos + 1..].parse::<u32>(),
+                    ) {
                         hdr.received_time_complete_sec = sec;
                         hdr.received_time_complete_usec = usec;
                     }
                 }
             }
             "helo_name" => hdr.helo_name = Some(value.to_string()),
-            "host_address" => {
-                // Format: "[{ip}]:{port}" — extract port from the address
-                Self::parse_host_address(hdr, value);
-            }
+            "host_address" => Self::parse_host_address(hdr, value),
             "host_name" => hdr.host_name = Some(value.to_string()),
             "host_auth" => hdr.host_auth = Some(value.to_string()),
             "host_auth_pubname" => hdr.host_auth_pubname = Some(value.to_string()),
-            "interface_address" => {
-                Self::parse_interface_address(hdr, value);
-            }
+            "interface_address" => Self::parse_interface_address(hdr, value),
             "active_hostname" => hdr.active_hostname = Some(value.to_string()),
             "ident" => hdr.sender_ident = Some(value.to_string()),
             "received_protocol" => hdr.received_protocol = Some(value.to_string()),
             "auth_id" => hdr.authenticated_id = Some(value.to_string()),
             "auth_sender" => hdr.authenticated_sender = Some(value.to_string()),
-            "body_linecount" => {
-                hdr.body_linecount = value.parse().unwrap_or(0);
-            }
-            "body_zerocount" => {
-                hdr.body_zerocount = value.parse().unwrap_or(0);
-            }
-            "max_received_linelength" => {
-                hdr.max_received_linelength = value.parse().unwrap_or(0);
-            }
+            "body_linecount" => hdr.body_linecount = value.parse().unwrap_or(0),
+            "body_zerocount" => hdr.body_zerocount = value.parse().unwrap_or(0),
+            "max_received_linelength" => hdr.max_received_linelength = value.parse().unwrap_or(0),
             "dsn_envid" => hdr.dsn_envid = Some(value.to_string()),
-            "dsn_ret" => {
-                hdr.dsn_ret = value.parse().unwrap_or(0);
-            }
+            "dsn_ret" => hdr.dsn_ret = value.parse().unwrap_or(0),
             "debug_selector" => {
-                // Value may be in hex (0x...) or decimal
-                let val = if value.starts_with("0x") || value.starts_with("0X") {
-                    u64::from_str_radix(&value[2..], 16).unwrap_or(0)
+                let val = if let Some(hex) = value.strip_prefix("0x") {
+                    u64::from_str_radix(hex, 16).unwrap_or(0)
+                } else if let Some(hex) = value.strip_prefix("0X") {
+                    u64::from_str_radix(hex, 16).unwrap_or(0)
                 } else {
                     value.parse::<u64>().unwrap_or(0)
                 };
@@ -688,47 +910,24 @@ impl SpoolHeaderFile {
             "spam_bar" => hdr.spam_bar = Some(value.to_string()),
             "spam_score" => hdr.spam_score = Some(value.to_string()),
             "spam_score_int" => hdr.spam_score_int = Some(value.to_string()),
-            // TLS variables — names start with "tls_"
+            // TLS variables
             "tls_certificate_verified" => hdr.tls.certificate_verified = true,
             "tls_cipher" => hdr.tls.cipher = Some(value.to_string()),
             "tls_ourcert" => hdr.tls.ourcert = Some(value.to_string()),
             "tls_peercert" => hdr.tls.peercert = Some(value.to_string()),
             "tls_peerdn" => hdr.tls.peerdn = Some(value.to_string()),
             "tls_sni" => hdr.tls.sni = Some(value.to_string()),
-            "tls_ocsp" => {
-                hdr.tls.ocsp = value.parse::<i32>().ok();
-            }
-            "tls_resumption" => {
-                if let Some(ch) = value.chars().next() {
-                    hdr.tls.resumption = Some(ch);
-                }
-            }
+            "tls_ocsp" => hdr.tls.ocsp = value.parse::<i32>().ok(),
+            "tls_resumption" => hdr.tls.resumption = value.chars().next(),
             "tls_ver" => hdr.tls.ver = Some(value.to_string()),
-            // ACL variables: "aclc {name} {len}" or "aclm {name} {len}"
-            n if n.starts_with("aclc ") || n.starts_with("aclm ") => {
-                // The C code stores these as "-aclc {name} {len}" and "-aclm {name} {len}"
-                // Here, 'name' has been extracted already and 'value' contains the rest
-                // Actually, the full line was parsed differently. Let's handle this case
-                // by detecting the name format. The variable name from parse_variable_line
-                // would be "aclc" or "aclm" and the value would be "{acl_name} {len}".
-                // But that's not right — the ACL variable handling in C uses a single
-                // space-separated line. We need to handle this specially.
-                Self::parse_acl_variable(hdr, n, value)?;
-            }
-            // Legacy ACL variable format: "acl {index} {len}"
-            n if n.starts_with("acl ") => {
-                Self::parse_legacy_acl_variable(hdr, n, value)?;
-            }
-            // Frozen: handled as flag with value
+            // Frozen with timestamp
             "frozen" => {
                 hdr.flags.deliver_freeze = true;
                 hdr.flags.deliver_frozen_at = value.parse().unwrap_or(0);
             }
             _ => {
-                // Unknown variable — store it generically
-                // The C code silently ignores unknown variables (just falls through
-                // the switch default). We preserve the value in variable_taints for
-                // round-trip fidelity but otherwise ignore it.
+                // Unknown variable — silently ignore (matches C behavior)
+                trace!(name, "ignoring unknown spool variable");
             }
         }
         Ok(())
@@ -754,6 +953,7 @@ impl SpoolHeaderFile {
             "tls_certificate_verified" => hdr.tls.certificate_verified = true,
             _ => {
                 // Unknown flag — silently ignore (matches C behavior)
+                trace!(name, "ignoring unknown spool flag");
             }
         }
         Ok(())
@@ -761,9 +961,6 @@ impl SpoolHeaderFile {
 
     /// Parse host address in the format `[{ip}]:{port}`.
     fn parse_host_address(hdr: &mut SpoolHeaderFile, value: &str) {
-        // C format: "[{ip}]:{port}" — e.g., "[192.168.1.1]:25"
-        // The C code calls host_address_extract_port() which modifies the string
-        // in-place to remove the :port suffix.
         if let Some(bracket_end) = value.find(']') {
             let ip = if value.starts_with('[') {
                 &value[1..bracket_end]
@@ -779,7 +976,6 @@ impl SpoolHeaderFile {
                 }
             }
         } else {
-            // No brackets — store as-is
             hdr.host_address = Some(value.to_string());
         }
     }
@@ -804,117 +1000,6 @@ impl SpoolHeaderFile {
         }
     }
 
-    /// Parse ACL variable in new format: `aclc {name} {len}` or `aclm {name} {len}`.
-    fn parse_acl_variable(
-        hdr: &mut SpoolHeaderFile,
-        name_prefix: &str,
-        _value: &str,
-    ) -> Result<(), SpoolHeaderError> {
-        // The name_prefix is like "aclc name_part" and the value is the length.
-        // In the C code, the full line after '-' is "aclc {name} {count}" and
-        // then {count} bytes are read from the file for the value.
-        //
-        // However, our line-based parser has already split at the first space,
-        // so name_prefix = "aclc" (or "aclm") and value = "{acl_name} {len}".
-        // Actually, looking more carefully at the parse_variable_line logic:
-        // The var_content = "aclc name 42" and we split at first space giving
-        // name="aclc" and value="name 42".
-        //
-        // For the line-based parser, the ACL variable data follows inline.
-        // In C, after parsing the count, fread() reads count+1 bytes for the
-        // actual data. For our implementation, we handle ACL variables as
-        // stored inline in the value (the data portion is the remainder).
-        //
-        // The actual implementation would need access to the reader to read
-        // the binary data. For simplicity in this first implementation,
-        // we parse the name and inline value from what's available.
-        let var_type = if name_prefix.starts_with("aclc") {
-            'c'
-        } else {
-            'm'
-        };
-
-        // Parse the parts: name_prefix may be just "aclc" or "aclm"
-        // and _value is "{acl_name} {len}" but since we can't read ahead in
-        // this line-based approach, store what we have.
-        let parts: Vec<&str> = _value.splitn(2, ' ').collect();
-        if !parts.is_empty() {
-            let acl_name = parts[0];
-            // The value will need to be read separately from the reader stream.
-            // For now, store the name. The actual binary read should happen at
-            // a higher level. We store a placeholder that gets filled by the
-            // specialized ACL reader.
-            let map = if var_type == 'c' {
-                &mut hdr.acl_c_vars
-            } else {
-                &mut hdr.acl_m_vars
-            };
-            // If there's inline data (for small values), use it
-            if parts.len() == 2 {
-                map.insert(acl_name.to_string(), parts[1].to_string());
-            } else {
-                map.insert(acl_name.to_string(), String::new());
-            }
-        }
-        Ok(())
-    }
-
-    /// Parse legacy ACL variable format: `acl {index} {count}`.
-    fn parse_legacy_acl_variable(
-        hdr: &mut SpoolHeaderFile,
-        name_prefix: &str,
-        _value: &str,
-    ) -> Result<(), SpoolHeaderError> {
-        // Legacy format: "-acl {index} {count}" where index 0-9 = connection,
-        // 10-19 = message. We convert to the new naming scheme.
-        let parts: Vec<&str> = _value.splitn(2, ' ').collect();
-        if let Some(_index_str) = name_prefix.strip_prefix("acl ") {
-            // name_prefix is "acl" and _value is "{index} {count}"
-            if let Ok(index) = parts.first().unwrap_or(&"").parse::<u32>() {
-                if index < 20 {
-                    let (var_type, idx) = if index < 10 {
-                        ('c', index)
-                    } else {
-                        ('m', index - 10)
-                    };
-                    let acl_name = format!("{}{}", var_type, idx);
-                    let map = if var_type == 'c' {
-                        &mut hdr.acl_c_vars
-                    } else {
-                        &mut hdr.acl_m_vars
-                    };
-                    if parts.len() == 2 {
-                        map.insert(acl_name, parts[1].to_string());
-                    } else {
-                        map.insert(acl_name, String::new());
-                    }
-                }
-            }
-        } else if let Ok(index) = _value
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .parse::<u32>()
-        {
-            if index < 20 {
-                let (var_type, idx) = if index < 10 {
-                    ('c', index)
-                } else {
-                    ('m', index - 10)
-                };
-                let acl_name = format!("{}{}", var_type, idx);
-                let map = if var_type == 'c' {
-                    &mut hdr.acl_c_vars
-                } else {
-                    &mut hdr.acl_m_vars
-                };
-                map.insert(acl_name, String::new());
-            }
-        }
-        let _ = name_prefix; // suppress unused warning in alternate branch
-        Ok(())
-    }
-
     /// Read the non-recipient tree from the spool file.
     ///
     /// The C code uses a recursive function `read_nonrecipients_tree()`.
@@ -925,15 +1010,10 @@ impl SpoolHeaderFile {
         first_line: &str,
         reader: &mut R,
     ) -> Result<NonRecipientNode, SpoolHeaderError> {
-        // The first_line has already been read; it should start with 'Y '
         if let Some(addr_part) = first_line.strip_prefix("Y ") {
             let address = addr_part.to_string();
-
-            // Read left subtree
             let left = Self::read_tree_node(reader)?;
-            // Read right subtree
             let right = Self::read_tree_node(reader)?;
-
             Ok(NonRecipientNode {
                 address,
                 left: left.map(Box::new),
@@ -981,7 +1061,7 @@ impl SpoolHeaderFile {
     ///
     /// Recipient lines can have several formats:
     /// - Simple: `{address}`
-    /// - Exim 4 new type: `{address} {orcpt} {orcpt_len},{dsn_flags} {errors_to} {et_len},{pno}#{type_bits}`
+    /// - Exim 4 new type (#3): `{address} {orcpt} {orcpt_len},{dsn_flags} {errors_to} {et_len},{pno}#3`
     /// - Exim 4 old type: `{address} {pno}`
     /// - Exim 3 type: `{address} {digits},{digits},{digits}`
     fn parse_recipient_line(line: &str) -> Result<Recipient, SpoolHeaderError> {
@@ -1033,6 +1113,7 @@ impl SpoolHeaderFile {
     /// Parse a new-format recipient line with `#` type bits.
     ///
     /// Format: `{address} {orcpt} {orcpt_len},{dsn_flags} {errors_to} {et_len},{pno}#{type_bits}`
+    /// The C code (spool_in.c lines 918-956) parses backwards from the `#` marker.
     fn parse_new_format_recipient(
         line: &str,
         hash_pos: usize,
@@ -1043,20 +1124,16 @@ impl SpoolHeaderFile {
         let mut errors_to: Option<String> = None;
         let mut orcpt: Option<String> = None;
         let mut dsn_flags: u32 = 0;
-
-        // Work backwards through the data, guided by the flag bits.
-        // The C code works backwards through the string.
         let mut end_pos = data_part.len();
 
+        // Work backwards through the data, guided by the flag bits.
         if flags_bits & 0x01 != 0 {
-            // Has errors_to data: ...{errors_to}{et_len},{pno}
-            // Find the last comma-separated pair of numbers
+            // Has errors_to data: ...{errors_to} {et_len},{pno}
             let segment = &data_part[..end_pos];
             if let Some(last_comma_pos) = segment.rfind(',') {
                 let pno_str = &segment[last_comma_pos + 1..];
                 pno = pno_str.trim().parse().unwrap_or(-1);
 
-                // Before the comma is the errors_to length
                 let before_comma = &segment[..last_comma_pos];
                 if let Some(space_pos) = before_comma.rfind(' ') {
                     let len_str = &before_comma[space_pos + 1..];
@@ -1071,7 +1148,7 @@ impl SpoolHeaderFile {
         }
 
         if flags_bits & 0x02 != 0 {
-            // Has DSN/orcpt data: ...{orcpt}{orcpt_len},{dsn_flags}
+            // Has DSN/orcpt data: ...{orcpt} {orcpt_len},{dsn_flags}
             let segment = &data_part[..end_pos];
             if let Some(last_comma_pos) = segment.rfind(',') {
                 let dsn_str = &segment[last_comma_pos + 1..];
@@ -1091,7 +1168,6 @@ impl SpoolHeaderFile {
         }
 
         // The remaining text up to end_pos is the address
-        // (it may have a trailing space that needs trimming)
         let address = data_part[..end_pos].trim_end().to_string();
 
         Ok(Recipient {
@@ -1105,18 +1181,23 @@ impl SpoolHeaderFile {
     /// Read the RFC 2822 headers section from the spool file.
     ///
     /// Each header is preceded by `{3-digit-len}{type-char} ` and then
-    /// `len` bytes of header text.
+    /// `len` bytes of header text. This function also computes
+    /// `message_linecount` and `message_size` for the header portion.
     fn read_headers_section<R: Read>(
         hdr: &mut SpoolHeaderFile,
         reader: &mut R,
     ) -> Result<(), SpoolHeaderError> {
-        // Read character by character to match the C fgetc() behavior
         let mut peek_buf = [0u8; 1];
         loop {
             match reader.read(&mut peek_buf) {
                 Ok(0) => break, // EOF
                 Ok(_) => {
                     let first_byte = peek_buf[0];
+                    // C code: breaks on '\n' or EOF, errors on other non-digits
+                    if first_byte == b'\n' {
+                        // Newline after the last header means end of section
+                        break;
+                    }
                     if !first_byte.is_ascii_digit() {
                         return Err(SpoolHeaderError::FormatError {
                             message: format!(
@@ -1127,12 +1208,10 @@ impl SpoolHeaderFile {
                         });
                     }
 
-                    // Read the rest of the length + type character
-                    // Format: {digits}{type_char}{space}{header_text}
+                    // Read the rest of the length digits + type character
                     let mut len_str = String::new();
                     len_str.push(first_byte as char);
 
-                    // Read until we get the type character (a non-digit after the length)
                     let type_char: char;
                     loop {
                         match reader.read(&mut peek_buf) {
@@ -1169,9 +1248,7 @@ impl SpoolHeaderFile {
                                 section: "headers".into(),
                             });
                         }
-                        Ok(_) => {
-                            // The space is consumed but not part of the header text
-                        }
+                        Ok(_) => { /* space consumed */ }
                         Err(e) => return Err(SpoolHeaderError::Io(e)),
                     }
 
@@ -1201,6 +1278,14 @@ impl SpoolHeaderFile {
 
                     let text = String::from_utf8_lossy(&text_buf).to_string();
 
+                    // Track message_size: exclude rewritten ('*') headers
+                    if type_char != '*' {
+                        hdr.message_size += slen as i64;
+                    }
+
+                    // Track message_linecount: count lines in this header
+                    hdr.message_linecount += text.chars().filter(|&c| c == '\n').count() as i64;
+
                     hdr.headers.push(SpoolHeader {
                         header_type: type_char,
                         slen,
@@ -1211,6 +1296,7 @@ impl SpoolHeaderFile {
             }
         }
 
+        trace!(count = hdr.headers.len(), "parsed headers section");
         Ok(())
     }
 }
@@ -1226,13 +1312,14 @@ impl SpoolHeaderFile {
     /// `src/src/spool_out.c`, producing a byte-level compatible -H file
     /// from the [`SpoolHeaderFile`] data.
     ///
-    /// # Arguments
+    /// The field write order exactly matches the C implementation to ensure
+    /// byte-level compatibility between C and Rust Exim spool files.
     ///
-    /// * `writer` — A writer to receive the serialized spool header data.
+    /// # Returns
     ///
-    /// # Errors
-    ///
-    /// Returns [`SpoolHeaderError`] on I/O errors.
+    /// The size_correction value (bytes of spool overhead: 3-digit length +
+    /// type char + space per header, plus the full size of rewritten headers).
+    /// The caller computes header_size = file_size - size_correction.
     pub fn write_to<W: Write>(&self, writer: W) -> Result<usize, SpoolHeaderError> {
         let mut w = BufWriter::new(writer);
         let mut size_correction: usize = 0;
@@ -1270,34 +1357,35 @@ impl SpoolHeaderFile {
         // ---- HELO name ----
         if let Some(ref helo) = self.helo_name {
             let taint = self.get_taint("helo_name");
-            Self::write_var(&mut w, "helo_name", helo, taint)?;
+            Self::write_var(&mut w, "helo_name", helo, &taint)?;
         }
 
         // ---- Host address ----
+        // The C code writes host_address with an extra taint dash prefix
+        // directly before the `-host_address` key (not using spool_var_write).
         if let Some(ref addr) = self.host_address {
             let taint = self.get_taint("host_address");
-            // C format: "-host_address [{ip}]:{port}\n"
             write!(w, "-")?;
             if matches!(taint, TaintInfo::Tainted { .. }) {
                 write!(w, "-")?;
             }
             writeln!(w, "host_address [{}]:{}", addr, self.host_port)?;
 
-            // Host name follows host address
+            // Host name follows host address in the C write order
             if let Some(ref name) = self.host_name {
-                let taint = self.get_taint("host_name");
-                Self::write_var(&mut w, "host_name", name, taint)?;
+                let t = self.get_taint("host_name");
+                Self::write_var(&mut w, "host_name", name, &t)?;
             }
         }
 
         // ---- Host auth ----
         if let Some(ref auth) = self.host_auth {
             let taint = self.get_taint("host_auth");
-            Self::write_var(&mut w, "host_auth", auth, taint)?;
+            Self::write_var(&mut w, "host_auth", auth, &taint)?;
         }
         if let Some(ref pubname) = self.host_auth_pubname {
             let taint = self.get_taint("host_auth_pubname");
-            Self::write_var(&mut w, "host_auth_pubname", pubname, taint)?;
+            Self::write_var(&mut w, "host_auth_pubname", pubname, &taint)?;
         }
 
         // ---- Interface address ----
@@ -1313,29 +1401,33 @@ impl SpoolHeaderFile {
         // ---- Active hostname ----
         if let Some(ref hostname) = self.active_hostname {
             let taint = self.get_taint("active_hostname");
-            Self::write_var(&mut w, "active_hostname", hostname, taint)?;
+            Self::write_var(&mut w, "active_hostname", hostname, &taint)?;
         }
 
         // ---- Sender ident ----
         if let Some(ref ident) = self.sender_ident {
             let taint = self.get_taint("ident");
-            Self::write_var(&mut w, "ident", ident, taint)?;
+            Self::write_var(&mut w, "ident", ident, &taint)?;
         }
 
         // ---- Received protocol ----
         if let Some(ref proto) = self.received_protocol {
             let taint = self.get_taint("received_protocol");
-            Self::write_var(&mut w, "received_protocol", proto, taint)?;
+            Self::write_var(&mut w, "received_protocol", proto, &taint)?;
         }
 
         // ---- ACL variables ----
+        // The C code uses tree_walk which visits nodes in sorted order.
+        // BTreeMap iteration is also sorted, so order matches.
         for (name, value) in &self.acl_c_vars {
             writeln!(w, "-aclc {} {}", name, value.len())?;
-            writeln!(w, "{}", value)?;
+            w.write_all(value.as_bytes())?;
+            w.write_all(b"\n")?;
         }
         for (name, value) in &self.acl_m_vars {
             writeln!(w, "-aclm {} {}", name, value.len())?;
-            writeln!(w, "{}", value)?;
+            w.write_all(value.as_bytes())?;
+            w.write_all(b"\n")?;
         }
 
         // ---- Debug info ----
@@ -1364,12 +1456,12 @@ impl SpoolHeaderFile {
         // ---- Auth info ----
         if let Some(ref auth_id) = self.authenticated_id {
             let taint = self.get_taint("auth_id");
-            Self::write_var(&mut w, "auth_id", auth_id, taint)?;
+            Self::write_var(&mut w, "auth_id", auth_id, &taint)?;
         }
         if let Some(ref auth_sender) = self.authenticated_sender {
             let taint = self.get_taint("auth_sender");
             let sanitized = format::zap_newlines(auth_sender);
-            Self::write_var(&mut w, "auth_sender", &sanitized, taint)?;
+            Self::write_var(&mut w, "auth_sender", &sanitized, &taint)?;
         }
 
         // ---- Boolean flags ----
@@ -1404,21 +1496,21 @@ impl SpoolHeaderFile {
         // ---- Local scan data ----
         if let Some(ref data) = self.local_scan_data {
             let taint = self.get_taint("local_scan");
-            Self::write_var(&mut w, "local_scan", data, taint)?;
+            Self::write_var(&mut w, "local_scan", data, &taint)?;
         }
 
         // ---- Content scanning ----
         if let Some(ref bar) = self.spam_bar {
             let taint = self.get_taint("spam_bar");
-            Self::write_var(&mut w, "spam_bar", bar, taint)?;
+            Self::write_var(&mut w, "spam_bar", bar, &taint)?;
         }
         if let Some(ref score) = self.spam_score {
             let taint = self.get_taint("spam_score");
-            Self::write_var(&mut w, "spam_score", score, taint)?;
+            Self::write_var(&mut w, "spam_score", score, &taint)?;
         }
         if let Some(ref score_int) = self.spam_score_int {
             let taint = self.get_taint("spam_score_int");
-            Self::write_var(&mut w, "spam_score_int", score_int, taint)?;
+            Self::write_var(&mut w, "spam_score_int", score_int, &taint)?;
         }
 
         if self.flags.deliver_manual_thaw {
@@ -1434,18 +1526,19 @@ impl SpoolHeaderFile {
         }
         if let Some(ref cipher) = self.tls.cipher {
             let taint = self.get_taint("tls_cipher");
-            Self::write_var(&mut w, "tls_cipher", cipher, taint)?;
+            Self::write_var(&mut w, "tls_cipher", cipher, &taint)?;
         }
+        // C code writes peercert with taint prefix (always tainted from peer)
         if let Some(ref peercert) = self.tls.peercert {
             writeln!(w, "--tls_peercert {}", peercert)?;
         }
         if let Some(ref peerdn) = self.tls.peerdn {
             let taint = self.get_taint("tls_peerdn");
-            Self::write_var(&mut w, "tls_peerdn", peerdn, taint)?;
+            Self::write_var(&mut w, "tls_peerdn", peerdn, &taint)?;
         }
         if let Some(ref sni) = self.tls.sni {
             let taint = self.get_taint("tls_sni");
-            Self::write_var(&mut w, "tls_sni", sni, taint)?;
+            Self::write_var(&mut w, "tls_sni", sni, &taint)?;
         }
         if let Some(ref ourcert) = self.tls.ourcert {
             writeln!(w, "-tls_ourcert {}", ourcert)?;
@@ -1458,7 +1551,7 @@ impl SpoolHeaderFile {
         }
         if let Some(ref ver) = self.tls.ver {
             let taint = self.get_taint("tls_ver");
-            Self::write_var(&mut w, "tls_ver", ver, taint)?;
+            Self::write_var(&mut w, "tls_ver", ver, &taint)?;
         }
 
         // ---- I18N ----
@@ -1494,12 +1587,12 @@ impl SpoolHeaderFile {
             if r.pno < 0 && r.errors_to.is_none() && r.dsn.dsn_flags == 0 {
                 writeln!(w, "{}", address)?;
             } else {
-                let errors_to = r
+                let errors_to_val = r
                     .errors_to
                     .as_deref()
                     .map(|e| format::zap_newlines(e).into_owned())
                     .unwrap_or_default();
-                let orcpt = r
+                let orcpt_val = r
                     .dsn
                     .orcpt
                     .as_deref()
@@ -1511,11 +1604,11 @@ impl SpoolHeaderFile {
                     w,
                     "{} {} {},{} {} {},{}#3",
                     address,
-                    orcpt,
-                    orcpt.len(),
+                    orcpt_val,
+                    orcpt_val.len(),
                     r.dsn.dsn_flags,
-                    errors_to,
-                    errors_to.len(),
+                    errors_to_val,
+                    errors_to_val.len(),
                     r.pno
                 )?;
             }
@@ -1524,23 +1617,29 @@ impl SpoolHeaderFile {
         // ---- Blank separator line ----
         writeln!(w)?;
 
-        // ---- Record position for size_correction calculation ----
-        w.flush()?;
-
         // ---- Headers ----
         for h in &self.headers {
             write!(w, "{:03}{} {}", h.slen, h.header_type, h.text)?;
-            size_correction += 5; // The 3-digit length + type char + space
+            size_correction += 5; // 3-digit length + type char + space
             if h.header_type == '*' {
                 size_correction += h.slen;
             }
         }
 
         w.flush()?;
+        debug!(
+            message_id = %self.message_id,
+            size_correction,
+            "spool header written"
+        );
         Ok(size_correction)
     }
 
-    /// Write a tree node and its children recursively.
+    /// Write a tree node and its children recursively (pre-order traversal).
+    ///
+    /// Format matches C `tree_write()`:
+    /// - `Y {name}\n` for a node with data, followed by left then right subtree
+    /// - `N\n` for a null/empty subtree
     fn write_tree_node<W: Write>(
         w: &mut W,
         node: &NonRecipientNode,
@@ -1558,11 +1657,15 @@ impl SpoolHeaderFile {
     }
 
     /// Write a variable with taint-aware prefix.
+    ///
+    /// Untainted: `-{name} {value}\n`
+    /// Tainted:   `--{name} {value}\n`
+    /// Tainted with quoter: `--({quoter}){name} {value}\n`
     fn write_var<W: Write>(
         w: &mut W,
         name: &str,
         value: &str,
-        taint: TaintInfo,
+        taint: &TaintInfo,
     ) -> Result<(), SpoolHeaderError> {
         write!(w, "-")?;
         if let TaintInfo::Tainted { ref quoter } = taint {
@@ -1593,11 +1696,12 @@ impl SpoolHeaderFile {
 /// This is an optimized reader that only parses the first 3 lines of the
 /// spool header file to extract the envelope sender address.
 ///
-/// Equivalent to `spool_sender_from_msgid()` in `src/src/spool_in.c`.
+/// Equivalent to `spool_sender_from_msgid()` in `src/src/spool_in.c`
+/// (lines 1088-1117).
 ///
 /// # Arguments
 ///
-/// * `reader` — A reader positioned at the start of the -H file.
+/// * `reader` - A reader positioned at the start of the -H file.
 ///
 /// # Returns
 ///
@@ -1683,6 +1787,8 @@ mod tests {
         assert_eq!(hdr.sender_address, reparsed.sender_address);
         assert_eq!(hdr.recipients.len(), reparsed.recipients.len());
         assert_eq!(hdr.headers.len(), reparsed.headers.len());
+        assert_eq!(hdr.body_linecount, reparsed.body_linecount);
+        assert_eq!(hdr.received_time_usec, reparsed.received_time_usec);
     }
 
     #[test]
@@ -1879,5 +1985,210 @@ mod tests {
             }
         );
         assert_ne!(TaintInfo::Untainted, TaintInfo::Tainted { quoter: None });
+    }
+
+    #[test]
+    fn test_originator_with_spaces_in_login() {
+        // C code parses right-to-left, so login "John Smith" with uid=1000, gid=1000
+        // is written as "John Smith 1000 1000\n"
+        let data = [
+            "1pBnKl-003F4x-Tw-H",
+            "John Smith 1000 1000",
+            "<sender@example.com>",
+            "1700000000 0",
+            "-received_time_usec .000000",
+            "-received_time_complete 1700000000.000000",
+            "-body_linecount 0",
+            "-max_received_linelength 0",
+            "XX",
+            "0",
+            "",
+        ]
+        .join("\n");
+        let hdr = SpoolHeaderFile::read_from(data.as_bytes(), false).unwrap();
+        assert_eq!(hdr.originator_login, "John Smith");
+        assert_eq!(hdr.originator_uid, 1000);
+        assert_eq!(hdr.originator_gid, 1000);
+    }
+
+    #[test]
+    fn test_acl_variable_roundtrip() {
+        let mut hdr = SpoolHeaderFile::default();
+        hdr.message_id = "1pBnKl-003F4x-Tw".to_string();
+        hdr.originator_login = "testuser".to_string();
+        hdr.originator_uid = 1000;
+        hdr.originator_gid = 1000;
+        hdr.sender_address = "sender@example.com".to_string();
+        hdr.received_time_sec = 1700000000;
+        hdr.received_time_complete_sec = 1700000000;
+        hdr.acl_c_vars
+            .insert("myvar".to_string(), "hello world".to_string());
+        hdr.acl_m_vars
+            .insert("msgvar".to_string(), "test data".to_string());
+        hdr.recipients.push(Recipient {
+            address: "rcpt@example.com".to_string(),
+            pno: -1,
+            errors_to: None,
+            dsn: DsnInfo::default(),
+        });
+
+        let mut output = Vec::new();
+        hdr.write_to(&mut output).unwrap();
+        let reparsed = SpoolHeaderFile::read_from(output.as_slice(), false).unwrap();
+        assert_eq!(
+            reparsed.acl_c_vars.get("myvar").map(|s| s.as_str()),
+            Some("hello world")
+        );
+        assert_eq!(
+            reparsed.acl_m_vars.get("msgvar").map(|s| s.as_str()),
+            Some("test data")
+        );
+    }
+
+    #[test]
+    fn test_message_linecount_computation() {
+        let data = minimal_spool_header();
+        let hdr = SpoolHeaderFile::read_from(data.as_bytes(), true).unwrap();
+        // body_linecount = 42, header has 1 header ending with \r\n (1 line)
+        // message_linecount should be body_linecount + number of header lines
+        assert_eq!(hdr.message_linecount, 42 + 1);
+    }
+
+    #[test]
+    fn test_message_size_excludes_rewritten() {
+        // Create a spool with a normal header and a rewritten header.
+        // Headers are contiguous in the spool format (no newline between them),
+        // so we build the header section separately from the join.
+        let mut data = [
+            "1pBnKl-003F4x-Tw-H",
+            "testuser 1000 1000",
+            "<sender@example.com>",
+            "1700000000 0",
+            "-received_time_usec .000000",
+            "-received_time_complete 1700000000.000000",
+            "-body_linecount 0",
+            "-max_received_linelength 0",
+            "XX",
+            "0",
+        ]
+        .join("\n");
+        // Add end-of-count newline + blank separator line + headers
+        data.push_str("\n\n");
+        data.push_str("028R Received: from test server\r\n");
+        // "X-Rewritten: old\r\n" = 17 bytes
+        data.push_str("017* X-Rewritten: old\r\n");
+        let hdr = SpoolHeaderFile::read_from(data.as_bytes(), true).unwrap();
+        assert_eq!(hdr.headers.len(), 2);
+        // Only the non-rewritten header counts toward message_size
+        assert_eq!(hdr.message_size, 28);
+    }
+
+    #[test]
+    fn test_extract_var_name() {
+        assert_eq!(SpoolHeaderFile::extract_var_name("-aclc myvar 42"), "aclc");
+        assert_eq!(SpoolHeaderFile::extract_var_name("--aclm var2 10"), "aclm");
+        assert_eq!(
+            SpoolHeaderFile::extract_var_name("--(sql)host_name test"),
+            "host_name"
+        );
+        assert_eq!(
+            SpoolHeaderFile::extract_var_name("-host_address [1.2.3.4]:25"),
+            "host_address"
+        );
+        assert_eq!(
+            SpoolHeaderFile::extract_var_name("-deliver_firsttime"),
+            "deliver_firsttime"
+        );
+    }
+
+    #[test]
+    fn test_complex_tree_roundtrip() {
+        let mut hdr = SpoolHeaderFile::default();
+        hdr.message_id = "1pBnKl-003F4x-Tw".to_string();
+        hdr.originator_login = "testuser".to_string();
+        hdr.originator_uid = 1000;
+        hdr.originator_gid = 1000;
+        hdr.sender_address = "sender@example.com".to_string();
+        hdr.received_time_sec = 1700000000;
+        hdr.received_time_complete_sec = 1700000000;
+        hdr.non_recipients = Some(NonRecipientNode {
+            address: "bounce@example.com".to_string(),
+            left: Some(Box::new(NonRecipientNode {
+                address: "a@example.com".to_string(),
+                left: None,
+                right: None,
+            })),
+            right: Some(Box::new(NonRecipientNode {
+                address: "c@example.com".to_string(),
+                left: None,
+                right: None,
+            })),
+        });
+        hdr.recipients.push(Recipient {
+            address: "rcpt@example.com".to_string(),
+            pno: -1,
+            errors_to: None,
+            dsn: DsnInfo::default(),
+        });
+
+        let mut output = Vec::new();
+        hdr.write_to(&mut output).unwrap();
+        let reparsed = SpoolHeaderFile::read_from(output.as_slice(), false).unwrap();
+        let tree = reparsed.non_recipients.as_ref().unwrap();
+        assert_eq!(tree.address, "bounce@example.com");
+        assert_eq!(tree.left.as_ref().unwrap().address, "a@example.com");
+        assert_eq!(tree.right.as_ref().unwrap().address, "c@example.com");
+    }
+
+    #[test]
+    fn test_i18n_roundtrip() {
+        let mut hdr = SpoolHeaderFile::default();
+        hdr.message_id = "1pBnKl-003F4x-Tw".to_string();
+        hdr.originator_login = "testuser".to_string();
+        hdr.originator_uid = 1000;
+        hdr.originator_gid = 1000;
+        hdr.sender_address = "sender@example.com".to_string();
+        hdr.received_time_sec = 1700000000;
+        hdr.received_time_complete_sec = 1700000000;
+        hdr.i18n.smtputf8 = true;
+        hdr.i18n.utf8_downconvert = -1;
+        hdr.recipients.push(Recipient {
+            address: "rcpt@example.com".to_string(),
+            pno: -1,
+            errors_to: None,
+            dsn: DsnInfo::default(),
+        });
+
+        let mut output = Vec::new();
+        hdr.write_to(&mut output).unwrap();
+        let reparsed = SpoolHeaderFile::read_from(output.as_slice(), false).unwrap();
+        assert!(reparsed.i18n.smtputf8);
+        assert_eq!(reparsed.i18n.utf8_downconvert, -1);
+    }
+
+    #[test]
+    fn test_dsn_roundtrip() {
+        let mut hdr = SpoolHeaderFile::default();
+        hdr.message_id = "1pBnKl-003F4x-Tw".to_string();
+        hdr.originator_login = "testuser".to_string();
+        hdr.originator_uid = 1000;
+        hdr.originator_gid = 1000;
+        hdr.sender_address = "sender@example.com".to_string();
+        hdr.received_time_sec = 1700000000;
+        hdr.received_time_complete_sec = 1700000000;
+        hdr.dsn_envid = Some("myenvid".to_string());
+        hdr.dsn_ret = 2;
+        hdr.recipients.push(Recipient {
+            address: "rcpt@example.com".to_string(),
+            pno: -1,
+            errors_to: None,
+            dsn: DsnInfo::default(),
+        });
+
+        let mut output = Vec::new();
+        hdr.write_to(&mut output).unwrap();
+        let reparsed = SpoolHeaderFile::read_from(output.as_slice(), false).unwrap();
+        assert_eq!(reparsed.dsn_envid.as_deref(), Some("myenvid"));
+        assert_eq!(reparsed.dsn_ret, 2);
     }
 }
