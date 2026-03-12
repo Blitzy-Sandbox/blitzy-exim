@@ -237,6 +237,12 @@ exim-tls = { path = "../exim-tls", optional = true }
 # allocation replacing POOL_MAIN/POOL_MESSAGE C store pools.
 exim-store = { path = "../exim-store" }
 
+# FFI safe wrappers — provides safe_read_fd() and safe_poll_readable_fd() for
+# bridging RawFd to nix 0.31.2's I/O-safe BorrowedFd API without requiring
+# unsafe code in this crate. Used by inbound/pipelining.rs for SMTP socket
+# reads and readability checks (per AAP §0.7.2: zero unsafe outside exim-ffi).
+exim-ffi = { path = "../exim-ffi" }
+
 # Driver trait definitions — needed for AUTH driver integration during SMTP AUTH
 # command handling. The SMTP server dispatches to registered AuthDriver
 # implementations when processing AUTH commands from clients.

@@ -27,11 +27,11 @@
 //! # Safety
 //!
 //! This crate contains **zero `unsafe` blocks** (enforced by
-//! `#![deny(unsafe_code)]`).  All FFI interactions are routed through
+//! `#![forbid(unsafe_code)]`).  All FFI interactions are routed through
 //! the `exim-ffi` crate.
 
 // ── Crate-level lint configuration ──────────────────────────────────────
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![deny(clippy::all)]
 
@@ -283,6 +283,24 @@ pub const RDO_DLFUNC: u32 = 1 << 2;
 /// Checked at expand.c line 5388 before invoking the embedded Perl
 /// interpreter.  Prevents Perl code execution in restricted contexts.
 pub const RDO_PERL: u32 = 1 << 3;
+
+/// Forbid `${readfile …}` during expansion.
+///
+/// Checked before allowing file reads via `${readfile}`.  Prevents
+/// arbitrary filesystem reads in restricted ACL contexts where file
+/// access should be forbidden (e.g., during address verification or
+/// in untrusted filter contexts).  Mirrors the C `RDO_READFILE` flag
+/// from expand.c.
+pub const RDO_READFILE: u32 = 1 << 4;
+
+/// Forbid `${readsocket …}` during expansion.
+///
+/// Checked before allowing network socket reads via `${readsocket}`.
+/// Separated from [`RDO_RUN`] because socket reads and command execution
+/// have different security implications — a context may allow network
+/// queries but forbid command execution, or vice versa.  Mirrors the
+/// C `RDO_READSOCK` flag from expand.c.
+pub const RDO_READSOCK: u32 = 1 << 5;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Constants

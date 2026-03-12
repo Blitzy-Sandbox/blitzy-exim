@@ -59,7 +59,7 @@
 //! to the `exim-ffi` crate and accessed through safe wrapper APIs.
 
 // Enforce zero unsafe code in this crate (AAP §0.7.2).
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 // ---------------------------------------------------------------------------
 // Shared helper modules — always compiled, not feature-gated.

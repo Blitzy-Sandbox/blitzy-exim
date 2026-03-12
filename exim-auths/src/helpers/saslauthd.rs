@@ -245,6 +245,26 @@ fn saslauthd_verify_inner(
         )
     })?;
 
+    // Apply socket timeouts to prevent indefinite blocking if the saslauthd
+    // daemon becomes unresponsive. Uses a default of 30 seconds which is
+    // generous for local Unix socket communication but prevents permanent
+    // thread hangs that would stall the SMTP connection.
+    let socket_timeout = std::time::Duration::from_secs(30);
+    stream.set_read_timeout(Some(socket_timeout)).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("failed to set read timeout on saslauthd socket: {}", e),
+        )
+    })?;
+    stream
+        .set_write_timeout(Some(socket_timeout))
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("failed to set write timeout on saslauthd socket: {}", e),
+            )
+        })?;
+
     // Step 2: Send four counted strings in the exact order expected by the
     // saslauthd daemon protocol.
 

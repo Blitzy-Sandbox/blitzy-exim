@@ -29,12 +29,11 @@
 //!
 //! ## Safety
 //!
-//! This module contains a single `unsafe` block wrapping `nix::unistd::fork()`,
-//! which nix 0.31.2 marks `unsafe` due to the inherent risk of forking in
-//! multi-threaded processes. The call is sound because Exim's delivery
-//! subprocess model guarantees no shared mutable state between parent and child
-//! processes (per AAP §0.7.3 fork-per-connection model). All other POSIX
-//! operations use safe nix wrappers.
+//! This module contains **zero** `unsafe` blocks (per AAP §0.7.2). The
+//! `fork()` system call is delegated to `exim_ffi::process::fork_process()`,
+//! which wraps the `unsafe { nix::unistd::fork() }` call in the only crate
+//! permitted to contain `unsafe` code. All other POSIX operations use safe
+//! nix wrappers.
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -44,7 +43,7 @@ use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::kill;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, pipe, read, write, ForkResult, Pid};
+use nix::unistd::{pipe, read, write, ForkResult, Pid};
 use tracing::{debug, error, info, warn};
 
 use crate::orchestrator::{AddressFlags, AddressItem, DeliveryError};
@@ -731,19 +730,15 @@ impl ParallelDeliveryManager {
     /// Translates C `do_remote_deliveries()` (deliver.c line 4337, ~1050
     /// lines).
     ///
-    /// # Safety Justification for `fork()`
+    /// # Fork Safety
     ///
-    /// `nix::unistd::fork()` is marked `unsafe` in nix 0.31.2 because
-    /// forking a multi-threaded process can leave the child with stale
-    /// mutex/lock state. This call is sound because:
-    ///
-    /// 1. Exim's delivery path is inherently single-threaded (fork-per-
-    ///    connection model per AAP §0.7.3).
-    /// 2. The child process immediately executes transport code and exits —
-    ///    it does not interact with parent-owned mutexes.
-    /// 3. All shared state between parent and child flows exclusively
-    ///    through the pipe IPC, not shared memory.
-    #[allow(unsafe_code)]
+    /// Forking is delegated to `exim_ffi::process::fork_process()` — the
+    /// safe wrapper that isolates the `unsafe { nix::unistd::fork() }` call
+    /// in the only crate permitted to contain `unsafe` code (AAP §0.7.2).
+    /// The call is sound because Exim's delivery path is inherently
+    /// single-threaded (fork-per-connection model per AAP §0.7.3), the child
+    /// immediately executes transport code and exits, and all shared state
+    /// flows exclusively through pipe IPC.
     pub fn do_remote_deliveries(
         &mut self,
         addr_remote: &mut Vec<AddressItem>,
@@ -836,10 +831,9 @@ impl ParallelDeliveryManager {
                 }
             };
 
-            // SAFETY: see function-level doc comment above for full
-            // justification. fork() is safe in Exim's single-threaded
-            // fork-per-connection delivery model.
-            let fork_result = unsafe { fork() };
+            // Delegate to the safe fork wrapper in exim-ffi (AAP §0.7.2).
+            // See function-level doc comment for safety justification.
+            let fork_result = exim_ffi::process::fork_process();
 
             match fork_result {
                 Ok(ForkResult::Child) => {

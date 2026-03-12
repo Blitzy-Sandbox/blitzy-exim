@@ -37,11 +37,9 @@
 
 use std::cmp::min;
 use std::io;
-use std::os::unix::io::{BorrowedFd, RawFd};
+use std::os::unix::io::RawFd;
 
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::alarm;
-use nix::unistd::read;
 use tracing::{debug, error, warn};
 
 use crate::IN_BUFFER_SIZE;
@@ -51,51 +49,28 @@ use crate::IN_BUFFER_SIZE;
 use exim_tls::TlsBuffer;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Safe fd helpers — minimal unsafe wrappers for nix 0.31.2 I/O-safe API
+// Safe fd helpers — delegated to exim-ffi (AAP §0.7.2: zero unsafe outside
+// exim-ffi crate). The safe wrappers in exim_ffi::fd bridge RawFd to nix
+// 0.31.2's I/O-safe BorrowedFd API with the unsafe blocks isolated in the
+// only crate permitted to contain them.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Perform a safe `read()` from a raw file descriptor.
 ///
-/// Bridges `RawFd` to nix 0.31.2's I/O-safe API (Rust RFC 3128) which
-/// requires `BorrowedFd`.
-///
-/// # `#[allow(unsafe_code)]` justification
-///
-/// nix 0.31.2 adopted Rust's I/O safety model (RFC 3128) requiring
-/// `BorrowedFd` instead of `RawFd` for all I/O operations.  Creating a
-/// `BorrowedFd` from a `RawFd` requires `unsafe` because the compiler
-/// cannot statically verify that the fd is valid.  In this crate, fds are
-/// opened by the daemon's connection acceptance code and remain valid for
-/// the entire SMTP session.  The `BorrowedFd` does not close the fd and
-/// does not outlive this function call.  This is the minimum `unsafe`
-/// required to perform socket reads.
-#[allow(unsafe_code)]
+/// Delegates to [`exim_ffi::fd::safe_read_fd`] which contains the single
+/// `unsafe` block for `BorrowedFd::borrow_raw()`, keeping this crate free
+/// of `unsafe` code per AAP §0.7.2.
 fn safe_read(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
-    // SAFETY: `fd` is a valid file descriptor opened by the daemon's
-    // `accept()` call.  It remains open for the SMTP session lifetime.
-    // The `BorrowedFd` borrows the fd without closing it and does not
-    // escape this function.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    read(borrowed, buf)
+    exim_ffi::fd::safe_read_fd(fd, buf)
 }
 
 /// Perform a safe zero-timeout `poll()` readability check on a raw fd.
 ///
-/// Returns `Ok(n)` where `n` is the number of ready fds (0 or 1), or
-/// `Err` on poll failure.
-///
-/// # `#[allow(unsafe_code)]` justification
-///
-/// Same as [`safe_read()`]: bridges `RawFd` to nix 0.31.2's I/O-safe
-/// `PollFd` constructor which requires `BorrowedFd`.  The `BorrowedFd`
-/// does not outlive this function call.
-#[allow(unsafe_code)]
+/// Delegates to [`exim_ffi::fd::safe_poll_readable_fd`] which contains the
+/// single `unsafe` block for `BorrowedFd::borrow_raw()`, keeping this crate
+/// free of `unsafe` code per AAP §0.7.2.
 fn safe_poll_readable(fd: RawFd) -> nix::Result<libc::c_int> {
-    // SAFETY: Same as safe_read — fd is valid for the session lifetime.
-    // BorrowedFd borrows without closing and does not escape this scope.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let pfd = PollFd::new(borrowed, PollFlags::POLLIN);
-    poll(&mut [pfd], PollTimeout::ZERO)
+    exim_ffi::fd::safe_poll_readable_fd(fd)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

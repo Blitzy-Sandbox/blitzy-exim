@@ -33,6 +33,7 @@ use exim_store::TaintState;
 /// Expansion forbid flag: lookups are forbidden.
 const RDO_LOOKUP: u32 = crate::RDO_LOOKUP;
 /// Expansion forbid flag: ${run} is forbidden.
+#[cfg(feature = "run")]
 const RDO_RUN: u32 = crate::RDO_RUN;
 /// Expansion forbid flag: ${dlfunc} is forbidden.
 #[cfg(feature = "dlfunc")]
@@ -40,6 +41,10 @@ const RDO_DLFUNC: u32 = crate::RDO_DLFUNC;
 /// Expansion forbid flag: ${perl} is forbidden.
 #[cfg(feature = "perl")]
 const RDO_PERL: u32 = crate::RDO_PERL;
+/// Expansion forbid flag: ${readfile} is forbidden.
+const RDO_READFILE: u32 = crate::RDO_READFILE;
+/// Expansion forbid flag: ${readsocket} is forbidden.
+const RDO_READSOCK: u32 = crate::RDO_READSOCK;
 
 /// Maximum expansion recursion depth (mirrors C EXPAND_MAXN)
 const MAX_EXPAND_DEPTH: u32 = 50;
@@ -67,7 +72,8 @@ pub struct Evaluator<'a> {
     /// Incremented on each recursive evaluate() call.
     pub expand_level: u32,
 
-    /// Expansion forbid flags — bitfield of RDO_LOOKUP, RDO_RUN, RDO_DLFUNC, RDO_PERL.
+    /// Expansion forbid flags — bitfield of RDO_LOOKUP, RDO_RUN, RDO_DLFUNC,
+    /// RDO_PERL, RDO_READFILE, RDO_READSOCK.
     /// When a bit is set, the corresponding expansion item is forbidden (returns error).
     pub expand_forbid: u32,
 
@@ -92,6 +98,17 @@ pub struct Evaluator<'a> {
 
     /// Expansion context providing variable resolution from scoped context structs.
     ctx: &'a ExpandContext,
+
+    /// Accumulated taint state for the current expansion result.
+    ///
+    /// Tracks whether any tainted data has been incorporated into the output
+    /// during expansion. When a variable with `TaintState::Tainted` is resolved,
+    /// this field is promoted to `TaintState::Tainted`. Once tainted, it cannot
+    /// revert to untainted (taint is monotonically increasing).
+    ///
+    /// This implements the taint propagation required by AAP §0.4.3: untainted
+    /// input concatenated with tainted variables produces tainted output.
+    pub result_taint: TaintState,
 }
 
 impl<'a> Evaluator<'a> {
@@ -112,6 +129,7 @@ impl<'a> Evaluator<'a> {
             lookup_value: None,
             max_depth: MAX_EXPAND_DEPTH,
             ctx,
+            result_taint: TaintState::Untainted,
         }
     }
 
@@ -129,6 +147,21 @@ impl<'a> Evaluator<'a> {
             lookup_value: None,
             max_depth: MAX_EXPAND_DEPTH,
             ctx,
+            result_taint: TaintState::Untainted,
+        }
+    }
+
+    /// Propagate taint state: if a resolved variable is tainted, promote the
+    /// accumulated `result_taint` to `TaintState::Tainted`. Taint is monotonically
+    /// increasing — once tainted, the result stays tainted regardless of
+    /// subsequent untainted values being concatenated.
+    ///
+    /// Implements AAP §0.4.3: untainted input concatenated with tainted
+    /// variables produces tainted output.
+    #[inline]
+    fn propagate_taint(&mut self, taint: TaintState) {
+        if matches!(taint, TaintState::Tainted) {
+            self.result_taint = TaintState::Tainted;
         }
     }
 
@@ -272,9 +305,18 @@ impl<'a> Evaluator<'a> {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Resolve a variable reference ($name / ${name}) via the variables module.
-    fn eval_variable(&self, var_ref: &VariableRef, output: &mut String) -> Result<(), ExpandError> {
+    ///
+    /// Propagates taint state: if the variable is tainted (e.g., user-supplied
+    /// input like `$local_part`, `$sender_address`, `$auth1`), the evaluator's
+    /// accumulated taint is promoted to `Tainted` (AAP §0.4.3).
+    fn eval_variable(
+        &mut self,
+        var_ref: &VariableRef,
+        output: &mut String,
+    ) -> Result<(), ExpandError> {
         tracing::debug!(var = %var_ref.name, "resolving variable");
-        let (val_opt, _taint) = variables::resolve_variable(&var_ref.name, self.ctx)?;
+        let (val_opt, taint) = variables::resolve_variable(&var_ref.name, self.ctx)?;
+        self.propagate_taint(taint);
         if let Some(val) = val_opt {
             output.push_str(&val);
         }
@@ -282,8 +324,11 @@ impl<'a> Evaluator<'a> {
     }
 
     /// Resolve a header reference ($h_name, $rh_name, $bh_name, $lh_name).
+    ///
+    /// Message headers are always tainted (they come from external input).
+    /// Propagates taint state per AAP §0.4.3.
     fn eval_header_ref(
-        &self,
+        &mut self,
         prefix: &HeaderPrefix,
         name: &str,
         output: &mut String,
@@ -296,7 +341,8 @@ impl<'a> Evaluator<'a> {
             HeaderPrefix::Body => format!("bh_{}", name),
             HeaderPrefix::List => format!("lh_{}", name),
         };
-        let (val_opt, _taint) = variables::resolve_variable(&full_name, self.ctx)?;
+        let (val_opt, taint) = variables::resolve_variable(&full_name, self.ctx)?;
+        self.propagate_taint(taint);
         if let Some(val) = val_opt {
             output.push_str(&val);
         }
@@ -304,9 +350,12 @@ impl<'a> Evaluator<'a> {
     }
 
     /// Resolve an ACL variable ($acl_c0..$acl_c9, $acl_m0..$acl_m9, etc.).
-    fn eval_acl_variable(&self, name: &str, output: &mut String) -> Result<(), ExpandError> {
+    ///
+    /// Propagates taint state per AAP §0.4.3.
+    fn eval_acl_variable(&mut self, name: &str, output: &mut String) -> Result<(), ExpandError> {
         tracing::debug!(acl_var = name, "resolving ACL variable");
-        let (val_opt, _taint) = variables::resolve_variable(name, self.ctx)?;
+        let (val_opt, taint) = variables::resolve_variable(name, self.ctx)?;
+        self.propagate_taint(taint);
         if let Some(val) = val_opt {
             output.push_str(&val);
         }
@@ -314,10 +363,14 @@ impl<'a> Evaluator<'a> {
     }
 
     /// Resolve an authentication variable ($auth1..$auth3).
-    fn eval_auth_variable(&self, idx: u8, output: &mut String) -> Result<(), ExpandError> {
+    ///
+    /// Auth variables are always tainted (they contain user-supplied credentials).
+    /// Propagates taint state per AAP §0.4.3.
+    fn eval_auth_variable(&mut self, idx: u8, output: &mut String) -> Result<(), ExpandError> {
         tracing::debug!(auth_idx = idx, "resolving auth variable");
         let name = format!("auth{}", idx);
-        let (val_opt, _taint) = variables::resolve_variable(&name, self.ctx)?;
+        let (val_opt, taint) = variables::resolve_variable(&name, self.ctx)?;
+        self.propagate_taint(taint);
         if let Some(val) = val_opt {
             output.push_str(&val);
         }
@@ -1177,12 +1230,25 @@ impl<'a> Evaluator<'a> {
     }
 
     /// ${readfile{filename}{eol_chars}} — read file contents.
+    ///
+    /// Checks `RDO_READFILE` forbid flag before allowing file reads,
+    /// preventing arbitrary filesystem access in restricted ACL contexts
+    /// (mirrors C `expand_forbid & RDO_READFILE` check from expand.c).
     fn eval_item_readfile(
         &mut self,
         args: &[AstNode],
         flags: EsiFlags,
         output: &mut String,
     ) -> Result<(), ExpandError> {
+        // Check expand_forbid flag — file reads may be forbidden in restricted
+        // ACL contexts (e.g., during address verification or in untrusted
+        // filter contexts). Mirrors C expand.c RDO_READFILE check.
+        if self.expand_forbid & RDO_READFILE != 0 {
+            return Err(ExpandError::Failed {
+                message: "${readfile} expansion forbidden in this context".into(),
+            });
+        }
+
         let filename = self.eval_arg(args, 0, flags)?;
         let eol_replacement = if args.len() > 1 {
             Some(self.eval_arg(args, 1, flags)?)
@@ -1206,15 +1272,23 @@ impl<'a> Evaluator<'a> {
     }
 
     /// ${readsocket{...}} — read from TCP or Unix socket.
+    ///
+    /// Checks `RDO_READSOCK` forbid flag (NOT `RDO_RUN`) before allowing socket
+    /// reads. Socket reads and command execution have different security
+    /// implications and must be controlled independently. Mirrors C expand.c
+    /// `expand_forbid & RDO_READSOCK` check.
     fn eval_item_readsocket(
         &mut self,
         args: &[AstNode],
         flags: EsiFlags,
         output: &mut String,
     ) -> Result<(), ExpandError> {
-        if self.expand_forbid & RDO_RUN != 0 {
+        // Check RDO_READSOCK — socket reads have separate security policy from
+        // command execution (RDO_RUN). C Exim has a dedicated RDO_READSOCK flag
+        // distinct from RDO_RUN for fine-grained expansion control.
+        if self.expand_forbid & RDO_READSOCK != 0 {
             return Err(ExpandError::Failed {
-                message: "item_readsocket expansion forbidden in this context".into(),
+                message: "${readsocket} expansion forbidden in this context".into(),
             });
         }
 

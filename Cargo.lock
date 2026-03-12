@@ -900,6 +900,7 @@ dependencies = [
  "exim-dns",
  "exim-drivers",
  "exim-expand",
+ "exim-ffi",
  "exim-store",
  "exim-tls",
  "libc",

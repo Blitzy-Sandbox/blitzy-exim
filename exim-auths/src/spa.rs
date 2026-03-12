@@ -26,6 +26,26 @@
 //   - http://www.kuro5hin.org/story/2002/4/28/1436/66154
 //   - [MS-NLMP]: NT LAN Manager (NTLM) Authentication Protocol
 //
+// # Weak Cryptography Notice
+//
+// **WARNING**: This module uses MD4 and DES as required by the SPA/NTLM
+// protocol specification (MS-NLMP).  These are considered weak by modern
+// cryptographic standards:
+//
+// - **MD4** (RFC 1320) has known collision attacks and should not be used
+//   for any new protocol design.  It is used here solely because the NTLM
+//   NT-Hash is defined as `MD4(UTF-16LE(password))`.
+//
+// - **DES** (FIPS 46-3, withdrawn 2005) has a 56-bit effective key space,
+//   which is vulnerable to brute-force attacks.  It is used here because
+//   the NTLM LM-Response requires DES-ECB encryption of the server
+//   challenge with three 7-bit keys derived from the LM-Hash.
+//
+// These algorithms **cannot be replaced** without breaking compatibility
+// with the NTLM authentication protocol.  Sites requiring stronger
+// authentication should use SCRAM-SHA-256 (via the gsasl driver) or
+// TLS client certificates (via the tls_auth driver) instead of SPA/NTLM.
+//
 // Safety: This file contains ZERO unsafe code (per AAP §0.7.2).
 // All crypto uses safe Rust crates (md4, des) instead of the C inline
 // implementations.

@@ -937,12 +937,22 @@ impl CramMd5Auth {
             }
         };
 
-        if received_digest != expected_digest {
-            tracing::debug!("CRAM-MD5 digest mismatch");
-            return Ok(AuthServerResult::Failed);
+        // Constant-time comparison to prevent timing attacks (CWE-208).
+        // The `hmac::Mac::verify_slice()` method uses `subtle::ConstantTimeEq`
+        // internally, ensuring the comparison time does not depend on which
+        // byte position first differs. We recreate the HMAC to use verify_slice
+        // rather than comparing raw byte arrays with `!=` (which short-circuits).
+        {
+            let mut mac = HmacMd5::new_from_slice(secret.as_bytes())
+                .expect("HMAC-MD5 accepts any key length");
+            mac.update(challenge.as_bytes());
+            if mac.verify_slice(&received_digest).is_err() {
+                tracing::debug!("CRAM-MD5 digest mismatch (constant-time comparison)");
+                return Ok(AuthServerResult::Failed);
+            }
         }
 
-        tracing::debug!("CRAM-MD5 digest matched");
+        tracing::debug!("CRAM-MD5 digest matched (constant-time verified)");
 
         // ── Evaluate server_condition ───────────────────────────────────
         //
@@ -1006,15 +1016,16 @@ fn get_hostname() -> String {
 
     // Try reading the system hostname via the hostname system call.
     let mut buf = [0u8; 256];
-    let result = unsafe_free_hostname(&mut buf);
+    let result = read_system_hostname(&mut buf);
     result.unwrap_or_else(|| "localhost".to_string())
 }
 
-/// Get hostname without using unsafe code.
+/// Read the system hostname from filesystem sources.
 ///
 /// Reads `/proc/sys/kernel/hostname` on Linux, falls back to
-/// `/etc/hostname`, and finally to `"localhost"`.
-fn unsafe_free_hostname(buf: &mut [u8; 256]) -> Option<String> {
+/// `/etc/hostname`, and finally returns `None` if neither source
+/// provides a non-empty hostname.
+fn read_system_hostname(buf: &mut [u8; 256]) -> Option<String> {
     // Try /proc/sys/kernel/hostname first (Linux-specific but common)
     if let Ok(hostname) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
         let trimmed = hostname.trim();

@@ -107,7 +107,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // Enforce the zero-unsafe-code policy at the crate level (AAP §0.7.2).
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 // ---------------------------------------------------------------------------
 // Module declarations

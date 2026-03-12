@@ -49,7 +49,7 @@
 //! Per AAP §0.4.3, network input data uses `Tainted<T>` / `Clean<T>` newtypes
 //! from `exim-store` for compile-time taint tracking with zero runtime cost.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 // ─── External imports ──────────────────────────────────────────────────────────
 

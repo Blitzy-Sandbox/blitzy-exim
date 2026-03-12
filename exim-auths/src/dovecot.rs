@@ -456,6 +456,27 @@ impl AuthDriver for DovecotAuth {
             ))
         })?;
 
+        // Apply socket timeouts to prevent indefinite blocking if the Dovecot
+        // daemon becomes unresponsive. Uses a default of 30 seconds which is
+        // generous for local Unix socket communication but prevents permanent
+        // thread hangs. This addresses the reliability concern where a hung
+        // Dovecot daemon would block the SMTP connection thread indefinitely.
+        let socket_timeout = std::time::Duration::from_secs(30);
+        stream.set_read_timeout(Some(socket_timeout)).map_err(|e| {
+            DriverError::TempFail(format!(
+                "failed to set read timeout on Dovecot auth socket: {}",
+                e
+            ))
+        })?;
+        stream
+            .set_write_timeout(Some(socket_timeout))
+            .map_err(|e| {
+                DriverError::TempFail(format!(
+                    "failed to set write timeout on Dovecot auth socket: {}",
+                    e
+                ))
+            })?;
+
         // Clone the stream so we can read and write independently.
         // BufReader wraps the read half; the write half stays unbuffered.
         let mut writer = stream
