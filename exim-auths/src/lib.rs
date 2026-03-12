@@ -49,3 +49,10 @@ pub mod gsasl;
 /// with an expanded initial response.
 #[cfg(feature = "auth-external")]
 pub mod external;
+
+/// Dovecot auth-client protocol authenticator driver.
+/// Replaces C `src/src/auths/dovecot.c` + `dovecot.h` — server-only auth
+/// that speaks Dovecot's TAB-delimited auth-client protocol over a Unix
+/// domain socket, relaying SASL exchanges to the Dovecot authentication daemon.
+#[cfg(feature = "auth-dovecot")]
+pub mod dovecot;
