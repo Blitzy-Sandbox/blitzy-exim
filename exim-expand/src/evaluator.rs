@@ -90,48 +90,59 @@ impl Evaluator {
             AstNode::Literal(s) => Ok(s.clone()),
             AstNode::Escape(c) => Ok(String::from(*c)),
             AstNode::Protected(s) => Ok(s.clone()),
-            AstNode::Variable(name) => {
+            AstNode::Variable(ref var_ref) => {
                 // Stub: variable lookup not yet implemented
-                tracing::debug!(name = %name, "variable lookup (stub)");
+                tracing::debug!(name = %var_ref, "variable lookup (stub)");
                 Ok(String::new())
             }
-            AstNode::HeaderRef(name) => {
-                tracing::debug!(name = %name, "header ref lookup (stub)");
+            AstNode::HeaderRef {
+                ref prefix,
+                ref name,
+            } => {
+                tracing::debug!(name = %name, ?prefix, "header ref lookup (stub)");
                 Ok(String::new())
             }
-            AstNode::AclVariable(name) => {
+            AstNode::AclVariable(ref name) => {
                 tracing::debug!(name = %name, "ACL variable lookup (stub)");
                 Ok(String::new())
             }
-            AstNode::AuthVariable(name) => {
-                tracing::debug!(name = %name, "auth variable lookup (stub)");
+            AstNode::AuthVariable(idx) => {
+                tracing::debug!(idx = %idx, "auth variable lookup (stub)");
                 Ok(String::new())
             }
-            AstNode::Item { name, args } => {
-                let _ = (name, args, flags);
+            AstNode::Item {
+                ref kind,
+                ref args,
+                ref yes_branch,
+                ref no_branch,
+            } => {
+                let _ = (kind, args, yes_branch, no_branch, flags);
                 // Stub: item evaluation not yet implemented
                 Ok(String::new())
             }
-            AstNode::Operator { name, operand } => {
-                let value = self.eval_expr(operand, flags)?;
-                let _ = (name, &value);
+            AstNode::Operator {
+                ref kind,
+                ref subject,
+            } => {
+                let value = self.eval_expr(subject, flags)?;
+                let _ = (kind, &value);
                 // Stub: operator application not yet implemented
                 Ok(value)
             }
             AstNode::Conditional {
-                condition,
-                then_branch,
-                else_branch,
+                ref condition,
+                ref yes_branch,
+                ref no_branch,
             } => {
-                let cond_val = self.eval_expr(condition, flags)?;
-                if !cond_val.is_empty()
-                    && cond_val != "0"
-                    && !cond_val.eq_ignore_ascii_case("no")
-                    && !cond_val.eq_ignore_ascii_case("false")
-                {
-                    self.eval_expr(then_branch, flags)
+                // Stub: evaluate condition node — for now treat
+                // non-negated as true and negated as false.
+                let cond_result = !condition.negated;
+                if cond_result {
+                    self.eval_expr(yes_branch, flags)
+                } else if let Some(ref nb) = *no_branch {
+                    self.eval_expr(nb, flags)
                 } else {
-                    self.eval_expr(else_branch, flags)
+                    Ok(String::new())
                 }
             }
             AstNode::Sequence(nodes) => {
