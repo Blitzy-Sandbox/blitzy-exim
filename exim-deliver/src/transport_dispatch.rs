@@ -15,8 +15,8 @@
 //! # Design Patterns (AAP §0.4.2)
 //!
 //! - **Scoped context passing**: All functions receive context structs explicitly
-//! - **Trait-based drivers**: Uses [`TransportDriver`] from `exim-drivers`
-//! - **Taint tracking**: Expanded option values use [`Tainted`] / [`Clean`]
+//! - **Trait-based drivers**: Uses `TransportDriver` from `exim-drivers`
+//! - **Taint tracking**: Expanded option values use `Tainted<T>` / `Clean<T>`
 //! - **Zero `unsafe` code**: All POSIX calls use safe wrappers from `nix`
 //!
 //! # Source C Mapping

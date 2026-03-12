@@ -464,7 +464,7 @@ pub fn write_bounce_from<W: Write>(
 /// Translates `moan_write_references()` from moan.c line 59.
 ///
 /// Scans the provided headers for existing `References:` and `Message-ID:`
-/// values. Collects up to [`MAX_REFERENCES`] (12) message IDs in a circular
+/// values. Collects up to `MAX_REFERENCES` (12) message IDs in a circular
 /// buffer. When the buffer exceeds 12 entries, the second-oldest entry is
 /// dropped (preserving the very first and the most recent entries).
 ///
