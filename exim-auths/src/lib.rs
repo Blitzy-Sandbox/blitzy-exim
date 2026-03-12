@@ -57,6 +57,13 @@ pub mod external;
 #[cfg(feature = "auth-dovecot")]
 pub mod dovecot;
 
+/// CRAM-MD5 HMAC challenge/response authenticator driver.
+/// Replaces C `src/src/auths/cram_md5.c` + `cram_md5.h` — RFC 2195 CRAM-MD5
+/// authentication using HMAC-MD5 from the RustCrypto ecosystem (hmac + md-5).
+/// Both server-side challenge verification and client-side response generation.
+#[cfg(feature = "auth-cram-md5")]
+pub mod cram_md5;
+
 /// Cyrus SASL authenticator driver (generic, mechanism-independent).
 /// Replaces C `src/src/auths/cyrus_sasl.c` + `cyrus_sasl.h` — delegates
 /// server-side SASL authentication to the Cyrus SASL library (libsasl2) via
