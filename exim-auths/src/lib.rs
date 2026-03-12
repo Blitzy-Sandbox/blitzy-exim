@@ -26,3 +26,10 @@ pub mod plaintext;
 /// full NTLM protocol with built-in MD4/DES crypto.
 #[cfg(feature = "auth-spa")]
 pub mod spa;
+
+/// Heimdal GSSAPI (Kerberos) authenticator driver.
+/// Replaces C `src/src/auths/heimdal_gssapi.c` + `heimdal_gssapi.h` —
+/// server-side Kerberos GSSAPI authentication via Heimdal/MIT libraries
+/// through `exim-ffi`.
+#[cfg(feature = "auth-heimdal-gssapi")]
+pub mod heimdal_gssapi;

@@ -94,7 +94,7 @@ auth-gsasl = ["dep:exim-ffi"]
 # Heimdal GSSAPI: Kerberos/GSSAPI authentication via Heimdal libraries.
 # Requires FFI bindings from exim-ffi for libkrb5/libgssapi interop.
 # Replaces AUTH_HEIMDAL_GSSAPI / heimdal_gssapi.c from the C build.
-auth-heimdal-gssapi = ["dep:exim-ffi"]
+auth-heimdal-gssapi = ["dep:exim-ffi", "exim-ffi/ffi-krb5"]
 
 # PLAIN/LOGIN: Cleartext PLAIN and LOGIN SASL mechanisms.
 # Pure Rust implementation with multi-prompt server support.

@@ -124,6 +124,50 @@ mod ffi {
         pub fn krb5_gss_register_acceptor_identity(
             keytab: *const ::std::os::raw::c_char,
         ) -> OM_uint32;
+
+        /// Wrap a message with integrity and optional confidentiality.
+        ///
+        /// From `<gssapi/gssapi.h>`:
+        /// ```c
+        /// OM_uint32 gss_wrap(
+        ///     OM_uint32 *minor_status,
+        ///     gss_ctx_id_t context_handle,
+        ///     int conf_req_flag,
+        ///     gss_qop_t qop_req,
+        ///     gss_buffer_t input_message_buffer,
+        ///     int *conf_state,
+        ///     gss_buffer_t output_message_buffer);
+        /// ```
+        pub fn gss_wrap(
+            minor_status: *mut OM_uint32,
+            context_handle: gss_ctx_id_t,
+            conf_req_flag: ::std::os::raw::c_int,
+            qop_req: OM_uint32,
+            input_message_buffer: gss_buffer_t,
+            conf_state: *mut ::std::os::raw::c_int,
+            output_message_buffer: gss_buffer_t,
+        ) -> OM_uint32;
+
+        /// Unwrap a message protected by gss_wrap.
+        ///
+        /// From `<gssapi/gssapi.h>`:
+        /// ```c
+        /// OM_uint32 gss_unwrap(
+        ///     OM_uint32 *minor_status,
+        ///     gss_ctx_id_t context_handle,
+        ///     gss_buffer_t input_message_buffer,
+        ///     gss_buffer_t output_message_buffer,
+        ///     int *conf_state,
+        ///     gss_qop_t *qop_state);
+        /// ```
+        pub fn gss_unwrap(
+            minor_status: *mut OM_uint32,
+            context_handle: gss_ctx_id_t,
+            input_message_buffer: gss_buffer_t,
+            output_message_buffer: gss_buffer_t,
+            conf_state: *mut ::std::os::raw::c_int,
+            qop_state: *mut OM_uint32,
+        ) -> OM_uint32;
     }
 }
 
@@ -664,6 +708,173 @@ impl GssContext {
         }
 
         Ok(GssName { name: src_name })
+    }
+
+    /// Wrap a message with integrity and optional confidentiality protection.
+    ///
+    /// Wraps the input message using `gss_wrap()` on a fully established
+    /// security context. Used for the SASL GSSAPI security-layer negotiation
+    /// where the server sends wrapped capability bytes to the client.
+    ///
+    /// Replaces the `gss_wrap()` call at `heimdal_gssapi.c` line 393.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` — The plaintext message bytes to wrap.
+    /// * `confidential` — If `true`, request confidentiality (encryption).
+    ///   If `false`, request integrity protection only.
+    ///
+    /// # Returns
+    ///
+    /// The wrapped message as a `Vec<u8>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GssapiError` if `gss_wrap()` fails.
+    pub fn wrap(&self, message: &[u8], confidential: bool) -> Result<Vec<u8>, GssapiError> {
+        let mut min_stat: u32 = 0;
+        let mut conf_state: i32 = 0;
+        let mut output_buf = ffi::gss_buffer_desc_struct {
+            length: 0,
+            value: ptr::null_mut(),
+        };
+        let mut input_buf = ffi::gss_buffer_desc_struct {
+            length: message.len(),
+            value: message.as_ptr() as *mut libc::c_void,
+        };
+
+        let conf_req = if confidential { 1 } else { 0 };
+
+        // SAFETY: calling gss_wrap to protect a message with
+        // the established GSSAPI security context. `self.ctx` is a valid
+        // context handle from a completed gss_accept_sec_context exchange.
+        // `input_buf` points to valid `message` bytes that outlive this call.
+        // `output_buf` and `conf_state` are valid stack-allocated variables.
+        // `qop_req` of 0 means use default QOP.
+        let maj = unsafe {
+            ffi::gss_wrap(
+                &mut min_stat,
+                self.ctx,
+                conf_req,
+                0, // GSS_C_QOP_DEFAULT
+                &mut input_buf,
+                &mut conf_state,
+                &mut output_buf,
+            )
+        };
+
+        if is_gss_error(maj) {
+            if output_buf.length > 0 && !output_buf.value.is_null() {
+                let mut rel_min: u32 = 0;
+                // SAFETY: releasing the output buffer on error.
+                unsafe {
+                    ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
+                }
+            }
+            return Err(GssapiError::from_status(maj, min_stat));
+        }
+
+        // Copy the wrapped bytes and release the GSSAPI-managed buffer.
+        let result = if output_buf.length > 0 && !output_buf.value.is_null() {
+            // SAFETY: the output buffer was populated by gss_wrap
+            // on success. The value pointer is valid for `length` bytes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(output_buf.value as *const u8, output_buf.length)
+            };
+            let token = bytes.to_vec();
+
+            let mut rel_min: u32 = 0;
+            // SAFETY: releasing the output buffer after copying.
+            unsafe {
+                ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
+            }
+            token
+        } else {
+            Vec::new()
+        };
+
+        Ok(result)
+    }
+
+    /// Unwrap a message protected by gss_wrap.
+    ///
+    /// Unwraps the input token using `gss_unwrap()` on a fully established
+    /// security context. Used for the SASL GSSAPI security-layer negotiation
+    /// where the server unwraps the client's security-layer choice response.
+    ///
+    /// Replaces the `gss_unwrap()` call at `heimdal_gssapi.c` line 423.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` — The wrapped message bytes to unwrap.
+    ///
+    /// # Returns
+    ///
+    /// The unwrapped plaintext message as a `Vec<u8>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GssapiError` if `gss_unwrap()` fails.
+    pub fn unwrap(&self, token: &[u8]) -> Result<Vec<u8>, GssapiError> {
+        let mut min_stat: u32 = 0;
+        let mut conf_state: i32 = 0;
+        let mut qop_state: u32 = 0;
+        let mut output_buf = ffi::gss_buffer_desc_struct {
+            length: 0,
+            value: ptr::null_mut(),
+        };
+        let mut input_buf = ffi::gss_buffer_desc_struct {
+            length: token.len(),
+            value: token.as_ptr() as *mut libc::c_void,
+        };
+
+        // SAFETY: calling gss_unwrap to decode a wrapped message
+        // with the established GSSAPI security context. `self.ctx` is a valid
+        // context handle from a completed gss_accept_sec_context exchange.
+        // `input_buf` points to valid `token` bytes that outlive this call.
+        // `output_buf`, `conf_state`, and `qop_state` are valid stack vars.
+        let maj = unsafe {
+            ffi::gss_unwrap(
+                &mut min_stat,
+                self.ctx,
+                &mut input_buf,
+                &mut output_buf,
+                &mut conf_state,
+                &mut qop_state,
+            )
+        };
+
+        if is_gss_error(maj) {
+            if output_buf.length > 0 && !output_buf.value.is_null() {
+                let mut rel_min: u32 = 0;
+                // SAFETY: releasing the output buffer on error.
+                unsafe {
+                    ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
+                }
+            }
+            return Err(GssapiError::from_status(maj, min_stat));
+        }
+
+        // Copy the unwrapped bytes and release the GSSAPI-managed buffer.
+        let result = if output_buf.length > 0 && !output_buf.value.is_null() {
+            // SAFETY: the output buffer was populated by gss_unwrap
+            // on success. The value pointer is valid for `length` bytes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(output_buf.value as *const u8, output_buf.length)
+            };
+            let token = bytes.to_vec();
+
+            let mut rel_min: u32 = 0;
+            // SAFETY: releasing the output buffer after copying.
+            unsafe {
+                ffi::gss_release_buffer(&mut rel_min, &mut output_buf);
+            }
+            token
+        } else {
+            Vec::new()
+        };
+
+        Ok(result)
     }
 }
 
