@@ -221,6 +221,12 @@ pub struct AddressItem {
 
     /// Name of the transport to use for this address.
     pub transport: Option<String>,
+
+    /// Hostname set by `self = pass` in a router when the address resolves
+    /// to the local machine.  Corresponds to C `address_item.self_hostname`
+    /// (`structs.h` line 566).  Used by subsequent routers to detect
+    /// self-referencing hosts without repeating DNS lookups.
+    pub self_hostname: Option<String>,
 }
 
 impl AddressItem {
@@ -257,6 +263,7 @@ impl AddressItem {
             host_list: Vec::new(),
             fallback_hosts: Vec::new(),
             transport: None,
+            self_hostname: None,
         }
     }
 

@@ -84,6 +84,15 @@ pub use get_munge_headers::get_munge_headers;
 pub use get_munge_headers::GetMungeHeadersError;
 pub use get_munge_headers::MungeHeadersResult;
 
+/// Self-reference detection action handler for router drivers.
+///
+/// Translates `rf_self_action()` from C `src/src/routers/rf_self_action.c`.
+/// Handles self-reference detection when a host lookup returns the local
+/// machine (`HOST_FOUND_LOCAL`). Dispatches on the configured `self` action
+/// (freeze, defer, fail, send, reroute, pass) and updates the address item
+/// and delivery context accordingly.
+pub mod self_action;
+
 /// Errors-to address resolution for router drivers.
 ///
 /// Translates `rf_get_errors_address()` from C `src/src/routers/rf_get_errors_address.c`.
@@ -101,6 +110,10 @@ pub use ugid::UgidBlock;
 pub use queue_add::queue_add;
 pub use queue_add::PasswdEntry;
 pub use queue_add::QueueAddError;
+
+// Re-export self_action function and enum for ergonomic access by router drivers.
+pub use self_action::self_action;
+pub use self_action::SelfAction;
 
 // Re-export get_errors_address function and types for ergonomic access.
 pub use get_errors_address::get_errors_address;
