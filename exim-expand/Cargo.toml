@@ -164,7 +164,9 @@ srs = []
 
 # ${perl} integration via embedded Perl interpreter through exim-ffi
 # Replaces: #ifdef EXIM_PERL (expand.c lines 5377-5442, 9156-9179)
-perl = ["dep:exim-ffi"]
+# Enables both the exim-ffi dependency and its ffi-perl feature to make
+# exim_ffi::perl::{PerlInterpreter, PerlError} available.
+perl = ["dep:exim-ffi", "exim-ffi/ffi-perl"]
 
 # ${dlfunc} dynamic function loading via libloading
 # Replaces: #ifdef EXPAND_DLFUNC (expand.c lines 7138-7222)
