@@ -27,7 +27,11 @@
 /// and `src/src/routers/rf_set_ugid.c`. These functions handle resolving uid/gid
 /// values for router instances (from fixed config values or expandable strings)
 /// and copying them onto address items for use by local transports.
+pub mod change_domain;
 pub mod ugid;
+
+// Re-export the change_domain function for ergonomic access by router drivers.
+pub use change_domain::change_domain;
 
 // Re-export primary types from ugid for ergonomic access by router drivers.
 pub use ugid::GetUgidError;
