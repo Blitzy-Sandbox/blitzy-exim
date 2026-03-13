@@ -343,6 +343,27 @@ pub struct DeliveryContext {
 
     /// Force delivery even if frozen.
     pub deliver_force: bool,
+
+    // -- Address data variables (set by routers, used by queue_add) --
+    /// Data from router's domain expansion (C: deliver_domain_data).
+    /// Set by the router that processed the address, then copied into
+    /// `AddressProperties.domain_data` by `queue_add()`.
+    pub deliver_domain_data: Option<String>,
+
+    /// Data from router's local-part expansion (C: deliver_localpart_data).
+    /// Set by the router that processed the address, then copied into
+    /// `AddressProperties.localpart_data` by `queue_add()`.
+    pub deliver_localpart_data: Option<String>,
+
+    /// Default home directory for local deliveries (C: deliver_home).
+    /// Used as a fallback by `queue_add()` when neither the passwd entry
+    /// nor the router configuration provides a home directory.
+    pub deliver_home: Option<String>,
+
+    /// Counter of remote delivery addresses queued (C: remote_delivery_count).
+    /// Incremented by `queue_add()` each time an address is queued for
+    /// remote transport delivery.
+    pub remote_delivery_count: u32,
 }
 
 // ── Header Rewriting Implementation ────────────────────────────────────────

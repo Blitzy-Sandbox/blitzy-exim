@@ -59,6 +59,15 @@ pub mod get_munge_headers;
 /// and copying them onto address items for use by local transports.
 pub mod ugid;
 
+/// Queue an address for local or remote transport delivery.
+///
+/// Translates `rf_queue_add()` from C `src/src/routers/rf_queue_add.c`.
+/// After a router has made its routing decision and selected a transport,
+/// this helper copies propagating data (domain/localpart expansion results),
+/// resolves uid/gid for local transports, sets up fallback hosts for remote
+/// transports, and appends the address to the appropriate delivery queue.
+pub mod queue_add;
+
 // Re-export the change_domain function for ergonomic access by router drivers.
 pub use change_domain::change_domain;
 
@@ -87,6 +96,11 @@ pub mod get_errors_address;
 // Re-export primary types from ugid for ergonomic access by router drivers.
 pub use ugid::GetUgidError;
 pub use ugid::UgidBlock;
+
+// Re-export queue_add function and types for ergonomic access.
+pub use queue_add::queue_add;
+pub use queue_add::PasswdEntry;
+pub use queue_add::QueueAddError;
 
 // Re-export get_errors_address function and types for ergonomic access.
 pub use get_errors_address::get_errors_address;
