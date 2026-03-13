@@ -113,6 +113,88 @@ pub fn safe_poll_readable_fd(fd: RawFd) -> nix::Result<libc::c_int> {
     nix::poll::poll(&mut [pfd], nix::poll::PollTimeout::ZERO)
 }
 
+/// Perform a safe `poll()` readability check with a configurable timeout.
+///
+/// Like [`safe_poll_readable_fd`] but accepts a timeout in milliseconds
+/// instead of always using zero.  A timeout of `-1` blocks indefinitely,
+/// `0` returns immediately (equivalent to `safe_poll_readable_fd`), and
+/// positive values block for at most that many milliseconds.
+///
+/// # Preconditions (caller must guarantee)
+///
+/// 1. `fd` is a valid, open file descriptor.
+/// 2. `fd` remains open for the duration of this function call.
+///
+/// # Returns
+///
+/// `Ok(n)` where `n` is the number of ready fds (0 or 1), or
+/// `Err` on poll failure.  `Ok(0)` means timeout expired with no data.
+///
+/// # Usage
+///
+/// This function is consumed by `exim-smtp/src/outbound/response.rs` in
+/// `ip_recv()` for timed socket reads during SMTP response parsing.
+///
+/// ```ignore
+/// let ready = exim_ffi::fd::safe_poll_fd_timeout(smtp_fd, 30_000)?;
+/// if ready == 0 { /* timeout */ }
+/// ```
+pub fn safe_poll_fd_timeout(fd: RawFd, timeout_ms: i32) -> nix::Result<libc::c_int> {
+    // SAFETY: Same as safe_read_fd — fd is valid for the session lifetime.
+    // BorrowedFd borrows without closing and does not escape this scope.
+    let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) };
+    let pfd = nix::poll::PollFd::new(borrowed, nix::poll::PollFlags::POLLIN);
+    let timeout =
+        nix::poll::PollTimeout::try_from(timeout_ms).unwrap_or(nix::poll::PollTimeout::NONE);
+    nix::poll::poll(&mut [pfd], timeout)
+}
+
+/// Perform a safe `setsockopt()` call with an integer value.
+///
+/// Wraps `libc::setsockopt()` for arbitrary integer socket options that
+/// do not have type-safe nix wrappers (e.g., `TCP_CORK` on Linux).
+///
+/// # Preconditions (caller must guarantee)
+///
+/// 1. `fd` is a valid, open socket file descriptor.
+/// 2. `level` and `optname` are valid socket option identifiers.
+///
+/// # Usage
+///
+/// This function is consumed by `exim-smtp/src/outbound/response.rs` in
+/// `flush_buffer()` to clear TCP_CORK after sending pipelined commands.
+///
+/// ```ignore
+/// exim_ffi::fd::safe_setsockopt_int(
+///     sock, libc::IPPROTO_TCP, libc::TCP_CORK, 0,
+/// )?;
+/// ```
+pub fn safe_setsockopt_int(
+    fd: RawFd,
+    level: libc::c_int,
+    optname: libc::c_int,
+    value: libc::c_int,
+) -> nix::Result<()> {
+    // SAFETY: fd is a valid socket descriptor for the session lifetime.
+    // The value pointer is a local variable that outlives the syscall.
+    // libc::setsockopt is a standard POSIX function that reads `value`
+    // bytes from the pointer without storing the pointer beyond the call.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        Err(nix::errno::Errno::last())
+    } else {
+        Ok(())
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
