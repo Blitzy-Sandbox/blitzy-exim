@@ -1512,7 +1512,7 @@ impl DnsResolver {
         // I18N: convert UTF-8 domain to ASCII-compatible encoding (A-labels / Punycode)
         #[cfg(feature = "i18n")]
         {
-            if name.chars().any(|c| !c.is_ascii()) {
+            if !name.is_ascii() {
                 return self.idn_to_ascii(name);
             }
         }
@@ -1542,12 +1542,12 @@ impl DnsResolver {
                 // The hickory-resolver itself handles IDN names internally.
                 let ascii_label = label
                     .chars()
-                    .filter_map(|c| {
+                    .map(|c| {
                         if c.is_ascii() {
-                            Some(c.to_ascii_lowercase())
+                            c.to_ascii_lowercase()
                         } else {
                             // Pass through — hickory-resolver's Name parser handles Unicode
-                            Some(c)
+                            c
                         }
                     })
                     .collect::<String>();

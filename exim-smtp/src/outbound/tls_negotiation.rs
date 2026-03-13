@@ -687,7 +687,7 @@ pub fn validate_dane_tlsa(
     );
 
     // Create a DANE verifier for the connection hostname.
-    let verifier = DaneVerifier::new(vec![hostname.clone()]);
+    let mut verifier = DaneVerifier::new(vec![hostname.clone()]);
 
     // Check if the verifier has any TLSA records to match against.
     // TLSA records are typically pre-fetched during DNS resolution and would

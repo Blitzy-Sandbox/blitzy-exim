@@ -214,7 +214,8 @@ pub fn call_dlfunc(
         detail: e.to_string(),
     })?;
 
-    // SAFETY: We call the loaded C function through its `Symbol` pointer.
+    // SAFETY: We call the loaded C function through its `Symbol` pointer,
+    // then immediately copy the result string from C memory.
     //
     // Contracts upheld:
     // - `result_ptr`: valid mutable pointer to a `*mut c_char` local variable.
@@ -223,23 +224,21 @@ pub fn call_dlfunc(
     //   null-terminated C string pointers owned by `c_args` (alive for the
     //   duration of this call).
     // - The function conforms to the `exim_dlfunc_t` ABI.
-    let status_code = unsafe {
-        func(
+    // - After the call, `result_ptr` (if non-null) is a valid C string that
+    //   we copy into a Rust `String` immediately, creating no lifetime
+    //   dependency on the C allocator.
+    let (status_code, result_string) = unsafe {
+        let code = func(
             &mut result_ptr as *mut *mut c_char,
             argc,
             c_arg_ptrs.as_mut_ptr(),
-        )
-    };
-
-    // Read the result string from C memory.
-    let result_string = if result_ptr.is_null() {
-        String::new()
-    } else {
-        // SAFETY: The loaded function set `result_ptr` to a valid,
-        // null-terminated C string.  We copy it into a Rust `String`
-        // immediately, creating no lifetime dependency on the C allocator.
-        let cstr = unsafe { CStr::from_ptr(result_ptr) };
-        cstr.to_string_lossy().into_owned()
+        );
+        let rstr = if result_ptr.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(result_ptr).to_string_lossy().into_owned()
+        };
+        (code, rstr)
     };
 
     Ok(DlfuncCallResult {
@@ -289,23 +288,20 @@ pub fn crypt_compare(plaintext: &str, salt: &str) -> bool {
     // null-terminated C strings and returns a pointer to a static buffer
     // containing the hashed result.  The pointers are valid for the
     // duration of the call (owned by CString locals).  The returned
-    // pointer is immediately copied into a Rust string.
-    //
-    // Note: `crypt(3)` returns a pointer to a static buffer that may be
-    // overwritten by subsequent calls.  We copy immediately before any
-    // other code can call `crypt()`.
-    let result_ptr = unsafe { crypt(c_plaintext.as_ptr(), c_salt.as_ptr()) };
-
-    if result_ptr.is_null() {
-        return false;
-    }
-
-    // SAFETY: `crypt()` returned a non-null pointer to a valid
-    // null-terminated C string in a static buffer.
-    let result = unsafe { CStr::from_ptr(result_ptr) };
-    match result.to_str() {
-        Ok(s) => s == salt,
-        Err(_) => false,
+    // pointer is immediately copied into a Rust string.  `crypt(3)`
+    // returns a pointer to a static buffer that may be overwritten by
+    // subsequent calls — we copy immediately via `CStr::from_ptr` before
+    // any other code can call `crypt()`.
+    unsafe {
+        let result_ptr = crypt(c_plaintext.as_ptr(), c_salt.as_ptr());
+        if result_ptr.is_null() {
+            return false;
+        }
+        let result = CStr::from_ptr(result_ptr);
+        match result.to_str() {
+            Ok(s) => s == salt,
+            Err(_) => false,
+        }
     }
 }
 

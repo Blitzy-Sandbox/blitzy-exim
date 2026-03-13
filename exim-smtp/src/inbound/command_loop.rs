@@ -360,17 +360,20 @@ impl ConfigContext {
             #[cfg(feature = "prdr")]
             prdr_enable: false,
 
+            // SMTPUTF8/WELLKNOWN/ESMTP-LIMITS/XCLIENT advertise hosts are not
+            // yet represented in exim_config::ConfigContext — default to None
+            // (disabled) until the config parser populates these fields.
             #[cfg(feature = "i18n")]
-            smtputf8_advertise_hosts: cfg.smtputf8_advertise_hosts.clone(),
+            smtputf8_advertise_hosts: None,
 
             #[cfg(feature = "wellknown")]
-            wellknown_advertise_hosts: cfg.wellknown_advertise_hosts.clone(),
+            wellknown_advertise_hosts: None,
 
             #[cfg(feature = "esmtp-limits")]
-            limits_advertise_hosts: cfg.limits_advertise_hosts.clone(),
+            limits_advertise_hosts: None,
 
             #[cfg(feature = "xclient")]
-            xclient_advertise_hosts: cfg.xclient_advertise_hosts.clone(),
+            xclient_advertise_hosts: None,
 
             // ATRN / ODMR settings — not yet represented in exim_config,
             // default to disabled/empty
@@ -2712,7 +2715,7 @@ pub fn smtp_setup_msg(
             }
 
             #[cfg(feature = "proxy")]
-            SmtpCommand::ProxyFail => {
+            SmtpCommand::ProxyFailIgnore => {
                 session.smtp_respond("503", false, "Command refused");
             }
 
@@ -2875,7 +2878,7 @@ fn handle_greeted_session(mut session: SmtpSession<'_, Greeted>) -> SmtpSetupRes
             }
 
             #[cfg(feature = "proxy")]
-            SmtpCommand::ProxyFail => {
+            SmtpCommand::ProxyFailIgnore => {
                 session.smtp_respond("503", false, "Command refused");
             }
 

@@ -543,9 +543,6 @@ impl GsaslSession {
         };
         let input_len = input.len() as libc::size_t;
 
-        let mut output: *mut libc::c_char = ptr::null_mut();
-        let mut output_len: libc::size_t = 0;
-
         // SASL step exchange via centralised dispatch.
         let (rc, out_bytes) = match gsasl_ffi(GsaslFfi::Step {
             session: self.session,

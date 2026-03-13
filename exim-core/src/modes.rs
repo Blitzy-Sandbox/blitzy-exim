@@ -590,8 +590,10 @@ pub fn filter_test_mode(
 fn run_exim_filter(filter_text: &str, is_system: bool) -> ExitCode {
     #[cfg(feature = "exim-filter")]
     {
-        let mut opts = exim_miscmods::exim_filter::FilterOptions::default();
-        opts.system_filter = is_system;
+        let opts = exim_miscmods::exim_filter::FilterOptions {
+            system_filter: is_system,
+            ..Default::default()
+        };
         match exim_miscmods::exim_filter::exim_interpret(filter_text, opts) {
             Ok(result) => {
                 print_filter_result(&result);

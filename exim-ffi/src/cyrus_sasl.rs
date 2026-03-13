@@ -349,7 +349,8 @@ fn sasl_ffi(op: SaslFfi) -> SaslFfiResult {
                 // The transmute converts the typed log callback to the generic
                 // function pointer type stored in sasl_callback_t.proc_.
                 let raw_cb: *const () = sasl_log_callback as *const ();
-                let log_proc = std::mem::transmute(raw_cb);
+                let log_proc =
+                    std::mem::transmute::<*const (), unsafe extern "C" fn() -> i32>(raw_cb);
                 let callbacks = [
                     ffi::sasl_callback_t {
                         id: ffi::SASL_CB_LOG,

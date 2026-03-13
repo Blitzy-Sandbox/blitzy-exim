@@ -69,7 +69,7 @@ pub fn tcp_stream_from_raw_fd(fd: RawFd) -> TcpStream {
 ///
 /// This function is consumed by `exim-smtp/src/inbound/pipelining.rs` to
 /// perform socket reads during SMTP pipelining I/O, replacing inline
-/// `unsafe { BorrowedFd::borrow_raw(fd) }` blocks that would violate the
+/// `BorrowedFd::borrow_raw(fd)` unsafe calls that would violate the
 /// crate-level `#![forbid(unsafe_code)]` policy in consumer crates.
 ///
 /// ```ignore
@@ -99,7 +99,7 @@ pub fn safe_read_fd(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
 ///
 /// This function is consumed by `exim-smtp/src/inbound/pipelining.rs` to
 /// check SMTP socket readability for pipelining synchronization enforcement,
-/// replacing inline `unsafe { BorrowedFd::borrow_raw(fd) }` blocks.
+/// replacing inline `BorrowedFd::borrow_raw(fd)` unsafe calls.
 ///
 /// ```ignore
 /// let ready = exim_ffi::fd::safe_poll_readable_fd(smtp_fd)?;
@@ -221,10 +221,12 @@ pub fn safe_force_fd(old_fd: RawFd, new_fd: RawFd) -> nix::Result<()> {
     // old_fd to new_fd. The subsequent close(old_fd) releases the original.
     // This is called exclusively in child processes after fork() and before
     // exec(), matching the C child.c force_fd() pattern.
-    let res = unsafe { libc::dup2(old_fd, new_fd) };
-    nix::errno::Errno::result(res)?;
-    let res2 = unsafe { libc::close(old_fd) };
-    nix::errno::Errno::result(res2).map(drop)
+    unsafe {
+        let res = libc::dup2(old_fd, new_fd);
+        nix::errno::Errno::result(res)?;
+        let res2 = libc::close(old_fd);
+        nix::errno::Errno::result(res2).map(drop)
+    }
 }
 
 /// Duplicate `old_fd` to `new_fd` via `dup2(2)` without closing `old_fd`.

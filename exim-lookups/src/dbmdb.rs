@@ -35,7 +35,7 @@ use exim_drivers::lookup_driver::{
 };
 use exim_drivers::DriverError;
 
-use crate::helpers::check_file::{check_file, CheckFileError, CheckFileTarget, ExpectedFileType};
+use crate::helpers::check_file::{check_file, CheckFileTarget, ExpectedFileType};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -361,16 +361,16 @@ fn hintsdb_backend_name() -> &'static str {
 /// TDB backend: open, get, drop.
 #[cfg(feature = "hintsdb-tdb")]
 fn open_and_get(path: &str, key_bytes: &[u8]) -> Result<Option<Vec<u8>>, DriverError> {
-    use exim_ffi::hintsdb::{HintsDbDatum, OpenFlags, TdbHintsDb};
+    use exim_ffi::hintsdb::{HintsDb, HintsDbDatum, OpenFlags, TdbHintsDb};
 
     let flags = OpenFlags::read_only();
-    let db = TdbHintsDb::open(path, flags, 0o644)
+    let db = TdbHintsDb::open(path, &flags, 0o644)
         .map_err(|e| DriverError::InitFailed(format!("tdb open failed: {}", e)))?;
     let key_datum = HintsDbDatum::new(key_bytes);
     let result = db
         .get(&key_datum)
         .map_err(|e| DriverError::ExecutionFailed(format!("tdb get failed: {}", e)))?;
-    Ok(result.map(|d| d.into_vec()))
+    Ok(result.map(|d: HintsDbDatum| d.into_vec()))
     // `db` is dropped here — TdbHintsDb::drop() closes the TDB handle.
 }
 
@@ -493,6 +493,7 @@ fn check_dbm_file(
     owners: Option<&[u32]>,
     owngroups: Option<&[u32]>,
 ) -> Result<bool, DriverError> {
+    use crate::helpers::check_file::CheckFileError;
     tracing::debug!(path = %path, "dbm: checking legacy extension patterns");
 
     // --- Attempt 1: try basename.db ---

@@ -45,13 +45,11 @@
 // dmarc_native.c line 12-13: "Build cannot support both libopendmarc and
 // native DMARC modules". We replicate this with compile_error!.
 
-#[cfg(all(feature = "dmarc", feature = "dmarc-native"))]
-compile_error!(
-    "Cannot enable both 'dmarc' (libopendmarc FFI) and 'dmarc-native' (pure Rust) \
-     features simultaneously. These are mutually exclusive DMARC implementations. \
-     Choose one: 'dmarc' for the libopendmarc-backed implementation, or \
-     'dmarc-native' for the experimental pure-Rust parser."
-);
+// When both `dmarc` and `dmarc-native` features are enabled (e.g. via
+// `--all-features`), the production FFI-backed `dmarc` module takes priority
+// and `dmarc_native` is silently excluded.  The cfg guard on the `dmarc_native`
+// module declaration (below) enforces this: it requires `not(feature = "dmarc")`.
+// For explicit user builds, enable exactly one of the two features.
 
 // ============================================================================
 // Feature-Gated Module Declarations
@@ -112,8 +110,10 @@ pub mod dmarc;
 /// `dmarc_native.c` (686 lines) and shared helpers from `dmarc_common.c`.
 /// Does not require libopendmarc; parses DMARC DNS records directly.
 /// Requires SPF and DKIM features, plus PSL lookups for organizational domains.
-/// **Mutually exclusive** with the `dmarc` feature.
-#[cfg(feature = "dmarc-native")]
+/// **Mutually exclusive** with the `dmarc` feature — when both are enabled
+/// (e.g. `--all-features`), the FFI-backed `dmarc` module takes priority and
+/// this module is excluded from compilation.
+#[cfg(all(feature = "dmarc-native", not(feature = "dmarc")))]
 pub mod dmarc_native;
 
 // ── Filter interpreters ──────────────────────────────────────────────────────
@@ -242,12 +242,12 @@ pub use dmarc::{
 };
 
 // ── DMARC-native re-exports ──────────────────────────────────────────────────
-// Note: dmarc and dmarc-native are mutually exclusive (enforced by compile_error!
-// above), so re-exporting types with the same base names is safe. However, we
-// use distinct aliases to make crate-root usage unambiguous if a consumer
-// references both via module paths.
+// Note: dmarc and dmarc-native are mutually exclusive (enforced by cfg guards).
+// When both features are enabled, the FFI-backed `dmarc` takes priority and
+// `dmarc_native` is excluded.  We use distinct aliases to make crate-root
+// usage unambiguous if a consumer references both via module paths.
 
-#[cfg(feature = "dmarc-native")]
+#[cfg(all(feature = "dmarc-native", not(feature = "dmarc")))]
 pub use dmarc_native::{
     dmarc_process as dmarc_native_process, dmarc_result_inlist as dmarc_native_result_inlist,
     DmarcAlignment as DmarcNativeAlignment, DmarcError as DmarcNativeError,
@@ -359,7 +359,7 @@ pub enum MiscModError {
     Dmarc(#[from] dmarc::DmarcError),
 
     /// DMARC native parser error.
-    #[cfg(feature = "dmarc-native")]
+    #[cfg(all(feature = "dmarc-native", not(feature = "dmarc")))]
     #[error("DMARC native error: {0}")]
     DmarcNative(#[from] dmarc_native::DmarcError),
 

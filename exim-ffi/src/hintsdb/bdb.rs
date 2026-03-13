@@ -105,7 +105,8 @@ enum BdbFfi {
     },
     /// `db_create(&mut db, env, 0)` — allocate a new DB handle.
     DbCreate { env: *mut ffi::DB_ENV },
-    /// `DB->set_errcall(db_as_env, callback)` — register error callback on DB (pre-4.1 compat).
+    /// `DB->set_errcall(db, callback)` — register error callback on DB (pre-4.1 compat).
+    #[cfg(not(bdb_41_plus))]
     DbSetErrcall { db: *mut ffi::DB },
     /// `DB->open(...)` — open the database (arg count varies by BDB version).
     DbOpen {
@@ -240,9 +241,10 @@ fn bdb_ffi(op: BdbFfi) -> BdbFfiResult {
                 BdbFfiResult::DbAndCode(db, rc)
             }
 
+            #[cfg(not(bdb_41_plus))]
             BdbFfi::DbSetErrcall { db } => {
                 let f = (*db).set_errcall.expect("DB->set_errcall null");
-                f(db as *mut ffi::DB_ENV, Some(bdb_error_callback));
+                f(db, Some(bdb_error_callback));
                 BdbFfiResult::Done
             }
 

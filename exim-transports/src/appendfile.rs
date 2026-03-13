@@ -48,11 +48,15 @@ const APPENDFILE_DIRECTORY_MODE: u32 = 0o700;
 const APPENDFILE_LOCKFILE_MODE: u32 = 0o600;
 
 /// MBX header size in bytes (C: MBX_HDRSIZE = 2048).
+/// Reserved for MBX mailbox format locking and header manipulation.
 #[cfg(feature = "mbx")]
+#[allow(dead_code)] // MBX format constant — used in full MBX locking implementation
 const MBX_HDRSIZE: usize = 2048;
 
 /// MBX number of user flags (C: MBX_NUSERFLAGS = 30).
+/// Reserved for MBX mailbox format user-flag field parsing.
 #[cfg(feature = "mbx")]
+#[allow(dead_code)] // MBX format constant — used in full MBX user-flag parsing
 const MBX_NUSERFLAGS: usize = 30;
 
 /// Transport write option: use CRLF (C: topt_use_crlf).

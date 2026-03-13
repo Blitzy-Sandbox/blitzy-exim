@@ -154,7 +154,7 @@ fn ndbm_ffi(op: NdbmFfi) -> NdbmFfiResult {
     unsafe {
         match op {
             NdbmFfi::Open(path, flags, mode) => {
-                NdbmFfiResult::Handle(ffi::dbm_open(path, flags, mode))
+                NdbmFfiResult::Handle(ffi::dbm_open(path, flags, mode as libc::c_int))
             }
             NdbmFfi::Close(h) => {
                 ffi::dbm_close(h);

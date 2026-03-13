@@ -609,10 +609,16 @@ impl GssName {
         };
 
         // Dispatch gss_import_name through consolidated FFI.
+        // SAFETY: GSS_C_NT_HOSTBASED_SERVICE is a global GSSAPI OID constant
+        // defined in <gssapi/gssapi.h>. It is initialised by the GSSAPI library
+        // at load time and never mutated thereafter. Reading its pointer value
+        // here is safe as it is only used as an input parameter to
+        // gss_import_name inside the krb5_ffi dispatch.
+        let nt_host = unsafe { ffi::GSS_C_NT_HOSTBASED_SERVICE };
         let maj = match krb5_ffi(Krb5Ffi::GssImportName {
             min: &mut min_stat,
             buf: &mut buf,
-            nt: ffi::GSS_C_NT_HOSTBASED_SERVICE,
+            nt: nt_host,
             out: &mut output_name,
         }) {
             Krb5FfiResult::Status(s) => s,
