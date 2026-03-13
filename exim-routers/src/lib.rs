@@ -30,6 +30,9 @@ pub mod helpers;
 
 // ── Feature-gated router modules ────────────────────────────────────────────
 
+#[cfg(feature = "router-iplookup")]
+pub mod iplookup;
+
 #[cfg(feature = "router-manualroute")]
 pub mod manualroute;
 
