@@ -859,6 +859,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bitflags",
+ "exim-dns",
  "exim-drivers",
  "exim-ffi",
  "exim-store",

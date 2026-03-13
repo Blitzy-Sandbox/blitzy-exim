@@ -193,6 +193,11 @@ exim-drivers = { path = "../exim-drivers" }
 # and per-message allocation.
 exim-store = { path = "../exim-store" }
 
+# DNS resolution crate — provides DnsResolver, DnsResult, DnsRecord,
+# DnsRecordData, DnsRecordType, and DnsError for DKIM TXT record lookup
+# (selector._domainkey.domain queries) during signature verification.
+exim-dns = { path = "../exim-dns" }
+
 # Minimal C FFI shim layer — ONLY crate with unsafe code (per AAP §0.7.2).
 # Optional dependency: pulled in only when FFI-dependent features are enabled
 # (spf, dmarc, pam, radius, perl). Each FFI-using feature activates the
