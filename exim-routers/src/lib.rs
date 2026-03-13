@@ -27,3 +27,8 @@
 /// Shared router helper functions, translating `rf_*.c` files from C.
 /// These are used across all router implementations and are NOT feature-gated.
 pub mod helpers;
+
+// ── Feature-gated router modules ────────────────────────────────────────────
+
+#[cfg(feature = "router-redirect")]
+pub mod redirect;
