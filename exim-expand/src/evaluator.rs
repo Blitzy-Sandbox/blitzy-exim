@@ -598,7 +598,7 @@ impl<'a> Evaluator<'a> {
 
         let library = self.eval_arg(args, 0, flags)?;
         let function = self.eval_arg(args, 1, flags)?;
-        let arg = if args.len() > 2 {
+        let _arg = if args.len() > 2 {
             Some(self.eval_arg(args, 2, flags)?)
         } else {
             None
@@ -1088,7 +1088,7 @@ impl<'a> Evaluator<'a> {
         }
 
         let function = self.eval_arg(args, 0, flags)?;
-        let arg = if args.len() > 1 {
+        let _arg = if args.len() > 1 {
             Some(self.eval_arg(args, 1, flags)?)
         } else {
             None
@@ -1590,7 +1590,12 @@ impl<'a> Evaluator<'a> {
             let hash_hex = format!("{:02x}{:02x}", hash_result[0], hash_result[1]);
 
             // Build SRS address
-            let srs_domain = self.ctx.qualify_domain.as_deref().unwrap_or("localhost");
+            let qd_ref: &str = &self.ctx.qualify_domain;
+            let srs_domain = if qd_ref.is_empty() {
+                "localhost"
+            } else {
+                qd_ref
+            };
             write!(
                 output,
                 "SRS0={}={}={}={}@{}",
