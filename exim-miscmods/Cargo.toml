@@ -117,7 +117,7 @@ spf-perl = ["spf", "perl"]
 # Replaces: #ifdef SUPPORT_DMARC (dmarc.c line 18)
 # Requires SPF: dmarc.c line 19: #ifndef EXIM_HAVE_SPF → #error
 # Requires DKIM: dmarc.c line 21: #elif defined DISABLE_DKIM → #error
-dmarc = ["spf", "dkim", "dep:exim-ffi"]
+dmarc = ["spf", "dkim", "dep:exim-ffi", "exim-ffi/ffi-dmarc"]
 
 # Native DMARC parser — experimental pure-Rust DMARC without libopendmarc.
 # Replaces: #ifdef EXPERIMENTAL_DMARC_NATIVE (dmarc_native.c line 16)

@@ -1160,6 +1160,7 @@ pub fn status_to_string(status: i32) -> String {
 ///
 /// If the array pointer is null, returns an empty vector.
 /// Non-UTF-8 entries are converted lossily (invalid bytes become U+FFFD).
+#[allow(dead_code)] // Used by DmarcPolicyContext::fetch_rua/fetch_ruf at runtime
 fn collect_string_array(arr: *mut *mut ffi::u_char) -> Vec<String> {
     // Dispatch through consolidated FFI (handles all unsafe array traversal).
     match dmarc_ffi(DmarcFfi::CollectArray { arr }) {

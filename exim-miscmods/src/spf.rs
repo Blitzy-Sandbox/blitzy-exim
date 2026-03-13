@@ -431,12 +431,18 @@ impl fmt::Debug for SpfState {
     }
 }
 
+impl Default for SpfState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SpfState {
     /// Create a new default SPF state with standard defaults.
     ///
     /// The guess record defaults to `"v=spf1 a/24 mx/24 ptr ?all"` matching
     /// the C default in `spf.c` line 37.
-    fn new() -> Self {
+    pub fn new() -> Self {
         SpfState {
             guess: String::from("v=spf1 a/24 mx/24 ptr ?all"),
             header_comment: Option::None,
