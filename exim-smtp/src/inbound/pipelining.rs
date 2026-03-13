@@ -224,6 +224,20 @@ pub struct SmtpIoState {
 }
 
 impl SmtpIoState {
+    /// Returns `true` when the input buffer contains unprocessed bytes.
+    ///
+    /// This is the method-based equivalent of the free function
+    /// [`smtp_hasc()`], provided for ergonomic use on owned `SmtpIoState`
+    /// values (e.g. inside `SmtpSession`).
+    ///
+    /// Used by the SMTP command loop for RFC 5321 §4.5.3.2 sync checking:
+    /// if pending input exists when a non-pipelineable command arrives, the
+    /// connection is out-of-sync and must be rejected.
+    #[inline]
+    pub fn has_pending_input(&self) -> bool {
+        self.inptr < self.inend
+    }
+
     /// Create a new I/O state bound to the given socket file descriptors.
     ///
     /// Allocates the input buffer (`IN_BUFFER_SIZE` bytes) and initialises

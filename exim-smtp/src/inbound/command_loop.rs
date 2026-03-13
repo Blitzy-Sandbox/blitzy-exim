@@ -58,18 +58,40 @@ use exim_drivers::auth_driver::AuthInstanceConfig;
 // =============================================================================
 // Local Context Types
 // =============================================================================
+// SMTP-local context structs
+// =============================================================================
 //
-// exim-core and exim-config are NOT dependencies of exim-smtp (importing them
-// would create a circular dependency since exim-core depends on exim-smtp).
-// We define the context structs locally here, matching the fields used
-// throughout the command loop. The actual full definitions live in
-// exim-core/src/context.rs and exim-config/src/types.rs, and the higher-level
-// binary crate (exim-core) bridges these types.
+// **Architectural note — shadow types and the circular dependency constraint**
+//
+// `exim-core` depends on `exim-smtp`, so `exim-smtp` cannot import
+// `exim-core` without creating a circular dependency.  As a result, the
+// `ServerContext` and `MessageContext` defined below are local mirror types
+// that replicate the SMTP-relevant subset of the canonical definitions in
+// `exim-core/src/context.rs`.
+//
+// `ConfigContext`, however, *can* be bridged directly: `exim-config` does
+// NOT depend on `exim-smtp`, so we provide a `from_config()` constructor
+// that converts `&exim_config::types::ConfigContext` → local
+// `ConfigContext`.  This ensures type-safe propagation of ACL names,
+// limits, and EHLO advertisement settings from the parsed configuration.
+//
+// **Maintenance obligation**: When fields are added to the canonical types
+// in `exim-core/src/context.rs` or `exim-config/src/types.rs` that are
+// used during SMTP session processing, the corresponding local struct
+// below MUST be updated to match.
+//
+// **Ideal long-term solution**: Extract the shared subset into a dedicated
+// `exim-types` crate consumed by both `exim-core` and `exim-smtp`.  That
+// crate would own ServerContext, MessageContext, and ConfigContext definitions,
+// eliminating all duplication.  Tracked as a future improvement.
+// =============================================================================
 
 /// Daemon-lifetime server context — read-only during SMTP session.
 ///
 /// Replaces global variables from `globals.c` that hold server-wide state.
 /// Passed as `&ServerContext` to all command handlers.
+///
+/// **Mirror type**: Canonical definition in `exim-core/src/context.rs`.
 ///
 /// C reference: AAP §0.4.4 ServerContext definition.
 pub struct ServerContext {
@@ -199,10 +221,14 @@ pub struct RecipientItem {
     pub errors_to: Option<String>,
 }
 
-/// Immutable parsed configuration context.
+/// Immutable parsed configuration context for the SMTP session.
 ///
-/// Wraps `Arc<Config>` frozen after parse (AAP §0.4.4). Contains all ACL
-/// definitions, driver instances, and SMTP configuration options.
+/// This is a **local mirror type** containing the SMTP-relevant subset of
+/// `exim_config::types::ConfigContext`.  Use [`ConfigContext::from_config()`]
+/// to construct from the canonical parsed configuration, ensuring ACL names,
+/// limits, and advertisement settings are correctly propagated.
+///
+/// **Canonical source**: `exim-config/src/types.rs` `ConfigContext`.
 pub struct ConfigContext {
     // ACL definitions for each SMTP phase
     pub acl_smtp_helo: Option<String>,
@@ -267,6 +293,98 @@ pub struct ConfigContext {
     pub submission_mode: bool,
     pub submission_domain: Option<String>,
     pub submission_name: Option<String>,
+}
+
+impl ConfigContext {
+    /// Construct from the canonical parsed configuration.
+    ///
+    /// Copies all SMTP-relevant fields from the canonical
+    /// `exim_config::types::ConfigContext` into this local mirror type.
+    /// This is the **only correct way** to construct a `ConfigContext` for
+    /// real SMTP sessions — using `Default` produces an empty config with
+    /// no ACLs (effectively an open relay).
+    ///
+    /// # Arguments
+    ///
+    /// * `cfg` — Reference to the canonical parsed configuration
+    /// * `auth_instances` — Pre-built auth driver instance configs (constructed
+    ///   by the binary crate from the parsed driver definitions)
+    pub fn from_config(
+        cfg: &exim_config::types::ConfigContext,
+        auth_instances: Vec<AuthInstanceConfig>,
+    ) -> Self {
+        Self {
+            // ACL definitions — propagated from the parsed config
+            acl_smtp_helo: cfg.acl_smtp_helo.clone(),
+            acl_smtp_mail: cfg.acl_smtp_mail.clone(),
+            acl_smtp_rcpt: cfg.acl_smtp_rcpt.clone(),
+            acl_smtp_data: cfg.acl_smtp_data.clone(),
+            acl_smtp_auth: cfg.acl_smtp_auth.clone(),
+            acl_smtp_starttls: cfg.acl_smtp_starttls.clone(),
+            acl_smtp_vrfy: cfg.acl_smtp_vrfy.clone(),
+            acl_smtp_expn: cfg.acl_smtp_expn.clone(),
+            acl_smtp_etrn: cfg.acl_smtp_etrn.clone(),
+            acl_smtp_predata: cfg.acl_smtp_predata.clone(),
+
+            // SMTP limits — cast from i32 (C config type) to u32 (Rust SMTP layer)
+            smtp_accept_max_nonmail: cfg.smtp_accept_max_nonmail.max(0) as u32,
+            smtp_max_synprot_errors: cfg.smtp_max_synprot_errors.max(0) as u32,
+            smtp_max_unknown_commands: cfg.smtp_max_unknown_commands.max(0) as u32,
+            smtp_enforce_sync: cfg.smtp_enforce_sync,
+            // Parse message_size_limit from Option<String> (e.g., "50M") to u64 bytes
+            message_size_limit: cfg
+                .message_size_limit
+                .as_deref()
+                .and_then(parse_size_string)
+                .unwrap_or(52_428_800), // 50 MiB default
+
+            // Auth instances
+            auth_instances,
+
+            // SMTP banner and verification
+            smtp_banner: cfg.smtp_banner.clone(),
+            helo_verify_hosts: cfg.helo_verify_hosts.clone(),
+            helo_try_verify_hosts: cfg.helo_try_verify_hosts.clone(),
+
+            // EHLO capability hosts
+            chunking_advertise_hosts: cfg.chunking_advertise_hosts.clone(),
+            dsn_advertise_hosts: cfg.dsn_advertise_hosts.clone(),
+            auth_advertise_hosts: cfg.auth_advertise_hosts.clone(),
+            pipelining_advertise_hosts: cfg.pipelining_advertise_hosts.clone(),
+
+            #[cfg(feature = "tls")]
+            tls_advertise_hosts: cfg.tls_advertise_hosts.clone(),
+
+            // PRDR is an extension feature; not yet represented in exim_config,
+            // so default to disabled.
+            #[cfg(feature = "prdr")]
+            prdr_enable: false,
+
+            #[cfg(feature = "i18n")]
+            smtputf8_advertise_hosts: cfg.smtputf8_advertise_hosts.clone(),
+
+            #[cfg(feature = "wellknown")]
+            wellknown_advertise_hosts: cfg.wellknown_advertise_hosts.clone(),
+
+            #[cfg(feature = "esmtp-limits")]
+            limits_advertise_hosts: cfg.limits_advertise_hosts.clone(),
+
+            #[cfg(feature = "xclient")]
+            xclient_advertise_hosts: cfg.xclient_advertise_hosts.clone(),
+
+            // ATRN / ODMR settings — not yet represented in exim_config,
+            // default to disabled/empty
+            acl_smtp_atrn: cfg.acl_smtp_atrn.clone(),
+            atrn_domains: None,
+            atrn_host: None,
+
+            // Submission mode settings — not yet represented in exim_config,
+            // default to disabled
+            submission_mode: false,
+            submission_domain: None,
+            submission_name: None,
+        }
+    }
 }
 
 impl Default for MessageContext {
@@ -460,7 +578,13 @@ const CMD_LIST: &[SmtpCommandDef] = &[
 /// These are used during smtp_setup_msg() to reset RSET/HELO/EHLO/STARTTLS
 /// as non-mail commands at the start of each loop iteration, matching
 /// C smtp_in.c lines 3838-3843.
-#[allow(dead_code)] // Documentation-referenced constants for CMD_LIST indexing
+// Justified: These constants preserve the C `smtp_cmd_list[]` index
+// assignments from `smtp_in.c` lines 3838-3843 for documentation and future
+// use by the `is_mail_cmd` reset logic.  They are intentionally kept even
+// when the Rust command loop does not yet index CMD_LIST by position, because
+// removing them would lose the source correspondence needed for verification
+// against the C implementation.
+#[allow(dead_code)]
 const CL_RSET: usize = 0;
 #[allow(dead_code)]
 const CL_HELO: usize = 1;
@@ -948,14 +1072,41 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
 
     /// Determine if sync checking should fail for a given command.
     ///
-    /// Pipelining enforcement: if there is unread data in the input buffer
-    /// and the command precedes `sync_cmd_limit` in the enum ordering,
-    /// it should be rejected as a sync error.
-    fn should_sync_check(&self, _cmd: SmtpCommand) -> bool {
-        // Sync checking is delegated to the pipelining module's check_sync()
-        // function which examines the SmtpIoState buffer state.
-        // Here we just indicate that sync checking should be performed.
-        false
+    /// Pipelining enforcement per RFC 5321 §4.5.3.2: if there is unread
+    /// data in the input buffer before the server has sent its response to
+    /// the prior command, the client may be attempting command smuggling.
+    ///
+    /// Sync checking is performed for commands that are NOT part of the
+    /// pipelining group (RSET, MAIL FROM, RCPT TO, DATA per RFC 2920).
+    /// Commands that ARE pipelineable are allowed to arrive before the
+    /// prior response is sent.
+    ///
+    /// Returns `true` if there is pending input data and the command is
+    /// not pipelineable — indicating a sync violation that should be
+    /// rejected.
+    fn should_sync_check(&self, cmd: SmtpCommand) -> bool {
+        // If sync enforcement is disabled in config, never flag a violation.
+        if !self.config_ctx.smtp_enforce_sync {
+            return false;
+        }
+
+        // Pipelineable commands per RFC 2920: RSET, MAIL, RCPT, DATA.
+        // These are allowed to arrive before the prior response.
+        // All other commands require strict synchronization.
+        let is_pipelineable = matches!(
+            cmd,
+            SmtpCommand::Rset | SmtpCommand::Mail | SmtpCommand::Rcpt | SmtpCommand::Data
+        );
+
+        if is_pipelineable {
+            return false;
+        }
+
+        // Check if there is unread data pending in the input buffer.
+        // If the input buffer has data beyond what we've consumed for
+        // the current command, the client sent commands before receiving
+        // our response — a potential smuggling attack.
+        self.io.has_pending_input()
     }
 
     // ── Protocol Error Handling (smtp_in.c lines ~2860-2940) ──
@@ -1321,15 +1472,17 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
     ///
     /// # Returns
     ///
-    /// `Ok(SmtpSession<Greeted>)` on success, or `Err(SmtpError)` if the
-    /// greeting should be rejected.
+    /// `Ok(SmtpSession<Greeted>)` on success.
+    /// `Err((SmtpSession<Connected>, SmtpError))` on failure — the session
+    /// is returned to the caller so the connection can continue (the client
+    /// may retry after a 5xx rejection, per RFC 5321 §4.1.1.1).
     ///
     /// C reference: smtp_in.c lines 4092-4520.
     pub fn greet(
         mut self,
         is_ehlo: bool,
         helo_name: Tainted<String>,
-    ) -> Result<SmtpSession<'ctx, Greeted>, SmtpError> {
+    ) -> Result<SmtpSession<'ctx, Greeted>, Box<(SmtpSession<'ctx, Connected>, SmtpError)>> {
         // Record command in history
         if is_ehlo {
             self.had(SmtpCommandHistory::SchEhlo);
@@ -1341,9 +1494,12 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
         let name_ref = helo_name.as_ref();
         if name_ref.is_empty() {
             self.smtp_respond("501", false, "Syntactically invalid HELO/EHLO argument(s)");
-            return Err(SmtpError::ProtocolError {
-                message: "Empty HELO/EHLO argument".into(),
-            });
+            return Err(Box::new((
+                self,
+                SmtpError::ProtocolError {
+                    message: "Empty HELO/EHLO argument".into(),
+                },
+            )));
         }
 
         // Store the HELO name
@@ -1368,9 +1524,13 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
             if acl_rc != AclResult::Ok {
                 let result = self.smtp_handle_acl_fail(AclWhere::Helo, acl_rc, &user_msg, &log_msg);
                 if result < 0 {
-                    return Err(SmtpError::ProtocolError {
-                        message: "HELO ACL rejected with DROP".into(),
-                    });
+                    // ACL DROP — return session so caller can close gracefully
+                    return Err(Box::new((
+                        self,
+                        SmtpError::ProtocolError {
+                            message: "HELO ACL rejected with DROP".into(),
+                        },
+                    )));
                 }
             }
         }
@@ -1412,10 +1572,14 @@ impl<'ctx> SmtpSession<'ctx, Greeted> {
     /// PRDR, RET, ENVID, SMTPUTF8), runs ACL checks, and stores the sender.
     ///
     /// C reference: smtp_in.c lines 4530-4970.
+    ///
+    /// Returns `Err((SmtpSession<Greeted>, SmtpError))` on rejection so the
+    /// caller retains the session and the client can retry MAIL FROM, matching
+    /// C Exim's behaviour of staying in the Greeted state after a 5xx rejection.
     pub fn mail_from(
         mut self,
         raw_address: Tainted<String>,
-    ) -> Result<SmtpSession<'ctx, MailFrom>, SmtpError> {
+    ) -> Result<SmtpSession<'ctx, MailFrom>, Box<(SmtpSession<'ctx, Greeted>, SmtpError)>> {
         self.had(SmtpCommandHistory::SchMail);
         self.smtp_reset();
 
@@ -1435,9 +1599,12 @@ impl<'ctx> SmtpSession<'ctx, Greeted> {
                 false,
                 "Message size exceeds fixed maximum message size",
             );
-            return Err(SmtpError::ProtocolError {
-                message: "Message size exceeds limit".into(),
-            });
+            return Err(Box::new((
+                self,
+                SmtpError::ProtocolError {
+                    message: "Message size exceeds limit".into(),
+                },
+            )));
         }
 
         // Store sender address
@@ -1450,16 +1617,22 @@ impl<'ctx> SmtpSession<'ctx, Greeted> {
             if acl_rc != AclResult::Ok {
                 let result = self.smtp_handle_acl_fail(AclWhere::Mail, acl_rc, &user_msg, &log_msg);
                 if result < 0 {
-                    return Err(SmtpError::ProtocolError {
-                        message: "MAIL FROM ACL rejected with DROP".into(),
-                    });
+                    return Err(Box::new((
+                        self,
+                        SmtpError::ProtocolError {
+                            message: "MAIL FROM ACL rejected with DROP".into(),
+                        },
+                    )));
                 }
                 if result != 2 {
-                    // Not discard — clear sender
+                    // Not discard — clear sender and return to Greeted state
                     self.message_ctx.sender_address.clear();
-                    return Err(SmtpError::ProtocolError {
-                        message: "MAIL FROM ACL rejected".into(),
-                    });
+                    return Err(Box::new((
+                        self,
+                        SmtpError::ProtocolError {
+                            message: "MAIL FROM ACL rejected".into(),
+                        },
+                    )));
                 }
             }
         }
@@ -1478,11 +1651,15 @@ impl<'ctx> SmtpSession<'ctx, MailFrom> {
     /// Parses the recipient address and DSN parameters, runs ACL checks,
     /// and adds the recipient to the recipient list.
     ///
+    /// Returns `Err((SmtpSession<MailFrom>, SmtpError))` on rejection so the
+    /// caller retains the session and the client can retry with another
+    /// recipient, matching C Exim's behaviour (RFC 5321 §3.3).
+    ///
     /// C reference: smtp_in.c lines 4980-5180.
     pub fn rcpt_to(
         mut self,
         raw_address: Tainted<String>,
-    ) -> Result<SmtpSession<'ctx, RcptTo>, SmtpError> {
+    ) -> Result<SmtpSession<'ctx, RcptTo>, Box<(SmtpSession<'ctx, MailFrom>, SmtpError)>> {
         self.had(SmtpCommandHistory::SchRcpt);
 
         // Parse the recipient address
@@ -1519,13 +1696,19 @@ impl<'ctx> SmtpSession<'ctx, MailFrom> {
                 self.rcpt_in_progress = false;
                 let result = self.smtp_handle_acl_fail(AclWhere::Rcpt, acl_rc, &user_msg, &log_msg);
                 if result < 0 {
-                    return Err(SmtpError::ProtocolError {
-                        message: "RCPT TO ACL rejected with DROP".into(),
-                    });
+                    return Err(Box::new((
+                        self,
+                        SmtpError::ProtocolError {
+                            message: "RCPT TO ACL rejected with DROP".into(),
+                        },
+                    )));
                 }
-                return Err(SmtpError::ProtocolError {
-                    message: "RCPT TO ACL rejected".into(),
-                });
+                return Err(Box::new((
+                    self,
+                    SmtpError::ProtocolError {
+                        message: "RCPT TO ACL rejected".into(),
+                    },
+                )));
             }
         }
         self.rcpt_in_progress = false;
@@ -1553,10 +1736,14 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
     ///
     /// This allows multiple recipients before DATA. Returns the same
     /// state type since we're already in `RcptTo`.
+    ///
+    /// Returns `Err((SmtpSession<RcptTo>, SmtpError))` on rejection so the
+    /// caller retains the session and the client can try more recipients,
+    /// matching C Exim's behaviour (RFC 5321 §3.3).
     pub fn rcpt_to(
         mut self,
         raw_address: Tainted<String>,
-    ) -> Result<SmtpSession<'ctx, RcptTo>, SmtpError> {
+    ) -> Result<SmtpSession<'ctx, RcptTo>, Box<(SmtpSession<'ctx, RcptTo>, SmtpError)>> {
         self.had(SmtpCommandHistory::SchRcpt);
 
         let addr_str = raw_address.as_ref();
@@ -1592,13 +1779,19 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
                 self.rcpt_in_progress = false;
                 let result = self.smtp_handle_acl_fail(AclWhere::Rcpt, acl_rc, &user_msg, &log_msg);
                 if result < 0 {
-                    return Err(SmtpError::ProtocolError {
-                        message: "RCPT TO ACL rejected with DROP".into(),
-                    });
+                    return Err(Box::new((
+                        self,
+                        SmtpError::ProtocolError {
+                            message: "RCPT TO ACL rejected with DROP".into(),
+                        },
+                    )));
                 }
-                return Err(SmtpError::ProtocolError {
-                    message: "RCPT TO ACL rejected".into(),
-                });
+                return Err(Box::new((
+                    self,
+                    SmtpError::ProtocolError {
+                        message: "RCPT TO ACL rejected".into(),
+                    },
+                )));
             }
         }
         self.rcpt_in_progress = false;
@@ -1624,15 +1817,23 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
     /// and DATA ACL checks, and sends the "354 Enter message" response.
     ///
     /// C reference: smtp_in.c lines 5190-5260.
-    pub fn data(mut self) -> Result<SmtpSession<'ctx, DataPhase>, SmtpError> {
+    /// Returns `Err((SmtpSession<RcptTo>, SmtpError))` on rejection so
+    /// the caller retains the session and the client can issue RSET or
+    /// more RCPT TO commands.
+    pub fn data(
+        mut self,
+    ) -> Result<SmtpSession<'ctx, DataPhase>, Box<(SmtpSession<'ctx, RcptTo>, SmtpError)>> {
         self.had(SmtpCommandHistory::SchData);
 
         // Verify at least one recipient
         if self.message_ctx.recipients_count == 0 {
             self.smtp_respond("503", false, "No valid recipients");
-            return Err(SmtpError::ProtocolError {
-                message: "DATA without recipients".into(),
-            });
+            return Err(Box::new((
+                self,
+                SmtpError::ProtocolError {
+                    message: "DATA without recipients".into(),
+                },
+            )));
         }
 
         // Run PREDATA ACL if configured
@@ -1642,14 +1843,20 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
                 let result =
                     self.smtp_handle_acl_fail(AclWhere::Predata, acl_rc, &user_msg, &log_msg);
                 if result < 0 {
-                    return Err(SmtpError::ProtocolError {
-                        message: "PREDATA ACL rejected with DROP".into(),
-                    });
+                    return Err(Box::new((
+                        self,
+                        SmtpError::ProtocolError {
+                            message: "PREDATA ACL rejected with DROP".into(),
+                        },
+                    )));
                 }
                 if result != 2 {
-                    return Err(SmtpError::ProtocolError {
-                        message: "PREDATA ACL rejected".into(),
-                    });
+                    return Err(Box::new((
+                        self,
+                        SmtpError::ProtocolError {
+                            message: "PREDATA ACL rejected".into(),
+                        },
+                    )));
                 }
             }
         }
@@ -1660,9 +1867,12 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
             if acl_rc != AclResult::Ok {
                 let result = self.smtp_handle_acl_fail(AclWhere::Data, acl_rc, &user_msg, &log_msg);
                 if result < 0 {
-                    return Err(SmtpError::ProtocolError {
-                        message: "DATA ACL rejected with DROP".into(),
-                    });
+                    return Err(Box::new((
+                        self,
+                        SmtpError::ProtocolError {
+                            message: "DATA ACL rejected with DROP".into(),
+                        },
+                    )));
                 }
             }
         }
@@ -1722,6 +1932,16 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
     /// Constructs the multi-line 250 response with all supported SMTP
     /// extensions. Capability strings are character-for-character identical
     /// to the C implementation for identical configurations (AAP §0.7.1).
+    ///
+    /// **Ordering guarantee**: Extensions are appended in the same order as
+    /// the C implementation at `smtp_in.c` lines 4330-4500:
+    ///   1. SIZE  2. 8BITMIME  3. PIPELINING  4. DSN  5. CHUNKING
+    ///   6. AUTH  7. STARTTLS  8. PRDR  9. SMTPUTF8  10. WELLKNOWN
+    ///   11. LIMITS  12. XCLIENT
+    ///
+    /// This ordering matches `s_]` in the C source and ensures EHLO
+    /// response diffs between C and Rust binaries are zero for identical
+    /// configurations.
     ///
     /// C reference: smtp_in.c lines 4330-4500.
     fn send_ehlo_response(&mut self) {
@@ -2129,25 +2349,57 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
         self.smtp_respond("220", false, "Ready to start TLS");
         let _ = self.smtp_fflush(true);
 
-        // TLS negotiation would be performed by the TLS backend here.
-        // The actual tls_server_start() call is handled by the binary
-        // crate which has access to the TlsBackend trait object.
-        // Mark TLS as active for now (the real integration happens at
-        // the binary crate level).
-        self.message_ctx.tls_in.active = true;
+        // Perform TLS negotiation via the TLS backend.
+        //
+        // C reference: smtp_in.c lines 5510-5630 — tls_server_start().
+        //
+        // TLS handshake is delegated to the `tls_server_start()` helper which
+        // invokes the appropriate TlsBackend trait method (rustls or openssl).
+        // On success it returns a `TlsSession` handle whose cipher/peer-DN/SNI
+        // are populated; on failure we send a 454 response.
+        //
+        // After TLS establishment, the I/O layer transparently encrypts
+        // all subsequent reads and writes.  The SMTP session MUST be
+        // reset (RFC 3207 §4.2) — HELO/AUTH state is cleared so the
+        // client re-identifies itself over the encrypted channel.
+        match tls_server_start(self.io.in_fd) {
+            Ok(tls_session) => {
+                // Populate TLS session metadata for logging and headers
+                self.message_ctx.tls_in.active = true;
+                self.message_ctx.tls_in.cipher = tls_session.cipher.clone();
+                self.message_ctx.tls_in.certificate_verified = tls_session.certificate_verified;
+                self.message_ctx.tls_in.peerdn = tls_session.peer_dn.clone();
+                self.message_ctx.tls_in.sni = tls_session.sni.clone();
 
-        // Reset HELO/AUTH state after TLS establishment
-        self.flags.helo_seen = false;
-        self.flags.auth_advertised = false;
-        self.message_ctx.authenticated_id = None;
-        self.message_ctx.sender_host_authenticated = None;
-        self.authenticated_by = None;
+                // RFC 3207 §4.2: Reset HELO/AUTH state after STARTTLS
+                self.flags.helo_seen = false;
+                self.flags.auth_advertised = false;
+                self.message_ctx.authenticated_id = None;
+                self.message_ctx.sender_host_authenticated = None;
+                self.authenticated_by = None;
 
-        // Update received protocol
-        self.update_received_protocol();
+                // Update received protocol (adds "s" suffix for TLS)
+                self.update_received_protocol();
 
-        info!("STARTTLS negotiation initiated");
-        0
+                info!(
+                    "STARTTLS negotiation succeeded, cipher={}",
+                    self.message_ctx
+                        .tls_in
+                        .cipher
+                        .as_deref()
+                        .unwrap_or("unknown")
+                );
+                0
+            }
+            Err(tls_err) => {
+                // TLS negotiation failed — log and send 454 temporary failure.
+                // The connection remains unencrypted; the client may retry
+                // without TLS or disconnect.
+                warn!("STARTTLS negotiation failed: {}", tls_err);
+                self.smtp_respond("454", false, "TLS currently unavailable");
+                0
+            }
+        }
     }
 
     // ── QUIT Command Handler ──
@@ -2395,12 +2647,16 @@ pub fn smtp_setup_msg(
                         // Now in Greeted state — enter inner loop for mail commands
                         return handle_greeted_session(greeted);
                     }
-                    Err(e) => {
+                    Err(boxed_err) => {
+                        let (returned_session, e) = *boxed_err;
                         warn!("HELO/EHLO failed: {}", e);
-                        // Stay in Connected state, allow retry
-                        // Re-create session since greet() consumed it
-                        session =
-                            SmtpSession::new(in_fd, out_fd, server_ctx, message_ctx, config_ctx);
+                        // Session returned — connection stays in Connected state.
+                        // Client may retry HELO/EHLO per RFC 5321.
+                        session = returned_session;
+                        // Check for DROP — ACL may have requested connection close
+                        if e.to_string().contains("DROP") {
+                            return SmtpSetupResult::Done;
+                        }
                     }
                 }
             }
@@ -2531,13 +2787,16 @@ fn handle_greeted_session(mut session: SmtpSession<'_, Greeted>) -> SmtpSetupRes
                         // Now in MailFrom state — handle RCPT TO commands
                         return handle_mailfrom_session(mail_session);
                     }
-                    Err(e) => {
+                    Err(boxed_err) => {
+                        let (returned_session, e) = *boxed_err;
                         warn!("MAIL FROM failed: {}", e);
-                        // Recreate greeted session since mail_from consumed it
-                        // The session data was moved — we need to get it back
-                        // This is handled by the type system; the error path
-                        // means mail_from already sent the error response.
-                        return SmtpSetupResult::Done;
+                        // Session returned to Greeted state — client can retry
+                        // MAIL FROM per RFC 5321 §3.3 (5xx is a transient failure
+                        // from the client's perspective).
+                        session = returned_session;
+                        if e.to_string().contains("DROP") {
+                            return SmtpSetupResult::Done;
+                        }
                     }
                 }
             }
@@ -2676,13 +2935,15 @@ fn handle_mailfrom_session(mut session: SmtpSession<'_, MailFrom>) -> SmtpSetupR
                         // Now in RcptTo state — handle DATA/more RCPT
                         return handle_rcptto_session(rcpt_session);
                     }
-                    Err(e) => {
+                    Err(boxed_err) => {
+                        let (returned_session, e) = *boxed_err;
                         warn!("RCPT TO failed: {}", e);
-                        // RCPT rejection doesn't end the session;
-                        // client can try more recipients.
-                        // But rcpt_to consumed the session...
-                        // For robustness, return Done here
-                        return SmtpSetupResult::Done;
+                        // Session returned to MailFrom state — client can
+                        // retry RCPT TO per RFC 5321 §3.3.
+                        session = returned_session;
+                        if e.to_string().contains("DROP") {
+                            return SmtpSetupResult::Done;
+                        }
                     }
                 }
             }
@@ -2774,11 +3035,14 @@ fn handle_rcptto_session(mut session: SmtpSession<'_, RcptTo>) -> SmtpSetupResul
                     Ok(new_session) => {
                         session = new_session;
                     }
-                    Err(e) => {
+                    Err(boxed_err) => {
+                        let (returned_session, e) = *boxed_err;
                         warn!("Additional RCPT TO failed: {}", e);
-                        // RCPT failure in RcptTo state: the session was consumed
-                        // by rcpt_to(). We'd need error recovery here.
-                        return SmtpSetupResult::Done;
+                        // Session returned — client can try more recipients
+                        session = returned_session;
+                        if e.to_string().contains("DROP") {
+                            return SmtpSetupResult::Done;
+                        }
                     }
                 }
             }
@@ -2790,9 +3054,14 @@ fn handle_rcptto_session(mut session: SmtpSession<'_, RcptTo>) -> SmtpSetupResul
                         // DATA accepted — yield to message reception
                         return SmtpSetupResult::Yield;
                     }
-                    Err(e) => {
+                    Err(boxed_err) => {
+                        let (returned_session, e) = *boxed_err;
                         warn!("DATA failed: {}", e);
-                        return SmtpSetupResult::Error;
+                        // Session returned — client can retry or RSET
+                        session = returned_session;
+                        if e.to_string().contains("DROP") {
+                            return SmtpSetupResult::Error;
+                        }
                     }
                 }
             }
@@ -2947,6 +3216,67 @@ fn parse_mail_address(input: &str) -> (String, String) {
     let address = parts.first().unwrap_or(&"").to_string();
     let extensions = parts.get(1).unwrap_or(&"").to_string();
     (address, extensions)
+}
+
+// =============================================================================
+// Module-Level Helper Functions
+// =============================================================================
+
+/// Parse a human-readable size string (e.g., "50M", "1G", "1024K", "8192")
+/// into a byte count. Returns `None` if the string is not a valid size.
+///
+/// Supports suffixes: K/k (KiB), M/m (MiB), G/g (GiB), or no suffix (bytes).
+/// This matches C Exim's `readconf_readfixed()` parsing for message_size_limit.
+fn parse_size_string(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_str, multiplier) = match s.as_bytes().last()? {
+        b'K' | b'k' => (&s[..s.len() - 1], 1024u64),
+        b'M' | b'm' => (&s[..s.len() - 1], 1024 * 1024),
+        b'G' | b'g' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => (s, 1u64),
+    };
+    let num: u64 = num_str.trim().parse().ok()?;
+    Some(num.saturating_mul(multiplier))
+}
+
+/// Perform server-side TLS handshake on the given file descriptor.
+///
+/// This helper bridges the SMTP inbound layer to the `exim_tls` crate's
+/// TLS backend. It delegates to the backend (rustls by default) to perform
+/// the actual TLS handshake on the accepted socket, then constructs a
+/// `TlsSession` from the backend's post-handshake state.
+///
+/// C reference: `tls_server_start()` in tls.c / tls-openssl.c / tls-gnu.c.
+///
+/// In the production daemon flow, the `TlsBackend` is initialised during
+/// daemon startup (`daemon_init`) and credentials are loaded via
+/// `server_creds_init`. The per-connection handshake is then performed via
+/// `server_start(fd)`.  Currently the backend instance is constructed per-call;
+/// in production wiring, the pre-initialised backend will be threaded through
+/// `ServerContext` → `SmtpSession` so that credentials loaded at daemon startup
+/// are reused across connections.
+#[cfg(feature = "tls")]
+fn tls_server_start(fd: RawFd) -> Result<exim_tls::TlsSession, exim_tls::TlsError> {
+    let mut backend = exim_tls::rustls_backend::RustlsBackend::new();
+    backend
+        .server_start(fd)
+        .map_err(|e| exim_tls::TlsError::HandshakeError(e.to_string()))?;
+    // Build TlsSession from the backend's post-handshake accessor methods
+    Ok(exim_tls::TlsSession {
+        active: true,
+        cipher: backend.cipher_name().map(String::from),
+        protocol_version: backend.protocol_version().map(String::from),
+        bits: 0, // Bit strength not directly exposed by rustls backend
+        certificate_verified: backend.peer_dn().is_some(),
+        peer_dn: backend.peer_dn().map(String::from),
+        sni: backend.sni().map(String::from),
+        peer_cert: None,
+        channel_binding: None,
+        resumption: exim_tls::ResumptionFlags::default(),
+    })
 }
 
 /// Extract the numeric response code from an SMTP response string.

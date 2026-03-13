@@ -793,7 +793,6 @@ dependencies = [
  "exim-store",
  "hmac",
  "libc",
- "libloading 0.9.0",
  "log",
  "md-5",
  "nix",
@@ -900,6 +899,7 @@ name = "exim-smtp"
 version = "0.1.0"
 dependencies = [
  "exim-acl",
+ "exim-config",
  "exim-dns",
  "exim-drivers",
  "exim-expand",

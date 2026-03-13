@@ -468,6 +468,11 @@ pub fn bdat_getc(
             if byte < 0 {
                 return BdatResult::Eof;
             }
+            // Justified: `byte` is guaranteed non-negative (checked above) and
+            // within 0..=255 (single-byte read from a buffered SMTP stream).
+            // Truncation from i32→u8 and sign loss from i32→u8 are both safe
+            // because the I/O layer returns byte values in [0, 255] and we
+            // guard against negative values (EOF) with the `byte < 0` check.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             return BdatResult::Byte(Tainted::new(byte as u8));
         }
@@ -776,6 +781,11 @@ pub fn bdat_ungetc(ctx: &mut ChunkingContext, io: &mut SmtpIoState, ch: i32) -> 
         .expect("lower receive functions not set after push in bdat_ungetc")
         .ungetc;
 
+    // Justified: `ch` is a character value returned from a previous getc()
+    // call, guaranteed to be in [0, 255] for valid byte data.  The caller
+    // is "ungetting" a byte that was previously read, so truncation from
+    // i32→u8 and sign loss are safe.  The return cast to i32 is lossless
+    // since lower_ungetc returns a byte-range value.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let byte = ch as u8;
     lower_ungetc(io, byte) as i32

@@ -38,6 +38,28 @@
 //! compile-time taint tracking. Network-received data (SMTP input, DNS
 //! responses) should be wrapped in `Tainted<T>` and validated via
 //! [`Tainted::sanitize()`] before use in security-sensitive operations.
+//!
+//! # C Boolean Flags (`f.*`) Coverage
+//!
+//! C Exim maintains ~150 boolean flags in the `struct global_flags f` defined
+//! in `globals.h`/`globals.c`.  These are distributed across four context
+//! structs:
+//!
+//! - **`exim_config::types::ConfigContext`** — 56 flags (AAP §0.4.4)
+//! - **`exim_core::context::ServerContext`** — 10 flags (daemon/process state)
+//! - **`exim_core::context::MessageContext`** — 6 flags (per-message state)
+//! - **`exim_core::context::DeliveryContext`** — 4 flags (per-delivery state)
+//!
+//! Total: ~76 of ~150 C boolean flags are currently mapped.  The remaining
+//! ~74 flags (e.g., `f.helo_verified`, `f.sender_verified`, `f.address_test_mode`,
+//! `f.filter_running`, `f.local_error_message`, `f.queue_only_policy`, and
+//! various transport/router-specific flags) will be added as they are needed
+//! by router and transport implementations (expected in CP5).
+//!
+//! Tracking ticket: Flag coverage should be validated against the full
+//! `globals.h` flag list when all router/transport implementations are
+//! complete.  Any flag accessed by production code MUST have a corresponding
+//! field in the appropriate context struct.
 
 use std::os::unix::io::OwnedFd;
 use std::path::PathBuf;

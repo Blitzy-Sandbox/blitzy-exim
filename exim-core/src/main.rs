@@ -389,10 +389,55 @@ fn dispatch_mode(
         }
 
         // ── Malware Test ────────────────────────────────────────────────
+        // C Exim's `-bmalware <file>` mode scans a file using the configured
+        // malware scanner (av_scanner option).  The scan delegates to the
+        // content scanning subsystem in miscmods/malware.c which supports
+        // ClamAV, cmdline, sophie, AVES, and other engines.
+        //
+        // The Rust malware scanner module (exim-miscmods/src/malware.rs) is
+        // not yet implemented — it will be added when the content scanning
+        // subsystem is ported from C.  Until then, we validate the file
+        // exists and report that the scanner is not configured.
         EximMode::MalwareTest { file } => {
             info!(file = %file, "malware test mode");
-            eprintln!("Exim malware test: scanning {file}");
-            ExitCode::SUCCESS
+
+            // Verify the target file exists and is readable.
+            let path = std::path::Path::new(&file);
+            if !path.exists() {
+                eprintln!("exim: malware test: file not found: {file}");
+                return ExitCode::FAILURE;
+            }
+            if !path.is_file() {
+                eprintln!("exim: malware test: not a regular file: {file}");
+                return ExitCode::FAILURE;
+            }
+
+            // Check whether the configuration specifies a malware scanner.
+            let av_scanner = &config_ctx.get_config().av_scanner;
+            if av_scanner.is_none() || av_scanner.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                eprintln!("exim: malware test: no av_scanner configured");
+                return ExitCode::FAILURE;
+            }
+
+            // Read file size for diagnostic output (matching C Exim format).
+            let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            info!(
+                file = %file,
+                size = file_size,
+                scanner = av_scanner.as_deref().unwrap_or(""),
+                "malware test: scanning file"
+            );
+
+            // Invoke the malware scanner via the content scanning subsystem.
+            // When exim-miscmods provides the malware scanning module, this
+            // will call malware_scan() with the file path and av_scanner
+            // configuration.  For now, report that the scanner subsystem
+            // is not yet available in the Rust build.
+            eprintln!(
+                "exim: malware test: content scanning subsystem not yet \
+                 available in Rust build — file: {file} ({file_size} bytes)"
+            );
+            ExitCode::FAILURE
         }
 
         // ── NewAliases ──────────────────────────────────────────────────
@@ -568,7 +613,7 @@ fn deliver_messages(
     forced: bool,
     give_up: bool,
     server_ctx: &mut ServerContext,
-    _config_ctx: &ConfigContext,
+    config_ctx: &ConfigContext,
 ) -> ExitCode {
     let mut overall_exit = ExitCode::SUCCESS;
 
@@ -588,7 +633,11 @@ fn deliver_messages(
                     running_in_test_harness: server_ctx.running_in_test_harness,
                     ..Default::default()
                 };
-                let cfg_config_ctx = exim_config::types::ConfigContext::default();
+                // Build ConfigContext from the actual parsed configuration,
+                // preserving all ACLs, rewrite rules, retry configs, and
+                // driver definitions.  Previously used ConfigContext::default()
+                // which lost all configuration data in delivery children.
+                let cfg_config_ctx = config_ctx.get_config().clone();
 
                 let result = exim_deliver::deliver_message(
                     msg_id,
@@ -656,7 +705,7 @@ fn deliver_messages(
 fn handle_smtp_input(
     batched: bool,
     server_ctx: &mut ServerContext,
-    _config_ctx: &ConfigContext,
+    config_ctx: &ConfigContext,
 ) -> ExitCode {
     info!(batched, "SMTP input mode");
 
@@ -670,7 +719,7 @@ fn handle_smtp_input(
 
     let mut smtp_msg_ctx = exim_smtp::inbound::command_loop::MessageContext::default();
 
-    let smtp_config_ctx = build_smtp_config_context();
+    let smtp_config_ctx = build_smtp_config_context(&config_ctx.config);
 
     let mut session_state = exim_smtp::inbound::SessionState::default();
 
@@ -703,7 +752,7 @@ fn handle_smtp_input(
 fn handle_host_check(
     host: &str,
     server_ctx: &mut ServerContext,
-    _config_ctx: &ConfigContext,
+    config_ctx: &ConfigContext,
 ) -> ExitCode {
     info!(host = %host, "host check / SMTP simulation mode");
 
@@ -711,7 +760,7 @@ fn handle_host_check(
 
     let mut smtp_msg_ctx = exim_smtp::inbound::command_loop::MessageContext::default();
 
-    let smtp_config_ctx = build_smtp_config_context();
+    let smtp_config_ctx = build_smtp_config_context(&config_ctx.config);
 
     let mut session_state = exim_smtp::inbound::SessionState::default();
 
@@ -754,47 +803,25 @@ fn build_smtp_server_context(
     }
 }
 
-/// Build a `command_loop::ConfigContext` with default ACL configuration.
+/// Build a `command_loop::ConfigContext` from the parsed configuration.
 ///
-/// The SMTP command loop's `ConfigContext` is a flat struct holding ACL
-/// names, SMTP limits, and session policy — not the same as
-/// `exim_config::ConfigContext`.
-fn build_smtp_config_context() -> exim_smtp::inbound::command_loop::ConfigContext {
-    exim_smtp::inbound::command_loop::ConfigContext {
-        acl_smtp_helo: None,
-        acl_smtp_mail: None,
-        acl_smtp_rcpt: None,
-        acl_smtp_data: None,
-        acl_smtp_auth: None,
-        acl_smtp_starttls: None,
-        acl_smtp_vrfy: None,
-        acl_smtp_expn: None,
-        acl_smtp_etrn: None,
-        acl_smtp_predata: None,
-        smtp_accept_max_nonmail: 10,
-        smtp_max_synprot_errors: 3,
-        smtp_max_unknown_commands: 3,
-        smtp_enforce_sync: true,
-        message_size_limit: 50 * 1024 * 1024, // 50 MB default
-        auth_instances: Vec::new(),
-        smtp_banner: None,
-        helo_verify_hosts: None,
-        helo_try_verify_hosts: None,
-        chunking_advertise_hosts: None,
-        dsn_advertise_hosts: None,
-        auth_advertise_hosts: None,
-        pipelining_advertise_hosts: None,
-        // These fields are present because exim-smtp defaults include
-        // "tls" and "prdr" features.
-        tls_advertise_hosts: None,
-        prdr_enable: false,
-        acl_smtp_atrn: None,
-        atrn_domains: None,
-        atrn_host: None,
-        submission_mode: false,
-        submission_domain: None,
-        submission_name: None,
-    }
+/// Populates the SMTP command loop's `ConfigContext` with ALL ACL definitions,
+/// SMTP limits, banner, host lists, and session policy from the frozen
+/// `Arc<Config>`.  Uses the `from_config()` bridge method to transfer all
+/// relevant fields from `exim_config::types::ConfigContext` to the SMTP
+/// crate's own `ConfigContext` type.
+///
+/// Previously set all 11 ACL fields to `None`, disabling all policy
+/// enforcement and creating an open relay for `-bs`/`-bS`/`-bh` modes.
+fn build_smtp_config_context(
+    frozen_config: &Arc<exim_config::Config>,
+) -> exim_smtp::inbound::command_loop::ConfigContext {
+    use std::ops::Deref;
+    let cfg_ctx: &exim_config::types::ConfigContext = (*frozen_config).deref();
+    exim_smtp::inbound::command_loop::ConfigContext::from_config(
+        cfg_ctx,
+        Vec::new(), // Auth instances — populated by auth driver registration
+    )
 }
 
 // =============================================================================
@@ -809,7 +836,7 @@ fn build_smtp_config_context() -> exim_smtp::inbound::command_loop::ConfigContex
 fn receive_message(
     cli_args: &cli::EximCli,
     server_ctx: &mut ServerContext,
-    _config_ctx: &ConfigContext,
+    config_ctx: &ConfigContext,
     _frozen_config: &Arc<Config>,
 ) -> ExitCode {
     info!("message reception mode (default)");
@@ -878,7 +905,10 @@ fn receive_message(
                     running_in_test_harness: server_ctx.running_in_test_harness,
                     ..Default::default()
                 };
-                let cfg_config_ctx = exim_config::types::ConfigContext::default();
+                // Build ConfigContext from the actual parsed configuration,
+                // preserving all ACLs, rewrite rules, retry configs, and
+                // driver definitions for the delivery child.
+                let cfg_config_ctx = config_ctx.get_config().clone();
 
                 let result = exim_deliver::deliver_message(
                     &msg_id,

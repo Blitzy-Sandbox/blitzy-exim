@@ -1195,7 +1195,13 @@ pub fn queue_run(
                     running_in_test_harness: server_ctx.running_in_test_harness,
                     ..Default::default()
                 };
-                let cfg_config_ctx = exim_config::types::ConfigContext::default();
+                // Build the config context from the actual parsed configuration
+                // (via the frozen Arc<Config>), preserving all ACLs, rewrite rules,
+                // retry configs, router/transport definitions, and every other option
+                // parsed from the config file.  Previously this used
+                // ConfigContext::default() which produced an empty config — causing
+                // delivery children to lose all policy enforcement.
+                let cfg_config_ctx = config.get_config().clone();
 
                 let result = deliver_message(
                     &msg_id,

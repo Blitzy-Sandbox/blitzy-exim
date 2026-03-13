@@ -46,6 +46,11 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(radius_lib_radlib)");
     println!("cargo::rustc-check-cfg=cfg(radius_lib_radiusclient)");
 
+    // Link against libcrypt for POSIX crypt(3) used by dlfunc::crypt_compare().
+    // This is unconditional because crypt_compare() is always compiled and
+    // used by the crypteq expansion condition.
+    println!("cargo:rustc-link-lib=crypt");
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set by Cargo"));
 
     // Write active feature manifest for build diagnostics and to ensure

@@ -348,6 +348,51 @@ pub fn daemon_go(ctx: &mut ServerContext, config: &Arc<Config>) -> ! {
         }
     }
 
+    // -- Step 6b: Drop root privileges after binding privileged ports --
+    //
+    // C Exim (daemon.c lines 2270–2290) drops to the Exim user/group after
+    // all privileged port bindings are complete. This is critical for security:
+    // the daemon must not run as root during normal SMTP processing.
+    //
+    // Privilege dropping order:
+    //   1. setgid(exim_gid) FIRST — must be done while still root
+    //   2. setuid(exim_uid) SECOND — cannot regain root after this
+    //
+    // We only drop privileges if we are currently running as root and the
+    // Exim UID/GID are configured (non-zero). In test harness mode, the
+    // daemon may run as a non-root user and this step is skipped.
+    if ctx.running_as_root && ctx.exim_uid != 0 {
+        // Drop group first — setgid() requires root
+        if ctx.exim_gid != 0 {
+            if let Err(e) = nix::unistd::setgid(nix::unistd::Gid::from_raw(ctx.exim_gid)) {
+                tracing::error!(
+                    gid = ctx.exim_gid,
+                    error = %e,
+                    "fatal: failed to drop group privileges"
+                );
+                exit(1);
+            }
+            tracing::debug!(gid = ctx.exim_gid, "dropped group privileges");
+        }
+
+        // Drop user — setuid() is irreversible (cannot regain root)
+        if let Err(e) = nix::unistd::setuid(nix::unistd::Uid::from_raw(ctx.exim_uid)) {
+            tracing::error!(
+                uid = ctx.exim_uid,
+                error = %e,
+                "fatal: failed to drop user privileges"
+            );
+            exit(1);
+        }
+
+        ctx.running_as_root = false;
+        tracing::info!(
+            uid = ctx.exim_uid,
+            gid = ctx.exim_gid,
+            "dropped root privileges to Exim user"
+        );
+    }
+
     // -- Step 7: PID file path --
     let pid_file_path = config.pid_file_path.clone();
 
@@ -1437,49 +1482,22 @@ fn handle_smtp_child(
         interface_port: 0,
     };
 
-    // Build the exim-smtp ConfigContext from our Arc<Config>.
-    // The exim-smtp crate defines its own ConfigContext type with SMTP-specific
-    // ACL and limit fields. Feature-gated fields follow exim-smtp's feature
-    // flags (tls, prdr are in its defaults; i18n, wellknown, etc. are not).
-    let smtp_config_ctx = exim_smtp::inbound::command_loop::ConfigContext {
-        acl_smtp_helo: None,
-        acl_smtp_mail: None,
-        acl_smtp_rcpt: None,
-        acl_smtp_data: None,
-        acl_smtp_auth: None,
-        acl_smtp_starttls: None,
-        acl_smtp_vrfy: None,
-        acl_smtp_expn: None,
-        acl_smtp_etrn: None,
-        acl_smtp_predata: None,
-        smtp_accept_max_nonmail: 10,
-        smtp_max_synprot_errors: 3,
-        smtp_max_unknown_commands: 3,
-        smtp_enforce_sync: true,
-        message_size_limit: 0,
-        auth_instances: Vec::new(),
-        smtp_banner: Some(format!(
-            "220 {} ESMTP Exim {}\r\n",
-            ctx.primary_hostname, config.config_filename
-        )),
-        helo_verify_hosts: None,
-        helo_try_verify_hosts: None,
-        chunking_advertise_hosts: None,
-        dsn_advertise_hosts: None,
-        auth_advertise_hosts: None,
-        pipelining_advertise_hosts: None,
-        // The tls_advertise_hosts field is present when exim-smtp's "tls"
-        // feature is enabled (it is, in exim-smtp default features).
-        tls_advertise_hosts: None,
-        // The prdr_enable field is present when exim-smtp's "prdr" feature
-        // is enabled (it is, in exim-smtp default features).
-        prdr_enable: false,
-        submission_mode: false,
-        submission_domain: None,
-        submission_name: None,
-        acl_smtp_atrn: None,
-        atrn_domains: None,
-        atrn_host: None,
+    // Build the exim-smtp ConfigContext from our Arc<Config> using the
+    // `from_config()` bridge method.  This propagates ALL ACL definitions,
+    // SMTP limits, banner, host lists, and EHLO capability settings from
+    // the frozen parsed configuration into the SMTP crate's ConfigContext.
+    //
+    // Previously this constructed a ConfigContext with ALL ACL fields set to
+    // None — which disabled all ACL checking and caused the daemon to
+    // operate as an open relay.  The from_config() method reads the actual
+    // ACL names from the parsed config, ensuring policy enforcement.
+    let smtp_config_ctx = {
+        use std::ops::Deref;
+        let cfg_ctx: &exim_config::types::ConfigContext = (*config).deref();
+        exim_smtp::inbound::command_loop::ConfigContext::from_config(
+            cfg_ctx,
+            Vec::new(), // Auth instances — populated by auth driver registration
+        )
     };
 
     // Initialize a MessageContext for this SMTP session.

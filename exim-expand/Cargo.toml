@@ -127,9 +127,9 @@ rand = "0.10.0"
 
 # ── Feature-gated optional external dependencies ────────────────────────────
 
-# Dynamic library loading for ${dlfunc} — replaces C dlopen()/dlsym()/dlerror()
-# (AAP §0.6.1: libloading 0.9.0). Only compiled when dlfunc feature is enabled.
-libloading = { workspace = true, optional = true }
+# NOTE: libloading is no longer a direct dependency of exim-expand.
+# Per AAP §0.7.2, all unsafe dlopen/dlsym operations are centralised in
+# exim-ffi/src/dlfunc.rs.  The dlfunc feature enables exim-ffi instead.
 
 # Safe POSIX API wrappers for ${run} fork/exec — killpg(), umask(), Pid
 # (AAP §0.6.1: nix 0.31.2). Only compiled when run feature is enabled.
@@ -168,13 +168,16 @@ srs = []
 # exim_ffi::perl::{PerlInterpreter, PerlError} available.
 perl = ["dep:exim-ffi", "exim-ffi/ffi-perl"]
 
-# ${dlfunc} dynamic function loading via libloading
+# ${dlfunc} dynamic function loading — delegates unsafe operations to exim-ffi
+# per AAP §0.7.2 (zero unsafe outside exim-ffi).
 # Replaces: #ifdef EXPAND_DLFUNC (expand.c lines 7138-7222)
-dlfunc = ["dep:libloading"]
+dlfunc = ["dep:exim-ffi"]
 
 # crypteq condition — password hash comparison ({md5}, {sha1}, {crypt}, {crypt16})
 # Replaces: #ifdef SUPPORT_CRYPTEQ (expand.c lines 34-41, 3211+)
-crypteq = []
+# Enables exim-ffi for POSIX crypt(3) delegation (AAP §0.7.2 — zero unsafe
+# outside exim-ffi).
+crypteq = ["dep:exim-ffi"]
 
 # Content scanning variables ($av_failed, $spam_*, $malware_*)
 # Replaces: #ifdef WITH_CONTENT_SCAN (expand.c lines 473-475, 576-578, 593-610, 661-714)

@@ -932,25 +932,160 @@ pub fn test_rewrite_mode(args: &[String], config: &Arc<exim_config::Config>) -> 
     let address = &args[0];
     let flag_str = args.get(1).map(|s| s.as_str()).unwrap_or("E");
 
-    // Interpret the flag character (matching C rewrite flag constants):
-    //   E = envelope sender, S = envelope sender, H = header, T = envelope to
+    // Interpret the flag character (matching C rewrite flag constants from
+    // src/src/rewrite.c rewrite_one_header() / rewrite_one() — the same
+    // flag bits used by C Exim -brw mode):
+    //   E / S = envelope sender (rewrite_envfrom = 0x01)
+    //   T     = envelope recipient (rewrite_envto = 0x02)
+    //   H     = header rewrite (all header-class bits: 0x3C)
+    //   *     = all flags (0xFF)
     let flag_value: u32 = match flag_str.chars().next().unwrap_or('E') {
         'E' | 'S' => 0x01, // rewrite_envfrom
         'T' => 0x02,       // rewrite_envto
-        'H' => 0x04,       // rewrite_headers
+        'H' => 0x3C,       // rewrite_headers (all header subtypes)
+        '*' => 0xFF,       // match all rules
         _ => 0x01,
     };
 
-    let _ = config; // Config used for rewrite rule lookup.
+    // Retrieve rewrite rules from the parsed configuration.
+    let rewrite_rules = &config.rewrite_rules;
 
-    println!("Rewrite test: address={address} flag={flag_str} (0x{flag_value:02x})");
+    if rewrite_rules.is_empty() {
+        // No rewrite rules configured — address is unchanged.
+        // Output format matches C Exim: "  <address> -> <address>"
+        println!("  {address} -> {address}");
+        return ExitCode::SUCCESS;
+    }
 
-    // Apply rewrite rules from the configuration. In the full implementation
-    // this calls the rewrite engine to transform the address.
-    // Output format matches C Exim -brw exactly.
-    println!("  {address} -> {address}");
+    // Apply rewrite rules sequentially (matching C `rewrite_one()` logic
+    // from src/src/rewrite.c lines 51–200).
+    //
+    // For each rule whose flags overlap with the requested flag_value, check
+    // whether the rule's key pattern matches the address. If it matches,
+    // apply the replacement and (unless the 'continue' flag is set) stop
+    // processing further rules.
+    //
+    // C Exim uses expand_string() for pattern matching and replacement;
+    // here we do a simplified but functionally correct match:
+    //   - If the key starts with `^`, treat it as a regex pattern
+    //   - If the key contains `@`, match against the address domain or full address
+    //   - Otherwise, compare the full address against the key (case-insensitive)
+    let mut result_address = address.clone();
+    let mut rewritten = false;
+
+    // Flag bit for "continue processing" (C: rewrite_continue = 0x40)
+    const REWRITE_CONTINUE: u32 = 0x40;
+    // Flag bit for "whole address" matching (C: rewrite_whole = 0x100)
+    const REWRITE_WHOLE: u32 = 0x100;
+
+    for rule in rewrite_rules {
+        // Check that the rule's flags apply to the requested context
+        // (matching C: `(rule->flags & flag) != 0`)
+        if (rule.flags & flag_value) == 0 {
+            continue;
+        }
+
+        // Determine the match target: if REWRITE_WHOLE is set, match the
+        // entire address; otherwise match only the domain portion.
+        // C reference: rewrite.c — REWRITE_WHOLE means the pattern applies to
+        // the complete address; without it, the pattern matches only the
+        // domain part (everything after '@').
+        let domain_only = result_address
+            .rfind('@')
+            .map(|pos| &result_address[pos + 1..])
+            .unwrap_or(&result_address);
+        let match_against = if (rule.flags & REWRITE_WHOLE) != 0 {
+            result_address.as_str()
+        } else {
+            domain_only
+        };
+
+        // Pattern matching: C Exim uses expand_string + address_match_list.
+        // We implement simplified matching for the -brw test mode:
+        let matched = if rule.key.starts_with('^') {
+            // Regex pattern — compile and match
+            match regex::Regex::new(&rule.key) {
+                Ok(re) => re.is_match(match_against),
+                Err(_) => {
+                    tracing::warn!(key = rule.key.as_str(), "rewrite: invalid regex pattern");
+                    false
+                }
+            }
+        } else if rule.key.contains('@') {
+            // Literal address comparison (case-insensitive)
+            rule.key.eq_ignore_ascii_case(match_against)
+        } else if rule.key.starts_with('*') {
+            // Wildcard domain match: "*@domain" or "*domain"
+            let pattern = rule.key.trim_start_matches('*');
+            match_against
+                .to_ascii_lowercase()
+                .ends_with(&pattern.to_ascii_lowercase())
+        } else {
+            // Domain-only match: check if the address domain matches
+            if let Some(at_pos) = match_against.rfind('@') {
+                let addr_domain = &match_against[at_pos + 1..];
+                rule.key.eq_ignore_ascii_case(addr_domain)
+            } else {
+                rule.key.eq_ignore_ascii_case(match_against)
+            }
+        };
+
+        if matched {
+            // Apply the replacement. C Exim expands the replacement string
+            // via expand_string(), substituting $1, $local_part, $domain etc.
+            // For -brw mode, we apply simple variable substitution.
+            let new_address = apply_rewrite_replacement(&rule.replacement, &result_address);
+            tracing::debug!(
+                from = result_address.as_str(),
+                to = new_address.as_str(),
+                key = rule.key.as_str(),
+                "rewrite: rule matched"
+            );
+            result_address = new_address;
+            rewritten = true;
+
+            // Unless 'continue' flag is set, stop processing further rules
+            if (rule.flags & REWRITE_CONTINUE) == 0 {
+                break;
+            }
+        }
+    }
+
+    if !rewritten {
+        tracing::debug!(address = address.as_str(), "rewrite: no rules matched");
+    }
+
+    // Output format matches C Exim -brw exactly:
+    // "  <original> -> <rewritten>" (or unchanged if no rules matched)
+    println!("  {address} -> {result_address}");
 
     ExitCode::SUCCESS
+}
+
+/// Apply a rewrite rule replacement to an address.
+///
+/// Performs variable substitution in the replacement template:
+/// - `$local_part` or `${local_part}` — the local part of the matched address
+/// - `$domain` or `${domain}` — the domain of the matched address
+/// - `$0` — the full matched address
+///
+/// This is a simplified version of C Exim's `expand_string()` for the
+/// rewrite replacement context, sufficient for -brw mode testing.
+fn apply_rewrite_replacement(replacement: &str, address: &str) -> String {
+    // Split the address into local_part and domain for substitution
+    let (local_part, domain) = if let Some(at_pos) = address.rfind('@') {
+        (&address[..at_pos], &address[at_pos + 1..])
+    } else {
+        (address, "")
+    };
+
+    let mut result = replacement.to_string();
+    result = result.replace("$local_part", local_part);
+    result = result.replace("${local_part}", local_part);
+    result = result.replace("$domain", domain);
+    result = result.replace("${domain}", domain);
+    result = result.replace("$0", address);
+    result
 }
 
 // ===========================================================================
@@ -1340,17 +1475,37 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m.saturating_sub(1), d)
 }
 
-/// Get the spool directory from the config.
+/// Get the spool directory from the parsed configuration.
+///
+/// Returns the configured `spool_directory` if non-empty, otherwise falls back
+/// to the compile-time default `/var/spool/exim` (matching C Exim's
+/// `SPOOL_DIRECTORY` macro default).
 fn config_spool_directory(config: &Arc<exim_config::Config>) -> String {
-    let _ = config;
-    String::from("/var/spool/exim")
+    let dir = &config.spool_directory;
+    if dir.is_empty() {
+        String::from("/var/spool/exim")
+    } else {
+        dir.clone()
+    }
 }
 
 /// Build a `CfgConfigContext` from an `Arc<Config>` for use with APIs
 /// that require the `exim_config::ConfigContext` struct.
+///
+/// Clones the inner `ConfigContext` from the frozen configuration, preserving
+/// all ACL definitions, rewrite rules, retry rules, router/transport instances,
+/// and every other configuration option parsed from the config file.
+///
+/// `Config` implements `Deref<Target=ConfigContext>`, so we use
+/// `std::ops::Deref` to reach the inner struct.
 fn build_config_context(config: &Arc<exim_config::Config>) -> CfgConfigContext {
-    let _ = config;
-    CfgConfigContext::default()
+    // Deref chain: Arc<Config> → Config → ConfigContext (via Config's Deref impl).
+    // Clone the underlying ConfigContext so the caller gets an owned copy with
+    // all parsed configuration data — ACLs, rewrite rules, retry configs,
+    // driver instances, host lists, etc.
+    use std::ops::Deref;
+    let cfg_ctx: &CfgConfigContext = (*config).deref();
+    cfg_ctx.clone()
 }
 
 /// Build a `CfgServerContext` from a `crate::context::ServerContext` for

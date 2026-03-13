@@ -406,6 +406,26 @@ pub struct MessageContext {
     ///
     /// Replaces calls to C `host_and_ident()` function.
     pub host_and_ident: String,
+
+    /// Local part of the current recipient address being evaluated.
+    ///
+    /// Set by `acl_check()` during RCPT/VRFY/PRDR phases by splitting the
+    /// recipient on `@`. Available as `$local_part` in ACL conditions and
+    /// expansion strings. Propagated back to the caller after ACL evaluation
+    /// completes so downstream code (routers, expansion engine) can read it.
+    ///
+    /// Replaces C global `deliver_localpart` set in `acl_check()`.
+    pub local_part: String,
+
+    /// Domain part of the current recipient address being evaluated.
+    ///
+    /// Set by `acl_check()` during RCPT/VRFY/PRDR phases by splitting the
+    /// recipient on `@`. Available as `$domain` in ACL conditions and
+    /// expansion strings. Propagated back to the caller after ACL evaluation
+    /// completes so downstream code (routers, expansion engine) can read it.
+    ///
+    /// Replaces C global `deliver_domain` set in `acl_check()`.
+    pub domain: String,
 }
 
 // =============================================================================
@@ -500,9 +520,10 @@ pub fn acl_check(
     // domain for use by ACL conditions ($local_part, $domain, $recipient).
     // In the full system, this would call deliver_split_address(). Here we
     // perform a simplified split on '@'.
-    let mut _local_part = String::new();
-    let mut _domain = String::new();
-
+    //
+    // The computed values are stored into the message context so downstream
+    // code (router chain, expansion engine) can read $local_part and $domain
+    // after ACL evaluation completes.
     let needs_address_setup = where_phase == AclWhere::Rcpt
         || where_phase == AclWhere::Vrfy
         || cfg_prdr_phase_match(where_phase);
@@ -510,18 +531,24 @@ pub fn acl_check(
     if needs_address_setup {
         if let Some(addr) = recipient {
             // Split "local_part@domain" — matching C deliver_split_address()
-            if let Some(at_pos) = addr.rfind('@') {
-                _local_part = addr[..at_pos].to_string();
-                _domain = addr[at_pos + 1..].to_string();
+            let (local_part, domain) = if let Some(at_pos) = addr.rfind('@') {
+                (addr[..at_pos].to_string(), addr[at_pos + 1..].to_string())
             } else {
                 // No '@' — entire address is the local part (local delivery)
-                _local_part = addr.to_string();
-            }
+                (addr.to_string(), String::new())
+            };
+
             trace!(
-                local_part = _local_part.as_str(),
-                domain = _domain.as_str(),
+                local_part = local_part.as_str(),
+                domain = domain.as_str(),
                 "acl_check: recipient address split"
             );
+
+            // Propagate into the message context so $local_part and $domain
+            // are available to ACL conditions during evaluation and to
+            // downstream code (routers, expansion engine) after evaluation.
+            msg_ctx.local_part = local_part;
+            msg_ctx.domain = domain;
         }
     }
 

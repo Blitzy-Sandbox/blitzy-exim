@@ -32,11 +32,10 @@
 
 // ── Crate-level lint configuration ──────────────────────────────────────
 //
-// `deny(unsafe_code)` prevents unsafe code in all modules by default.
-// The `dlfunc` module (feature-gated) overrides this with `allow(unsafe_code)`
-// because `libloading` 0.9's `Library::new()` and `Library::get()` are both
-// `unsafe fn`.  This is the minimum relaxation required — every other module
-// in the crate remains protected by `deny`.
+// `deny(unsafe_code)` prevents unsafe code in ALL modules — no exceptions.
+// Per AAP §0.7.2, all unsafe operations (including libloading's `dlopen`/
+// `dlsym` wrappers formerly in the `dlfunc` module) are now centralised in
+// the `exim-ffi` crate.  This crate contains zero unsafe blocks.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![deny(clippy::all)]

@@ -1450,8 +1450,39 @@ fn eval_for_iter(
     for item in &items {
         tracing::debug!(op = op_name, item = %item, "iterator: evaluating for $item");
 
-        // Substitute $item in the condition template
-        let expanded_cond = cond_template.replace("$item", item);
+        // Substitute $item in the condition template using word-boundary-aware
+        // replacement.  Naive `replace("$item", ...)` would also transform
+        // variables like `$item_count` or `$itemized` into `<value>_count` or
+        // `<value>ized`.  We match `$item` only when the character after it is
+        // NOT a valid variable-name continuation character (alphanumeric or
+        // underscore), matching C Exim's read_name() boundary rules.
+        let expanded_cond = {
+            let mut result = String::with_capacity(cond_template.len() + item.len());
+            let bytes = cond_template.as_bytes();
+            let pattern = b"$item";
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i..].starts_with(pattern) {
+                    let after = i + pattern.len();
+                    // Check the character immediately after "$item" — if it is
+                    // alphanumeric or underscore, this is a longer variable name
+                    // (e.g. $item_count) and must NOT be substituted.
+                    let is_longer_var = after < bytes.len()
+                        && (bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+                    if is_longer_var {
+                        result.push(bytes[i] as char);
+                        i += 1;
+                    } else {
+                        result.push_str(item);
+                        i = after;
+                    }
+                } else {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            result
+        };
 
         // Evaluate the substituted condition
         let tempcond =
@@ -1673,24 +1704,28 @@ fn eval_crypt_compare(
     salted: &str,
     _mode: CryptMode,
 ) -> Result<bool, ExpandError> {
-    // Guard against short salt (expand.c lines 3328–3333)
+    // Guard against short salt (expand.c lines 3328–3333).
+    // The salt must be at least 2 characters for crypt(3) to produce
+    // a meaningful result.  With a shorter salt, crypt() behaviour is
+    // undefined on some platforms, so we reject early.
     if salted.len() < 2 {
         return Ok(false);
     }
 
-    // Use a simple comparison approach: since we cannot safely call libc::crypt
-    // without `unsafe`, and this crate forbids unsafe, we implement a
-    // compatibility shim that compares the plaintext directly against the
-    // stored hash. In production, this would delegate to exim-ffi's crypt
-    // wrapper. For now, provide a meaningful comparison.
+    // Delegate to exim-ffi's safe wrapper around POSIX crypt(3).
+    // This crate forbids unsafe code (#![deny(unsafe_code)]), so the actual
+    // libc::crypt() call lives in exim-ffi/src/dlfunc.rs per AAP §0.7.2.
     //
-    // NOTE: Full crypt() support requires FFI through exim-ffi crate.
-    // This implementation handles the common case and logs when FFI is needed.
-    tracing::debug!("crypteq: crypt() comparison — full support requires exim-ffi crate");
-
-    // Direct comparison as fallback — this matches C behavior when
-    // crypt() returns the same string for identical plaintext+salt
-    Ok(plaintext == salted)
+    // The wrapper:
+    //  1. Extracts the salt prefix from `salted` (crypt(3) does this
+    //     internally — the full stored hash is passed as the salt argument).
+    //  2. Calls libc::crypt(plaintext, salted) to hash the plaintext.
+    //  3. Compares the resulting hash against the stored `salted` value.
+    //  4. Returns true on match, false on mismatch or crypt() failure.
+    //
+    // This matches C Exim expand.c lines 3328–3345 which call
+    // crypt(coded, strncpy(salt, coded, salt_len)) and then strcmp().
+    Ok(exim_ffi::dlfunc::crypt_compare(plaintext, salted))
 }
 
 // ── Status checks (expand.c lines 2738–2747) ──────────────────────────

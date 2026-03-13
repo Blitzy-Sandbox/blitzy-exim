@@ -10,29 +10,13 @@
 // This module is feature-gated behind the `dlfunc` Cargo feature flag,
 // replacing the C `#ifdef EXPAND_DLFUNC` / `#ifndef EXPAND_DLFUNC`
 // conditional compilation (expand.c lines 7138-7143).
-
-// ── Module-level lint override ──────────────────────────────────────────
 //
-// Allow `unsafe` code in this module ONLY.  Required for three `libloading`
-// operations that wrap POSIX `dlopen(3)` / `dlsym(3)`:
-//
-//  1. `Library::new(path)` — loads a shared object (replaces `dlopen`)
-//  2. `Library::get::<T>(symbol)` — looks up a function symbol (replaces `dlsym`)
-//  3. Calling the loaded function through the `Symbol` pointer
-//
-// The crate-level `#![deny(unsafe_code)]` prevents unsafe code everywhere
-// else in `exim-expand`.  This module is the ONLY place where unsafe is
-// permitted, and only because dynamic library operations are inherently
-// unsafe in Rust's safety model.  Each `unsafe` block below carries an
-// inline safety justification referencing the specific contract.
-#![allow(unsafe_code)]
+// Per AAP §0.7.2, this module contains **zero** `unsafe` code.  All
+// dynamic library operations (`dlopen`, `dlsym`, function pointer calls,
+// `CStr::from_ptr`) are centralised in `exim-ffi/src/dlfunc.rs` which
+// exposes safe wrapper functions consumed here.
 
-use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int};
-use std::sync::{LazyLock, Mutex};
-
-use libloading::{Library, Symbol};
+use std::os::raw::c_int;
 
 use crate::evaluator::Evaluator;
 use crate::{ExpandError, RDO_DLFUNC};
@@ -126,14 +110,6 @@ impl DlfuncStatus {
     /// unrecognised value maps to [`Error`](Self::Error), matching the
     /// C `else` branch at expand.c line 7213 which catches all values
     /// that are neither OK, FAIL, nor FAIL_FORCED.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// assert_eq!(DlfuncStatus::from_c_int(0), DlfuncStatus::Ok);
-    /// assert_eq!(DlfuncStatus::from_c_int(258), DlfuncStatus::FailForced);
-    /// assert_eq!(DlfuncStatus::from_c_int(99), DlfuncStatus::Error);
-    /// ```
     pub fn from_c_int(val: c_int) -> Self {
         match val {
             C_STATUS_OK => Self::Ok,
@@ -155,85 +131,6 @@ impl std::fmt::Display for DlfuncStatus {
             Self::Error => write!(f, "ERROR"),
         }
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Shared Object Handle Cache
-// ═══════════════════════════════════════════════════════════════════════
-
-/// C function signature for dynamically loaded Exim functions.
-///
-/// Matches the C typedef:
-/// ```c
-/// typedef int (*exim_dlfunc_t)(uschar **result, int argc, uschar *argv[]);
-/// ```
-///
-/// Where `uschar` is `unsigned char`.  The function receives:
-/// - `result`: output pointer — set to the result string on success
-/// - `argc`: number of arguments (excluding filename and function name)
-/// - `argv`: array of argument strings
-///
-/// Returns an Exim status code (OK=0, DEFER=1, FAIL=2, FAIL_FORCED=258).
-type EximDlfuncFn =
-    unsafe extern "C" fn(result: *mut *mut c_char, argc: c_int, argv: *mut *mut c_char) -> c_int;
-
-/// Process-level cache of loaded shared object handles.
-///
-/// Replaces the C balanced binary tree (`tree_node` with
-/// `tree_search`/`tree_insertnode` anchored at the `dlobj_anchor` global
-/// variable — expand.c lines 7170-7184).
-///
-/// Uses [`LazyLock`] for lazy initialisation on first `${dlfunc}` invocation,
-/// avoiding global constructor overhead.  The [`Mutex`] provides thread-safe
-/// access, although Exim's fork-per-connection model means contention is
-/// effectively zero.
-///
-/// Libraries cached here persist for the **entire process lifetime**, matching
-/// the C behaviour where `dlobj_anchor` is a process-global tree that is
-/// never freed.  Loaded libraries are only unloaded at process exit via the
-/// [`Library`] `Drop` implementation calling `dlclose()`.
-static LIBRARY_CACHE: LazyLock<Mutex<HashMap<String, Library>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Helper: load or retrieve a library from the cache
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Load a shared library by filename, using the process-level cache.
-///
-/// If the library has already been loaded, the cached handle is reused.
-/// Otherwise the library is opened via `dlopen(filename, RTLD_LAZY)` and
-/// inserted into the cache for subsequent calls.
-///
-/// # Errors
-///
-/// Returns `ExpandError::Failed` if `dlopen` fails (library not found,
-/// permission denied, missing symbol dependencies, etc.).  The error
-/// message matches the C format: `dlopen "filename" failed: <dlerror>`.
-fn load_library(filename: &str) -> Result<(), ExpandError> {
-    let mut cache = LIBRARY_CACHE.lock().map_err(|e| ExpandError::Failed {
-        message: format!("internal error: library cache lock poisoned: {e}"),
-    })?;
-
-    if cache.contains_key(filename) {
-        return Ok(());
-    }
-
-    // SAFETY: `Library::new` loads a shared object via `dlopen(path, RTLD_LAZY)`.
-    // The filename originates from Exim configuration file expansion, which runs
-    // in a trusted administrative context.  The loaded library persists in the
-    // process-level cache until process exit, matching C behaviour.  Library
-    // initialisation routines are executed by the operating system loader;
-    // the administrator is responsible for specifying safe libraries in the
-    // configuration.
-    let lib = unsafe { Library::new(filename) }.map_err(|e| {
-        let msg = format!("dlopen \"{}\" failed: {}", filename, e);
-        tracing::error!("{}", msg);
-        ExpandError::Failed { message: msg }
-    })?;
-
-    cache.insert(filename.to_owned(), lib);
-    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -276,6 +173,13 @@ fn load_library(filename: &str) -> Result<(), ExpandError> {
 ///
 /// Returns [`ExpandError::ForcedFail`] when the loaded function returns
 /// `FAIL_FORCED` status.
+///
+/// # Safety
+///
+/// This function contains **zero** `unsafe` code.  All dynamic library
+/// operations are delegated to the safe wrappers in `exim_ffi::dlfunc`,
+/// which is the only crate in the workspace permitted to contain `unsafe`
+/// code (per AAP §0.7.2).
 ///
 /// # C Equivalent
 ///
@@ -320,126 +224,49 @@ pub fn eval_dlfunc(args: &[String], evaluator: &mut Evaluator) -> Result<String,
     // ── Step 3: Load or retrieve the shared library from cache ──────────
     // expand.c lines 7170-7184:
     //   tree_search(dlobj_anchor, argv[0])  → if not found → dlopen → tree_insertnode
-    load_library(filename)?;
-
-    // Acquire the cache lock for symbol lookup and function call.
-    // The lock is held for the duration of the call because the `Symbol`
-    // lifetime is tied to the `Library` reference within the cache.
-    let cache = LIBRARY_CACHE.lock().map_err(|e| ExpandError::Failed {
-        message: format!("internal error: library cache lock poisoned: {e}"),
+    //
+    // Delegates to exim_ffi::dlfunc::load_library() which wraps dlopen()
+    // in the only crate permitted to contain unsafe code (AAP §0.7.2).
+    exim_ffi::dlfunc::load_library(filename).map_err(|e| {
+        let msg = format!("dlopen \"{}\" failed: {}", filename, e);
+        tracing::error!("{}", msg);
+        ExpandError::Failed { message: msg }
     })?;
 
-    let lib = cache
-        .get(filename.as_str())
-        .expect("load_library() succeeded so the entry must exist");
-
-    // ── Step 4: Look up the function symbol ─────────────────────────────
-    // expand.c lines 7189-7195:
+    // ── Step 4-5: Look up symbol, marshal args, and call the function ──
+    // expand.c lines 7189-7207:
     //   func = (exim_dlfunc_t *)dlsym(t->data.ptr, CS argv[1])
+    //   status = func(&result, argc - 2, &argv[2]);
     //
-    // Validate the function name does not contain interior null bytes,
-    // which would silently truncate the symbol name in the C layer.
-    if function_name.as_bytes().contains(&0u8) {
-        return Err(ExpandError::Failed {
-            message: format!(
-                "dlsym \"{}\" in \"{}\" failed: function name contains null byte",
-                function_name, filename,
-            ),
-        });
-    }
-
-    // SAFETY: `Library::get` wraps `dlsym(handle, symbol_name)`.
-    //
-    // Contracts upheld:
-    // 1. The library handle is valid — managed by the `LIBRARY_CACHE` and
-    //    guaranteed to exist by the `load_library()` call above.
-    // 2. The function name is a valid C symbol identifier originating from
-    //    the administrator's configuration (verified above to contain no
-    //    interior null bytes).
-    // 3. We assert the function conforms to the `exim_dlfunc_t` ABI:
-    //      int func(uschar **result, int argc, uschar *argv[])
-    //    This is the documented plugin contract — dlfunc plugins MUST
-    //    adhere to this signature.
-    let func: Symbol<'_, EximDlfuncFn> =
-        unsafe { lib.get(function_name.as_bytes()) }.map_err(|e| {
-            let msg = format!(
-                "dlsym \"{}\" in \"{}\" failed: {}",
-                function_name, filename, e,
-            );
+    // Delegates to exim_ffi::dlfunc::call_dlfunc() which wraps dlsym()
+    // and the function pointer call in safe APIs.
+    let func_arg_strings: Vec<String> = func_args.to_vec();
+    let call_result = exim_ffi::dlfunc::call_dlfunc(filename, function_name, &func_arg_strings)
+        .map_err(|e| {
+            let msg = match &e {
+                exim_ffi::dlfunc::DlfuncError::SymbolNotFound {
+                    symbol,
+                    path,
+                    detail,
+                } => format!("dlsym \"{}\" in \"{}\" failed: {}", symbol, path, detail),
+                exim_ffi::dlfunc::DlfuncError::NullInFunctionName(name) => format!(
+                    "dlsym \"{}\" in \"{}\" failed: function name contains null byte",
+                    name, filename,
+                ),
+                exim_ffi::dlfunc::DlfuncError::NullInArgument(arg) => {
+                    format!("dlfunc argument contains interior null byte: \"{}\"", arg)
+                }
+                other => format!("{}", other),
+            };
             tracing::error!("{}", msg);
             ExpandError::Failed { message: msg }
         })?;
 
-    // ── Step 5: Marshal arguments and call the function ──────────────────
-    // expand.c lines 7197-7207:
-    //   resetok = FALSE;                       ← store side-effects assumed
-    //   result = NULL;
-    //   for (argc = 0; argv[argc]; argc++) ;
-    //   status = func(&result, argc - 2, &argv[2]);
-
-    // Convert Rust String arguments to null-terminated C strings.
-    let c_args: Result<Vec<CString>, ExpandError> = func_args
-        .iter()
-        .map(|a| {
-            CString::new(a.as_bytes()).map_err(|_| ExpandError::Failed {
-                message: format!("dlfunc argument contains interior null byte: \"{}\"", a),
-            })
-        })
-        .collect();
-    let c_args = c_args?;
-
-    // Build the argv pointer array for the C function.
-    // Each pointer is valid for the lifetime of the `c_args` Vec.
-    let mut c_arg_ptrs: Vec<*mut c_char> =
-        c_args.iter().map(|cs| cs.as_ptr() as *mut c_char).collect();
-
-    let argc = c_arg_ptrs.len() as c_int;
-
-    // Result pointer — initialised to null.  The loaded function sets this
-    // to point at a result string on success (expand.c line 7205).
-    let mut result_ptr: *mut c_char = std::ptr::null_mut();
-
-    // SAFETY: We call the loaded C function through its `Symbol` pointer.
-    //
-    // Contracts upheld:
-    // - `result_ptr`: valid mutable pointer to a `*mut c_char` local variable.
-    // - `argc`: accurately reflects the number of pointers in `c_arg_ptrs`.
-    // - `c_arg_ptrs.as_mut_ptr()`: points to a contiguous array of valid,
-    //   null-terminated C string pointers owned by `c_args` (alive for the
-    //   duration of this call).
-    // - The function conforms to the `exim_dlfunc_t` ABI.
-    //
-    // expand.c line 7204: `resetok = FALSE` — the function may have side
-    // effects on memory allocations, so the store cannot be reset.  In the
-    // Rust memory model this is handled by the arena/ownership system; the
-    // Evaluator does not track `resetok` because Rust ownership semantics
-    // make manual store resets unnecessary.
-    let status_code = unsafe {
-        func(
-            &mut result_ptr as *mut *mut c_char,
-            argc,
-            c_arg_ptrs.as_mut_ptr(),
-        )
-    };
-
+    let status_code = call_result.status_code;
+    let result_string = call_result.result_string;
     let status = DlfuncStatus::from_c_int(status_code);
 
-    // ── Step 6: Read the result string from C memory ────────────────────
-    // expand.c line 7210:
-    //   expand_string_message = result ? result : US"(no message)";
-    // expand.c line 7219:
-    //   if (result) yield = string_cat(yield, result);
-    let result_string = if result_ptr.is_null() {
-        String::new()
-    } else {
-        // SAFETY: The loaded function set `result_ptr` to a valid,
-        // null-terminated C string.  We copy it into a Rust `String`
-        // immediately, creating no lifetime dependency on the C allocator.
-        let cstr = unsafe { CStr::from_ptr(result_ptr) };
-        cstr.to_string_lossy().into_owned()
-    };
-
-    // ── Step 7: Process status and return ───────────────────────────────
+    // ── Step 6: Process status and return ───────────────────────────────
     // expand.c lines 7208-7222 — status dispatch.
     //
     // The C logic:

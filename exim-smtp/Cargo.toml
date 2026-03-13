@@ -222,6 +222,13 @@ socks = []
 # every SMTP phase: CONNECT, HELO, MAIL, RCPT, DATA, AUTH, STARTTLS, VRFY,
 # EXPN, ETRN, ATRN, WELLKNOWN. Replaces calls to acl_check(ACL_WHERE_RCPT, ...)
 # and acl_check(ACL_WHERE_DATA, ...) found throughout smtp_in.c.
+# Configuration types — provides exim_config::types::ConfigContext which is the
+# canonical source of parsed configuration.  The SMTP crate defines its own
+# SmtpConfigContext with a `from_config()` bridge to convert from the canonical
+# type, avoiding type incompatibility between the core context system and the
+# SMTP session (see command_loop.rs header comment for details).
+exim-config = { path = "../exim-config" }
+
 exim-acl = { path = "../exim-acl" }
 
 # TLS abstraction — provides STARTTLS negotiation for both inbound SMTP

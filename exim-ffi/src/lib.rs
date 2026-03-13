@@ -121,6 +121,16 @@ pub mod signal;
 /// `exim-deliver/src/transport_dispatch.rs` and `exim-core/src/process.rs`.
 pub mod process;
 
+/// Safe wrappers around `libloading` for `${dlfunc}` dynamic function loading.
+///
+/// Centralises all `unsafe` code for `dlopen(3)` / `dlsym(3)` operations so
+/// that `exim-expand/src/dlfunc.rs` contains **zero** `unsafe` blocks.
+/// Per AAP §0.7.2, all `unsafe` code in the workspace MUST reside in this
+/// crate.
+///
+/// Source: `src/src/expand.c` (EITEM_DLFUNC handler, lines 7133-7222).
+pub mod dlfunc;
+
 // =============================================================================
 // Feature-gated C library FFI module declarations
 // =============================================================================
