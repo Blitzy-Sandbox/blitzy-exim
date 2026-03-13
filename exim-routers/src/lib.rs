@@ -30,5 +30,8 @@ pub mod helpers;
 
 // ── Feature-gated router modules ────────────────────────────────────────────
 
+#[cfg(feature = "router-queryprogram")]
+pub mod queryprogram;
+
 #[cfg(feature = "router-redirect")]
 pub mod redirect;
