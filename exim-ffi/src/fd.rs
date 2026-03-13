@@ -195,6 +195,80 @@ pub fn safe_setsockopt_int(
     }
 }
 
+/// Atomically duplicate a raw file descriptor to a specific target fd number.
+///
+/// This is a safe wrapper around `libc::dup2()`. It replicates the behavior of
+/// the C `force_fd()` function from `child.c` (lines 31–38): if `old_fd` equals
+/// `new_fd`, return immediately; otherwise close `new_fd`, duplicate `old_fd` to
+/// `new_fd`, and close `old_fd`.
+///
+/// # Preconditions (caller must guarantee)
+///
+/// 1. `old_fd` is a valid, open file descriptor.
+/// 2. `new_fd` is a valid fd number (typically 0, 1, or 2 for stdin/stdout/stderr).
+/// 3. The caller is in a forked child process about to `exec()`, so fd table
+///    manipulation is expected and safe.
+///
+/// # Returns
+///
+/// `Ok(())` on success, `Err` with errno if `dup2()` fails.
+pub fn safe_force_fd(old_fd: RawFd, new_fd: RawFd) -> nix::Result<()> {
+    if old_fd == new_fd {
+        return Ok(());
+    }
+    // SAFETY: Both old_fd and new_fd are valid file descriptors in a forked
+    // child process. dup2() atomically closes new_fd if open, then duplicates
+    // old_fd to new_fd. The subsequent close(old_fd) releases the original.
+    // This is called exclusively in child processes after fork() and before
+    // exec(), matching the C child.c force_fd() pattern.
+    let res = unsafe { libc::dup2(old_fd, new_fd) };
+    nix::errno::Errno::result(res)?;
+    let res2 = unsafe { libc::close(old_fd) };
+    nix::errno::Errno::result(res2).map(drop)
+}
+
+/// Redirect stdin, stdout, and stderr to `/dev/null` if they are not open.
+///
+/// Ensures that file descriptors 0, 1, and 2 exist by opening `/dev/null` for
+/// any that are closed. This prevents accidental data leakage when a child
+/// process opens files and gets fd 0/1/2.
+///
+/// Replaces the C `exim_nullstd()` function pattern.
+///
+/// # Preconditions (caller must guarantee)
+///
+/// 1. The process is a forked child about to exec.
+///
+/// # Returns
+///
+/// `Ok(())` on success, `Err` if `/dev/null` cannot be opened.
+pub fn safe_nullstd() -> nix::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: We open /dev/null safely, then use dup2 to fill any missing
+    // standard fds. This is called in child processes after fork() and before
+    // exec(), matching the C exim_nullstd() pattern from child.c.
+    for target_fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // Check if the fd is open by trying fcntl F_GETFD
+        let flags = unsafe { libc::fcntl(target_fd, libc::F_GETFD) };
+        if flags < 0 {
+            // fd is not open — open /dev/null and dup2 it
+            let devnull = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .map_err(|_| nix::errno::Errno::ENOENT)?;
+            let raw = devnull.as_raw_fd();
+            if raw != target_fd {
+                let res = unsafe { libc::dup2(raw, target_fd) };
+                nix::errno::Errno::result(res)?;
+            }
+            // devnull drops here, closing the original fd
+            // (the dup2'd copy remains open at target_fd)
+        }
+    }
+    Ok(())
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod context;
+pub mod process;
 pub mod signal;
 
 fn main() {
