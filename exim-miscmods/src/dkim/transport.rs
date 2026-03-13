@@ -726,16 +726,44 @@ fn arc_sign(signspec: &str, sig_headers: &str) -> Result<String, TransportSignEr
     // Call the crate-local arc module directly since it's in the same crate.
     // The C code uses function-table indirection because misc modules are
     // loaded dynamically; in Rust, the feature flag handles this at compile time.
-    match crate::arc::arc_sign(&crate::arc::ArcState::default()) {
+    //
+    // Parse the signspec to extract domain:selector:keyfile, then build
+    // ArcSignOptions and ArcSigningContext before signing.
+    let parts: Vec<&str> = signspec.splitn(3, ':').collect();
+    if parts.len() < 3 {
+        return Err(TransportSignError::ArcSignFailed(
+            "bad ARC signspec: expected domain:selector:keyfile".to_string(),
+        ));
+    }
+    let arc_opts = crate::arc::ArcSignOptions {
+        domain: parts[0].to_string(),
+        selector: parts[1].to_string(),
+        private_key: parts[2].to_string(),
+        ..Default::default()
+    };
+
+    // Build signing context from existing empty header list (headers are
+    // accumulated separately during the transport pipeline).
+    let arc_ctx = match crate::arc::arc_sign_init(&arc_opts, &[]) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            let msg = format!("ARC sign_init failed: {}", e);
+            tracing::error!("{}", msg);
+            return Err(TransportSignError::ArcSignFailed(msg));
+        }
+    };
+
+    match crate::arc::arc_sign(&arc_ctx, "", "0.0.0.0") {
         Ok(arc_headers) => {
             if arc_headers.is_empty() {
                 tracing::warn!("ARC signing returned empty headers");
                 Ok(sig_headers.to_string())
             } else {
                 // Prepend ARC headers before DKIM headers
-                let combined = format!("{}{}", arc_headers, sig_headers);
+                let arc_combined = arc_headers.join("");
+                let combined = format!("{}{}", arc_combined, sig_headers);
                 tracing::debug!(
-                    arc_header_len = arc_headers.len(),
+                    arc_header_count = arc_headers.len(),
                     combined_len = combined.len(),
                     "dkt_arc_sign: ARC headers prepended"
                 );
@@ -743,7 +771,7 @@ fn arc_sign(signspec: &str, sig_headers: &str) -> Result<String, TransportSignEr
             }
         }
         Err(arc_err) => {
-            let msg = format!("failed to find arc module: {}", arc_err);
+            let msg = format!("failed to sign ARC: {}", arc_err);
             tracing::error!(error = %arc_err, "dkt_arc_sign: {}", msg);
             Err(TransportSignError::ArcSignFailed(msg))
         }

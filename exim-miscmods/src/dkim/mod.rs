@@ -538,10 +538,10 @@ pub fn query_dns_txt(name: &str, dns: &DnsResolver) -> Result<Tainted<String>, D
 #[instrument(level = "debug", skip(dns))]
 pub fn parse_dns_pubkey(dnsname: &str, dns: &DnsResolver) -> Result<(Vec<u8>, String), DkimError> {
     let tainted_record = query_dns_txt(dnsname, dns)?;
-    let record_text = tainted_record.inner();
+    let record_text = tainted_record.into_inner();
 
     // Parse the TXT record into a PdkimPubkey structure
-    let pubkey = pdkim::parse_pubkey_record(record_text).ok_or_else(|| {
+    let pubkey = pdkim::parse_pubkey_record(&record_text).ok_or_else(|| {
         DkimError::VerificationError(format!(
             "failed to parse DKIM public key record for {dnsname}"
         ))
@@ -589,11 +589,14 @@ pub fn sig_verify(
     use pdkim::signing;
 
     // Initialize a verification context with the public key
-    let mut vctx = signing::verify_init(pubkey, KeyType::Rsa, signing::KeyFormat::Der)
+    let (mut vctx, _key_bits) = signing::verify_init(pubkey, KeyType::Rsa, signing::KeyFormat::Der)
         .map_err(|e| DkimError::VerificationError(format!("verify_init failed: {e}")))?;
 
-    // Perform the verification
-    let result = signing::verify(&mut vctx, data_hash, sighash)
+    // Feed the data hash into the verification context
+    vctx.data_append(data_hash);
+
+    // Perform the verification: signature bytes and hash algorithm
+    let result = signing::verify(&mut vctx, sighash, hash)
         .map_err(|e| DkimError::VerificationError(format!("verify failed: {e}")))?;
 
     if result {
