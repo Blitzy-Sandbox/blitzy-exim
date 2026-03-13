@@ -42,6 +42,15 @@ pub mod expand_data;
 /// the name is not tainted, and looks up the transport instance configuration.
 pub mod get_transport;
 
+/// Header add/remove processing for router drivers.
+///
+/// Translates `rf_get_munge_headers()` from C `src/src/routers/rf_get_munge_headers.c`.
+/// Expands `headers_add` (newline-separated list → header chain) and
+/// `headers_remove` (colon-separated list → aggregated string) from router
+/// configuration. Handles forced failure (ignore) and expansion error (DEFER)
+/// paths for both options.
+pub mod get_munge_headers;
+
 /// UID/GID resolution and assignment helpers.
 ///
 /// Translates `rf_get_ugid()` and `rf_set_ugid()` from C `src/src/routers/rf_get_ugid.c`
@@ -60,6 +69,11 @@ pub use expand_data::ExpandDataError;
 // Re-export get_transport function and error type for ergonomic access.
 pub use get_transport::get_transport;
 pub use get_transport::GetTransportError;
+
+// Re-export get_munge_headers function and types for ergonomic access.
+pub use get_munge_headers::get_munge_headers;
+pub use get_munge_headers::GetMungeHeadersError;
+pub use get_munge_headers::MungeHeadersResult;
 
 // Re-export primary types from ugid for ergonomic access by router drivers.
 pub use ugid::GetUgidError;
