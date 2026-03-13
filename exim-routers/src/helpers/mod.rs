@@ -35,6 +35,13 @@ pub mod change_domain;
 /// and other expansion failures → DEFER with formatted error message.
 pub mod expand_data;
 
+/// Transport resolution by name for router drivers.
+///
+/// Translates `rf_get_transport()` from C `src/src/routers/rf_get_transport.c`.
+/// Resolves a transport by name (with optional string expansion), validates that
+/// the name is not tainted, and looks up the transport instance configuration.
+pub mod get_transport;
+
 /// UID/GID resolution and assignment helpers.
 ///
 /// Translates `rf_get_ugid()` and `rf_set_ugid()` from C `src/src/routers/rf_get_ugid.c`
@@ -49,6 +56,10 @@ pub use change_domain::change_domain;
 // Re-export expand_data function and error type for ergonomic access.
 pub use expand_data::expand_data;
 pub use expand_data::ExpandDataError;
+
+// Re-export get_transport function and error type for ergonomic access.
+pub use get_transport::get_transport;
+pub use get_transport::GetTransportError;
 
 // Re-export primary types from ugid for ergonomic access by router drivers.
 pub use ugid::GetUgidError;
