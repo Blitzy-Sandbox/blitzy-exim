@@ -36,6 +36,12 @@ pub mod variables;
 /// CSA verification, ratelimit, and all per-condition evaluation semantics.
 pub mod conditions;
 
+/// ACL evaluation core engine: [`AclBlock`](engine::AclBlock),
+/// [`AclConditionBlock`](engine::AclConditionBlock), [`acl_read`](engine::acl_read),
+/// [`acl_check_internal`](engine::acl_check_internal),
+/// [`acl_check_wargs`](engine::acl_check_wargs), and parser/evaluation machinery.
+pub mod engine;
+
 // Re-export key variable types for convenient access by dependent crates.
 pub use variables::{AclVarError, AclVarScope, AclVarStore, AclVariable};
 
