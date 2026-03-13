@@ -31,7 +31,13 @@
 //! the `exim-ffi` crate.
 
 // ── Crate-level lint configuration ──────────────────────────────────────
-#![forbid(unsafe_code)]
+//
+// `deny(unsafe_code)` prevents unsafe code in all modules by default.
+// The `dlfunc` module (feature-gated) overrides this with `allow(unsafe_code)`
+// because `libloading` 0.9's `Library::new()` and `Library::get()` are both
+// `unsafe fn`.  This is the minimum relaxation required — every other module
+// in the crate remains protected by `deny`.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![deny(clippy::all)]
 
