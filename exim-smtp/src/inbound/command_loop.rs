@@ -255,6 +255,14 @@ pub struct ConfigContext {
     #[cfg(feature = "xclient")]
     pub xclient_advertise_hosts: Option<String>,
 
+    // ATRN / ODMR settings (RFC 2645)
+    /// ACL for SMTP ATRN command. When `None`, ATRN is not advertised.
+    pub acl_smtp_atrn: Option<String>,
+    /// Colon-separated list of domains to relay via ATRN.
+    pub atrn_domains: Option<String>,
+    /// Remote ATRN host to connect to (customer mode only).
+    pub atrn_host: Option<String>,
+
     // Submission mode settings
     pub submission_mode: bool,
     pub submission_domain: Option<String>,
@@ -547,7 +555,8 @@ pub struct SmtpSession<'ctx, S> {
 
     // ── SMTP I/O State ──
     /// Buffered I/O state for the SMTP connection.
-    io: SmtpIoState,
+    /// `pub(crate)` so that the ATRN module can access fd state for role swap.
+    pub(crate) io: SmtpIoState,
 
     /// BDAT/chunking protocol state.
     chunking_ctx: ChunkingContext,
@@ -2973,7 +2982,7 @@ fn strip_response_code(response: &str) -> &str {
 /// # Returns
 ///
 /// (AclResult, user_message, log_message)
-fn run_acl_check(
+pub(crate) fn run_acl_check(
     where_phase: AclWhere,
     acl_text: Option<&str>,
     recipient: Option<&str>,

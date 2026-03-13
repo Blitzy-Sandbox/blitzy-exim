@@ -227,6 +227,58 @@ pub fn safe_force_fd(old_fd: RawFd, new_fd: RawFd) -> nix::Result<()> {
     nix::errno::Errno::result(res2).map(drop)
 }
 
+/// Duplicate `old_fd` to `new_fd` via `dup2(2)` without closing `old_fd`.
+///
+/// Unlike [`safe_force_fd`], this function does **not** close `old_fd` after
+/// the duplication.  This is needed when both file descriptors should remain
+/// open — for example, making stdout point to the same socket as stdin during
+/// ATRN connection flipping (`dup2(0, 1)`).
+///
+/// # Preconditions (caller must guarantee)
+///
+/// 1. `old_fd` is a valid, open file descriptor.
+/// 2. `new_fd` is a valid fd number (0, 1, 2, or an open fd).
+///
+/// # Safety justification
+///
+/// The `unsafe` block wraps `libc::dup2()`, which is an inherently unsafe
+/// system call operating on raw fd numbers.  Callers in the exim workspace
+/// never use `unsafe` — they call this safe wrapper instead (AAP §0.7.2).
+///
+/// # Returns
+///
+/// `Ok(())` on success, `Err` with errno if `dup2()` fails.
+pub fn safe_dup2(old_fd: RawFd, new_fd: RawFd) -> nix::Result<()> {
+    if old_fd == new_fd {
+        return Ok(());
+    }
+    // SAFETY: Both old_fd and new_fd are valid file descriptors.  dup2()
+    // atomically closes new_fd if it is currently open, then makes new_fd
+    // a duplicate of old_fd.  old_fd is NOT closed — both remain valid.
+    let res = unsafe { libc::dup2(old_fd, new_fd) };
+    nix::errno::Errno::result(res).map(drop)
+}
+
+/// Close a raw file descriptor.
+///
+/// Wraps `libc::close()` in a safe interface so that callers outside the
+/// `exim-ffi` crate never need to write `unsafe` themselves (AAP §0.7.2).
+///
+/// # Preconditions (caller must guarantee)
+///
+/// 1. `fd` is a valid, open file descriptor.
+/// 2. No other code holds a borrow of this fd that expects it to remain open.
+///
+/// # Returns
+///
+/// `Ok(())` on success, `Err` with errno if `close()` fails.
+pub fn safe_close(fd: RawFd) -> nix::Result<()> {
+    // SAFETY: fd is a valid open file descriptor. close() releases the fd
+    // from the process's fd table. Callers guarantee no other borrows.
+    let res = unsafe { libc::close(fd) };
+    nix::errno::Errno::result(res).map(drop)
+}
+
 /// Redirect stdin, stdout, and stderr to `/dev/null` if they are not open.
 ///
 /// Ensures that file descriptors 0, 1, and 2 exist by opening `/dev/null` for

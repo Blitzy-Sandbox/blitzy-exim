@@ -2,14 +2,16 @@
 //!
 //! Provides the SMTP command state machine, session lifecycle management,
 //! custom buffered I/O, pipelining enforcement, CHUNKING/BDAT support,
-//! PRDR (feature-gated), and ATRN/ODMR extension.
+//! PRDR (feature-gated), and ATRN/ODMR extension (RFC 2645).
 //!
 //! # Submodules
 //!
 //! - [`pipelining`] — PIPELINING support and custom buffered I/O
 //! - [`chunking`] — CHUNKING/BDAT support (RFC 3030)
 //! - [`prdr`] — Per-Recipient Data Response (feature-gated behind `prdr`)
+//! - [`atrn`] — ATRN/ODMR extension (RFC 2645) for on-demand mail relay
 
+pub mod atrn;
 pub mod chunking;
 pub mod command_loop;
 pub mod pipelining;
