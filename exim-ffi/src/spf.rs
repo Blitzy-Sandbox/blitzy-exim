@@ -124,7 +124,7 @@ fn spf_ffi(op: SpfFfi) -> SpfFfiResult {
     unsafe {
         match op {
             SpfFfi::ServerNew { dns_type, debug } => {
-                SpfFfiResult::Ptr(ffi::SPF_server_new(dns_type, debug) as *mut libc::c_void)
+                SpfFfiResult::Ptr(ffi::SPF_server_new(dns_type as u32, debug) as *mut libc::c_void)
             }
             SpfFfi::RequestNew { server } => {
                 SpfFfiResult::Ptr(ffi::SPF_request_new(server) as *mut libc::c_void)
@@ -142,28 +142,30 @@ fn spf_ffi(op: SpfFfi) -> SpfFfiResult {
                 SpfFfiResult::Done
             }
             SpfFfi::SetIpv4 { req, ip } => {
-                SpfFfiResult::Code(ffi::SPF_request_set_ipv4_str(req, ip))
+                SpfFfiResult::Code(ffi::SPF_request_set_ipv4_str(req, ip) as libc::c_int)
             }
             SpfFfi::SetIpv6 { req, ip } => {
-                SpfFfiResult::Code(ffi::SPF_request_set_ipv6_str(req, ip))
+                SpfFfiResult::Code(ffi::SPF_request_set_ipv6_str(req, ip) as libc::c_int)
             }
             SpfFfi::SetHeloDom { req, dom } => {
-                SpfFfiResult::Code(ffi::SPF_request_set_helo_dom(req, dom))
+                SpfFfiResult::Code(ffi::SPF_request_set_helo_dom(req, dom) as libc::c_int)
             }
             SpfFfi::SetEnvFrom { req, sender } => {
-                SpfFfiResult::Code(ffi::SPF_request_set_env_from(req, sender))
+                SpfFfiResult::Code(ffi::SPF_request_set_env_from(req, sender) as libc::c_int)
             }
             SpfFfi::QueryMailfrom { req, resp } => {
-                SpfFfiResult::Code(ffi::SPF_request_query_mailfrom(req, resp))
+                SpfFfiResult::Code(ffi::SPF_request_query_mailfrom(req, resp) as libc::c_int)
             }
             SpfFfi::QueryRcptto { req, resp, rcpt } => {
-                SpfFfiResult::Code(ffi::SPF_request_query_rcptto(req, resp, rcpt))
+                SpfFfiResult::Code(ffi::SPF_request_query_rcptto(req, resp, rcpt) as libc::c_int)
             }
             SpfFfi::RequestFree { req } => {
                 ffi::SPF_request_free(req);
                 SpfFfiResult::Done
             }
-            SpfFfi::ResponseResult { resp } => SpfFfiResult::Code(ffi::SPF_response_result(resp)),
+            SpfFfi::ResponseResult { resp } => {
+                SpfFfiResult::Code(ffi::SPF_response_result(resp) as libc::c_int)
+            }
             SpfFfi::ResultStr { resp } => {
                 let code = ffi::SPF_response_result(resp);
                 let c_str = ffi::SPF_strresult(code);
@@ -425,7 +427,7 @@ impl SpfServer {
     pub fn new() -> Result<Self, SpfError> {
         // Dispatch: ServerNew — creates SPF server with DNS caching.
         let server = match spf_ffi(SpfFfi::ServerNew {
-            dns_type: ffi::SPF_server_dnstype_enum_SPF_DNS_CACHE,
+            dns_type: ffi::SPF_server_dnstype_enum_SPF_DNS_CACHE as libc::c_int,
             debug: 0,
         }) {
             SpfFfiResult::Ptr(p) => p as *mut ffi::SPF_server_t,
