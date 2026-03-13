@@ -11,6 +11,7 @@
 //! - [`prdr`] — Per-Recipient Data Response (feature-gated behind `prdr`)
 
 pub mod chunking;
+pub mod command_loop;
 pub mod pipelining;
 
 /// Per-Recipient Data Response (PRDR) support.
