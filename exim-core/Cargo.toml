@@ -180,6 +180,10 @@ tracing-subscriber = { workspace = true }
 # for privilege management, and user/group lookup.
 nix = { workspace = true }
 
+# Rust-native regex for message ID validation in queue management and
+# selective delivery filtering by sender/recipient patterns.
+regex = { workspace = true }
+
 # C type definitions and system call bindings — version 0.2.183 per AAP §0.6.1.
 # Required for low-level POSIX operations: pid_t, uid_t, gid_t types,
 # signal constants, socket address structures, and file mode constants.

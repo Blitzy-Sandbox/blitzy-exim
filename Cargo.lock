@@ -724,6 +724,7 @@ dependencies = [
  "libc",
  "log",
  "nix",
+ "regex",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",

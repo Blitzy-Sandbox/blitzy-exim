@@ -7,6 +7,7 @@ pub mod cli;
 pub mod context;
 pub mod modes;
 pub mod process;
+pub mod queue_runner;
 pub mod signal;
 
 fn main() {
