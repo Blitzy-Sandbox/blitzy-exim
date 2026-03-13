@@ -120,3 +120,17 @@ pub use get_errors_address::get_errors_address;
 pub use get_errors_address::ErrorsAddressResult;
 pub use get_errors_address::GetErrorsAddressError;
 pub use get_errors_address::VerifyMode;
+
+/// Host list IP address lookup for router drivers.
+///
+/// Translates `rf_lookup_hostlist()` from C `src/src/routers/rf_lookup_hostlist.c`.
+/// Resolves IP addresses for all entries in a router's host list, handling MX
+/// shorthand (`/MX`), port specifications, DNS failure policies, `pass_on_timeout`,
+/// and self-reference detection with `rf_self_action` dispatch.
+pub mod lookup_hostlist;
+
+// Re-export lookup_hostlist function and types for ergonomic access.
+pub use lookup_hostlist::lookup_hostlist;
+pub use lookup_hostlist::HostFindFailedPolicy;
+pub use lookup_hostlist::LookupHostlistError;
+pub use lookup_hostlist::WhichLists;
