@@ -30,6 +30,9 @@ pub mod helpers;
 
 // ── Feature-gated router modules ────────────────────────────────────────────
 
+#[cfg(feature = "router-manualroute")]
+pub mod manualroute;
+
 #[cfg(feature = "router-queryprogram")]
 pub mod queryprogram;
 
