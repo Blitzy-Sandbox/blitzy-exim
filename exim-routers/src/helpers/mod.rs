@@ -21,17 +21,34 @@
 //
 // This file contains ZERO unsafe code (per AAP §0.7.2).
 
+/// Domain rewriting helper for router drivers.
+///
+/// Translates `rf_change_domain()` from C `src/src/routers/rf_change_domain.c`.
+/// Creates child addresses with a new domain, preserving propagated properties,
+/// and optionally rewrites message headers.
+pub mod change_domain;
+
+/// String expansion wrapper for router drivers.
+///
+/// Translates `rf_expand_data()` from C `src/src/routers/rf_expand_data.c`.
+/// Thin wrapper around `expand_string()` that maps forced failure → DECLINE
+/// and other expansion failures → DEFER with formatted error message.
+pub mod expand_data;
+
 /// UID/GID resolution and assignment helpers.
 ///
 /// Translates `rf_get_ugid()` and `rf_set_ugid()` from C `src/src/routers/rf_get_ugid.c`
 /// and `src/src/routers/rf_set_ugid.c`. These functions handle resolving uid/gid
 /// values for router instances (from fixed config values or expandable strings)
 /// and copying them onto address items for use by local transports.
-pub mod change_domain;
 pub mod ugid;
 
 // Re-export the change_domain function for ergonomic access by router drivers.
 pub use change_domain::change_domain;
+
+// Re-export expand_data function and error type for ergonomic access.
+pub use expand_data::expand_data;
+pub use expand_data::ExpandDataError;
 
 // Re-export primary types from ugid for ergonomic access by router drivers.
 pub use ugid::GetUgidError;
