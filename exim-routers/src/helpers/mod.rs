@@ -75,6 +75,21 @@ pub use get_munge_headers::get_munge_headers;
 pub use get_munge_headers::GetMungeHeadersError;
 pub use get_munge_headers::MungeHeadersResult;
 
+/// Errors-to address resolution for router drivers.
+///
+/// Translates `rf_get_errors_address()` from C `src/src/routers/rf_get_errors_address.c`.
+/// Expands and verifies the router's `errors_to` setting to determine the
+/// bounce/error recipient address.  Handles forced failure (ignore), empty
+/// expansion (ignore errors), verify mode (skip verification), and address
+/// verification (format validation) paths.
+pub mod get_errors_address;
+
 // Re-export primary types from ugid for ergonomic access by router drivers.
 pub use ugid::GetUgidError;
 pub use ugid::UgidBlock;
+
+// Re-export get_errors_address function and types for ergonomic access.
+pub use get_errors_address::get_errors_address;
+pub use get_errors_address::ErrorsAddressResult;
+pub use get_errors_address::GetErrorsAddressError;
+pub use get_errors_address::VerifyMode;
