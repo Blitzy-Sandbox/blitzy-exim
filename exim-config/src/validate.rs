@@ -675,28 +675,24 @@ pub fn print_option(
         OptionType::Uid => {
             // C lines 2734–2742: print UID with name lookup via getpwuid.
             // Resolve UID option to a string: try name resolution first.
+            // Always print the resolved name — uid 0 (root) is a valid value
+            // for options like exim_user.
             let uid_val = resolve_int_option(name, ctx) as u32;
             if !no_labels {
                 write!(out, "{name} = ")?;
             }
-            if uid_val == 0 && !name.contains("uid") {
-                writeln!(out)?;
-            } else {
-                writeln!(out, "{}", resolve_uid_name(uid_val))?;
-            }
+            writeln!(out, "{}", resolve_uid_name(uid_val))?;
         }
 
         OptionType::Gid => {
             // C lines 2766–2774: print GID with name lookup via getgrgid.
+            // Always print the resolved name — gid 0 (root) is a valid value
+            // for options like exim_group.
             let gid_val = resolve_int_option(name, ctx) as u32;
             if !no_labels {
                 write!(out, "{name} = ")?;
             }
-            if gid_val == 0 && !name.contains("gid") {
-                writeln!(out)?;
-            } else {
-                writeln!(out, "{}", resolve_gid_name(gid_val))?;
-            }
+            writeln!(out, "{}", resolve_gid_name(gid_val))?;
         }
 
         OptionType::UidList => {

@@ -59,6 +59,16 @@ use exim_config::Config;
 use exim_deliver::DeliveryResult;
 use exim_store::MessageArena;
 
+// Force the linker to include driver crate object files so that
+// `inventory::submit!` static registrations survive dead-code elimination.
+// Without these `extern crate` declarations, Cargo/LLD may strip the driver
+// crates entirely because main.rs has no direct symbol references to them,
+// resulting in an empty driver registry at runtime (QA Issue 1).
+extern crate exim_auths;
+extern crate exim_lookups;
+extern crate exim_routers;
+extern crate exim_transports;
+
 // =============================================================================
 // Imports — External crates
 // =============================================================================
@@ -117,24 +127,57 @@ const SMTP_RESPONSE_CODE_REGEX: &str = r"^[0-9]{3}";
 /// - `EXIT_FAILURE` (1) for errors
 /// - `2` for specific modes (e.g., delivery with no attempt)
 fn main() -> ExitCode {
-    // Step 1: Initialise basic logging subscriber.
-    // Must happen first so all subsequent operations can log.
-    tracing_subscriber::fmt::init();
-
-    // Step 2: Detect symlink-based invocation.
-    // argv[0] may be "mailq", "rmail", "rsmtp", "runq", or "newaliases".
+    // Step 1: Parse command-line arguments FIRST (before tracing init)
+    // so we can check whether -d (debug) was specified.  Tracing output
+    // must go to stderr and only when -d is active, matching C Exim's
+    // behaviour where debug output is written to stderr and regular
+    // user-facing output is on stdout (AAP §0.7.1).
     let symlink_name = cli::detect_symlink_invocation();
+
+    let mut cli_args = cli::parse_args();
+
+    // Apply symlink-based overrides early.
+    if let Some(ref name) = symlink_name {
+        cli_args.called_as = Some(name.clone());
+    }
+
+    // Step 2: Initialise tracing subscriber.
+    // - Output goes to stderr (never stdout) to avoid polluting parseable
+    //   output from -bV, -bP, -be, -bp, -bs, and the test harness.
+    // - Only enabled when -d debug flag is specified, matching C Exim's
+    //   behaviour where debug output is suppressed unless explicitly
+    //   requested.
+    // - ANSI colour codes are disabled for clean machine-parseable output.
+    if cli_args.debug_selector.is_some() {
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+        fmt::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .init();
+    } else {
+        // No -d flag: install a minimal subscriber that discards all
+        // tracing events.  This prevents any tracing output from
+        // reaching stdout or stderr in normal operation.
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::new("off");
+        fmt::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .init();
+    }
+
+    // Step 3 (moved up): symlink invocation already detected above.
     if let Some(ref name) = symlink_name {
         debug!(invoked_as = %name, "symlink invocation detected");
     }
 
-    // Step 3: Parse command-line arguments.
-    let mut cli_args = cli::parse_args();
-
-    // Apply symlink-based overrides to parsed arguments.
-    if let Some(ref name) = symlink_name {
-        cli_args.called_as = Some(name.clone());
-    }
+    // CLI args already parsed above (step 1).
+    // (Do NOT re-parse — just continue with cli_args.)
 
     // Step 4: Determine the operational mode from parsed arguments.
     let mode = cli::determine_mode(&cli_args);
@@ -267,6 +310,9 @@ fn dispatch_mode(
             info!(foreground, "entering daemon mode");
             server_ctx.background_daemon = !foreground;
             server_ctx.daemon_listen = true;
+            // Pass -oX override to daemon context so that
+            // bind_listening_sockets() can use it instead of config values.
+            server_ctx.override_local_interfaces = cli_args.override_local_interfaces.clone();
             signal::install_daemon_signals();
             // daemon_go() is a diverging function (-> !)
             daemon::daemon_go(server_ctx, frozen_config);
@@ -734,8 +780,39 @@ fn handle_smtp_input(
         &mut session_state,
     ) {
         Ok(true) => {
-            info!("SMTP session completed successfully");
-            ExitCode::SUCCESS
+            // Session initialization succeeded — now enter the SMTP command
+            // loop on stdin/stdout.  In -bs mode, stdin (fd 0) is the inbound
+            // SMTP stream and stdout (fd 1) is the outbound response stream.
+            //
+            // This fixes QA Issue 6: "-bs mode produces no SMTP output".
+            // Previously, smtp_start_session() returned without entering
+            // the command loop, so no SMTP commands were processed.
+            use std::os::unix::io::AsRawFd;
+            let in_fd = std::io::stdin().as_raw_fd();
+            let out_fd = std::io::stdout().as_raw_fd();
+
+            let result = exim_smtp::inbound::command_loop::smtp_setup_msg(
+                &smtp_server_ctx,
+                &mut smtp_msg_ctx,
+                &smtp_config_ctx,
+                in_fd,
+                out_fd,
+            );
+
+            match result {
+                exim_smtp::inbound::command_loop::SmtpSetupResult::Done => {
+                    info!("SMTP session completed successfully");
+                    ExitCode::SUCCESS
+                }
+                exim_smtp::inbound::command_loop::SmtpSetupResult::Yield => {
+                    info!("SMTP session yielded for message body");
+                    ExitCode::SUCCESS
+                }
+                exim_smtp::inbound::command_loop::SmtpSetupResult::Error => {
+                    error!("SMTP session ended with error");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Ok(false) => {
             info!("SMTP session ended without completing");

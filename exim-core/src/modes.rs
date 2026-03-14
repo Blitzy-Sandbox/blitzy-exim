@@ -446,7 +446,9 @@ pub fn expansion_test_mode(
         }
     }
 
-    let _ = (ctx, config); // Satisfy usage — context needed for variable access.
+    // Build an expansion context populated with static variable values
+    // so that expressions like ${version_number} resolve correctly.
+    let expand_ctx = build_expand_context(ctx, config);
 
     // Read expansion strings from stdin, one per line.
     // Each line is expanded independently and the result is printed.
@@ -457,7 +459,7 @@ pub fn expansion_test_mode(
     for line_result in reader.lines() {
         match line_result {
             Ok(line) => {
-                expansion_test_line(&line, &mut stdout);
+                expansion_test_line_ctx(&line, &expand_ctx, &mut stdout);
             }
             Err(_) => break,
         }
@@ -490,6 +492,72 @@ fn expansion_test_line<W: Write>(line: &str, out: &mut W) {
             let _ = writeln!(out, "Failed: {e}");
         }
     }
+}
+
+/// Expand a single test line using an explicit expansion context.
+///
+/// This is the context-aware variant used by `-be` mode so that static
+/// variables like `$version_number`, `$primary_hostname`, `$pid`, etc.
+/// resolve to their actual values instead of empty strings.
+fn expansion_test_line_ctx<W: Write>(
+    line: &str,
+    ctx: &exim_expand::variables::ExpandContext,
+    out: &mut W,
+) {
+    // Skip blank lines (matching C behaviour).
+    if line.trim().is_empty() {
+        return;
+    }
+
+    match exim_expand::expand_string_with_context(line, ctx) {
+        Ok(expanded) => {
+            let _ = writeln!(out, "{expanded}");
+        }
+        Err(exim_expand::ExpandError::ForcedFail) => {
+            let _ = writeln!(out, "Forced failure");
+        }
+        Err(exim_expand::ExpandError::Failed { message }) => {
+            let _ = writeln!(out, "Failed: {message}");
+        }
+        Err(e) => {
+            let _ = writeln!(out, "Failed: {e}");
+        }
+    }
+}
+
+/// Build an expansion context populated with static variable values.
+///
+/// Initializes variables like `$version_number`, `$primary_hostname`,
+/// `$pid`, `$tod_epoch`, etc. from the server context and configuration.
+/// This is required for `-be` expansion testing mode where these
+/// variables must resolve to their actual values.
+fn build_expand_context(
+    ctx: &ServerContext,
+    config: &Arc<exim_config::Config>,
+) -> exim_expand::variables::ExpandContext {
+    use exim_store::taint::Clean;
+
+    let mut expand_ctx = exim_expand::variables::ExpandContext::new();
+
+    // Version information.
+    expand_ctx.exim_version = Clean::new(EXIM_VERSION.to_string());
+    expand_ctx.compile_number = Clean::new(EXIM_BUILD_NUMBER.to_string());
+    expand_ctx.compile_date = Clean::new(build_date_string());
+
+    // Hostname from config.
+    expand_ctx.primary_hostname = Clean::new(ctx.primary_hostname.clone());
+
+    // Process identity.
+    expand_ctx.pid = std::process::id() as i32;
+    expand_ctx.exim_uid = nix::unistd::getuid().as_raw();
+    expand_ctx.exim_gid = nix::unistd::getgid().as_raw();
+
+    // Spool and qualify settings.
+    expand_ctx.spool_directory = Clean::new(config_spool_directory(config));
+    expand_ctx.qualify_domain = Clean::new(ctx.primary_hostname.clone());
+    expand_ctx.qualify_recipient = Clean::new(ctx.primary_hostname.clone());
+
+    expand_ctx
 }
 
 // ---------------------------------------------------------------------------
@@ -686,7 +754,25 @@ pub fn config_check_mode(
     }
 
     if options.is_empty() {
-        // No specific options requested — just validate.
+        // No specific options requested — print all main-section config options.
+        // C Exim `-bP` with no arguments behaves like `-bP all`: iterate over
+        // every main option table entry and print `option = value`.
+        // Delegate to `print_config_option("all", ...)` which handles this
+        // (readconf.c lines 2951-2960).
+        let store = exim_config::validate::ConfigLineStore::default();
+        let mut stdout = io::stdout();
+        if let Err(e) = exim_config::print_config_option(
+            "all",
+            None,
+            &config_ctx,
+            false, // admin
+            false, // no_labels
+            &store,
+            &mut stdout,
+        ) {
+            eprintln!("exim: error printing config: {e}");
+            return ExitCode::FAILURE;
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -761,27 +847,43 @@ pub fn version_mode() -> ExitCode {
     print_supported_features();
 
     // Print driver listings from the registry.
+    // Always print the header even when no drivers are registered, matching
+    // C Exim's -bV output format which always shows these sections.
     let lookup_line = exim_drivers::DriverRegistry::lookup_show_supported();
-    if !lookup_line.is_empty() {
+    if lookup_line.is_empty() {
+        println!("Lookups (built-in): (none)");
+    } else {
         println!("{lookup_line}");
     }
 
     let auth_line = exim_drivers::DriverRegistry::auth_show_supported();
-    if !auth_line.is_empty() {
+    if auth_line.is_empty() {
+        println!("Authenticators: (none)");
+    } else {
         println!("{auth_line}");
     }
 
     let router_line = exim_drivers::DriverRegistry::route_show_supported();
-    if !router_line.is_empty() {
+    if router_line.is_empty() {
+        println!("Routers: (none)");
+    } else {
         println!("{router_line}");
     }
 
     let transport_line = exim_drivers::DriverRegistry::transport_show_supported();
-    if !transport_line.is_empty() {
+    if transport_line.is_empty() {
+        println!("Transports: (none)");
+    } else {
         println!("{transport_line}");
     }
 
+    // Print fixed/never features (matching C Exim -bV format).
+    println!("Fixed never_users: 0");
+
     println!("Size of off_t: {}", std::mem::size_of::<i64>());
+
+    // Print the configuration file path (matching C Exim -bV format).
+    println!("Configuration file is {}", super::CONFIGURE_FILE_LIST);
 
     ExitCode::SUCCESS
 }

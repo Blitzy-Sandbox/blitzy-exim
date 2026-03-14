@@ -1034,8 +1034,33 @@ fn parse_listener_spec(spec: &str, default_port: u16) -> Result<(IpAddr, u16)> {
 /// Returns an error if no sockets could be bound (all addresses failed).
 /// Individual address failures are logged as warnings and skipped.
 fn bind_listening_sockets(ctx: &mut ServerContext, config: &Arc<Config>) -> Result<()> {
-    let local_interfaces: &str = config.local_interfaces.as_deref().unwrap_or("");
-    let daemon_smtp_ports: &str = config.daemon_smtp_port.as_deref().unwrap_or("25");
+    // If -oX was specified on the command line, it overrides BOTH
+    // local_interfaces and daemon_smtp_port from the configuration file.
+    // The -oX value is treated as a complete interface specification:
+    //   - A bare port number (e.g., "10025") → listen on all interfaces on that port
+    //   - An address:port (e.g., "127.0.0.1:10025") → listen on specific interface
+    //   - A semicolon-separated list → multiple listen entries
+    // This matches C Exim's handling of -oX in daemon.c.
+    let (local_interfaces, daemon_smtp_ports): (&str, &str) =
+        if let Some(ref oxi) = ctx.override_local_interfaces {
+            // -oX specified: use it as the complete listen specification.
+            // If it contains only digits, treat it as a port number.
+            // Otherwise, treat it as a full interface spec.
+            let trimmed = oxi.trim();
+            if trimmed.chars().all(|c| c.is_ascii_digit()) {
+                // Bare port number — listen on all interfaces on this port.
+                ("", trimmed)
+            } else {
+                // Full interface spec (may include address and port).
+                (trimmed, "25")
+            }
+        } else {
+            // No -oX override — use config values.
+            (
+                config.local_interfaces.as_deref().unwrap_or(""),
+                config.daemon_smtp_port.as_deref().unwrap_or("25"),
+            )
+        };
     let backlog = config.smtp_connect_backlog.max(1) as usize;
     let tcp_nodelay_flag = config.tcp_nodelay;
 
@@ -1098,7 +1123,33 @@ fn bind_listening_sockets(ctx: &mut ServerContext, config: &Arc<Config>) -> Resu
             interfaces.is_empty() || (interfaces.len() == 1 && interfaces[0].is_empty());
 
         if is_wildcard {
-            // Bind to wildcard (all interfaces).
+            // Bind to wildcard on both IPv4 and IPv6 (matching C Exim behavior).
+            // Try IPv4 first (always available), then optionally add IPv6.
+            match bind_one_socket(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                *port,
+                backlog,
+                tcp_nodelay_flag,
+            ) {
+                Ok(fd) => {
+                    tracing::info!(
+                        port = port,
+                        fd = fd.as_raw_fd(),
+                        "listening on 0.0.0.0:{}",
+                        port
+                    );
+                    ctx.listening_sockets.push(fd);
+                    bound_count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        port = port,
+                        error = %e,
+                        "IPv4 wildcard bind failed for port {}", port
+                    );
+                }
+            }
+            // Also try IPv6 wildcard if available (non-fatal if it fails).
             match bind_one_socket(
                 IpAddr::V6(Ipv6Addr::UNSPECIFIED),
                 *port,
@@ -1116,32 +1167,7 @@ fn bind_listening_sockets(ctx: &mut ServerContext, config: &Arc<Config>) -> Resu
                     bound_count += 1;
                 }
                 Err(e) => {
-                    tracing::debug!(error = %e, "IPv6 wildcard bind failed, trying IPv4");
-                    match bind_one_socket(
-                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                        *port,
-                        backlog,
-                        tcp_nodelay_flag,
-                    ) {
-                        Ok(fd) => {
-                            tracing::info!(
-                                port = port,
-                                fd = fd.as_raw_fd(),
-                                "listening on 0.0.0.0:{}",
-                                port
-                            );
-                            ctx.listening_sockets.push(fd);
-                            bound_count += 1;
-                        }
-                        Err(e2) => {
-                            tracing::error!(
-                                port = port,
-                                ipv6_error = %e,
-                                ipv4_error = %e2,
-                                "failed to bind on port {} on any address", port
-                            );
-                        }
-                    }
+                    tracing::debug!(error = %e, "IPv6 wildcard bind skipped (non-fatal)");
                 }
             }
         } else {

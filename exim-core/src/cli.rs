@@ -364,6 +364,12 @@ pub struct EximCli {
 
     /// Symlink-based invocation name that was detected.
     pub called_as: Option<String>,
+
+    /// `-oX <list>`: override local interfaces for daemon socket binding.
+    /// Contains the raw interface specification string from the CLI, which
+    /// is parsed by the daemon module's `bind_listening_sockets()`.
+    /// When set, overrides the `local_interfaces` config option.
+    pub override_local_interfaces: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -949,8 +955,10 @@ pub fn determine_mode(cli: &EximCli) -> EximMode {
             }
             BMode::CountQueue => return EximMode::CountQueue,
             BMode::ConfigCheck { show_config } => {
+                // Positional arguments after -bP are config option names to print.
+                // They end up in cli.recipients because they are non-flag arguments.
                 return EximMode::ConfigCheck {
-                    options: Vec::new(),
+                    options: cli.recipients.clone(),
                     show_config: *show_config,
                 };
             }
@@ -1173,6 +1181,7 @@ impl Default for EximCli {
             malware_test_file: None,
             inetd_wait_timeout: None,
             called_as: None,
+            override_local_interfaces: None,
         }
     }
 }
@@ -1724,7 +1733,10 @@ fn parse_o_options(cli: &mut EximCli, args: &[String], mut i: usize, rest: &str)
             }
         }
 
-        // -oX <list>: override local interfaces (accepted)
+        // -oX <list>: override local interfaces for daemon socket binding.
+        // The next argument is the interface specification, which may contain
+        // port numbers (e.g., "10025", "0.0.0.0:10025", "<; 0.0.0.0.10025").
+        // This overrides the `local_interfaces` configuration option.
         'X' => {
             if !sub_rest.is_empty() {
                 fail_bad_option(&args[i]);
@@ -1733,6 +1745,7 @@ fn parse_o_options(cli: &mut EximCli, args: &[String], mut i: usize, rest: &str)
             if i >= args.len() {
                 fail_bad_option(&args[i - 1]);
             }
+            cli.override_local_interfaces = Some(args[i].clone());
         }
 
         // -oY: override notifier socket (accepted)

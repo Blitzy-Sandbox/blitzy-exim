@@ -21,7 +21,8 @@ use std::fmt::Write as FmtWrite;
 use std::marker::PhantomData;
 use std::os::unix::io::RawFd;
 
-use nix::sys::socket::{self, MsgFlags};
+// nix::sys::socket::{send, MsgFlags} removed — we now use
+// exim_ffi::fd::safe_write_fd() which works on both sockets and pipes.
 use tracing::{debug, error, info, trace, warn};
 
 // Crate-level types from exim-smtp/src/lib.rs
@@ -894,14 +895,17 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
 
     /// Write raw bytes to the SMTP output socket.
     ///
-    /// Uses `nix::sys::socket::send()` which accepts `RawFd` directly
-    /// (unlike `nix::unistd::write()` which requires `impl AsFd`).
-    /// This avoids `unsafe` code per AAP §0.7.2.
+    /// Write data to the SMTP output file descriptor.
+    ///
+    /// Uses `exim_ffi::fd::safe_write_fd()` which works on **both** sockets
+    /// and pipes/files (unlike `nix::sys::socket::send()` which returns
+    /// ENOTSOCK for pipe-based fds in `-bs` mode).  This is the fix for
+    /// QA Issue 6 ("SMTP socket write error: ENOTSOCK").
     fn write_to_socket(&mut self, buf: &[u8]) {
         let fd = self.io.out_fd;
         let mut sent = 0usize;
         while sent < buf.len() {
-            match socket::send(fd, &buf[sent..], MsgFlags::empty()) {
+            match exim_ffi::fd::safe_write_fd(fd, &buf[sent..]) {
                 Ok(n) => {
                     sent += n;
                 }
@@ -2606,6 +2610,21 @@ pub fn smtp_setup_msg(
     in_fd: RawFd,
     out_fd: RawFd,
 ) -> SmtpSetupResult {
+    // Construct the 220 SMTP banner BEFORE creating the session, because
+    // SmtpSession::new() takes a mutable borrow on message_ctx which would
+    // prevent reading message_ctx.smtp_banner afterwards.
+    //
+    // This fixes QA Issue 5: "No 220 SMTP banner sent on connection".
+    // C Exim sends the banner at smtp_in.c ~4060 before reading any commands.
+    let banner = if let Some(ref b) = message_ctx.smtp_banner {
+        b.clone()
+    } else {
+        format!(
+            "220 {} ESMTP Exim 4.99 ready\r\n",
+            server_ctx.smtp_active_hostname
+        )
+    };
+
     // Create a session in the Connected state
     let mut session: SmtpSession<'_, Connected> =
         SmtpSession::new(in_fd, out_fd, server_ctx, message_ctx, config_ctx);
@@ -2618,6 +2637,9 @@ pub fn smtp_setup_msg(
     {
         let _ = exim_ffi::fd::safe_setsockopt_int(in_fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 0);
     }
+
+    // Send the 220 SMTP banner immediately, before entering the command loop.
+    session.smtp_printf(&banner, false);
 
     // Main command dispatch loop — replaces C `while (done <= 0)`
     //

@@ -614,6 +614,12 @@ pub struct ServerContext {
     /// Timezone string for log timestamps (e.g., "+0000", "-0500").
     /// Replaces C `timezone_string` / `timestamp_zone`.
     pub timestamp_zone: String,
+
+    /// CLI override for local interfaces (`-oX` flag).
+    /// When set, overrides the `local_interfaces` and `daemon_smtp_port`
+    /// configuration options for socket binding.  The value is the raw
+    /// interface specification string from the command line.
+    pub override_local_interfaces: Option<String>,
 }
 
 impl ServerContext {
@@ -663,6 +669,7 @@ impl Default for ServerContext {
             running_in_test_harness: false,
             received_time: SystemTime::UNIX_EPOCH,
             timestamp_zone: String::new(),
+            override_local_interfaces: None,
         }
     }
 }

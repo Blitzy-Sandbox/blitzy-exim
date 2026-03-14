@@ -84,6 +84,41 @@ pub fn safe_read_fd(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
     nix::unistd::read(borrowed, buf)
 }
 
+/// Perform a safe `write()` on a raw file descriptor.
+///
+/// Works on **both** sockets and pipes/files, unlike
+/// `nix::sys::socket::send()` which only works on sockets and returns
+/// `ENOTSOCK` for pipe-based file descriptors (e.g. stdin/stdout in
+/// Exim `-bs` mode).
+///
+/// This thin wrapper around `nix::unistd::write()` encapsulates the
+/// single `unsafe` call (`BorrowedFd::borrow_raw()`) so that consumer
+/// crates can write to any fd without violating their own
+/// `#![forbid(unsafe_code)]` attribute.
+///
+/// # Preconditions (caller must guarantee)
+///
+/// 1. `fd` is a valid, open file descriptor.
+/// 2. `fd` remains open for the duration of this function call.
+/// 3. `buf` contains the data to write.
+///
+/// # Returns
+///
+/// `Ok(n)` where `n` is the number of bytes written, or `Err(errno)`
+/// on write failure.
+///
+/// ```ignore
+/// let n = exim_ffi::fd::safe_write_fd(out_fd, b"220 hello\r\n")?;
+/// ```
+pub fn safe_write_fd(fd: RawFd, buf: &[u8]) -> nix::Result<usize> {
+    // SAFETY: `fd` is a valid file descriptor opened by the daemon's
+    // `accept()` call, `pipe()`, or inherited stdin/stdout. It remains
+    // open for the SMTP session lifetime. The `BorrowedFd` borrows the
+    // fd without closing it and does not escape this function.
+    let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) };
+    nix::unistd::write(borrowed, buf)
+}
+
 /// Perform a safe zero-timeout `poll()` readability check on a raw fd.
 ///
 /// Returns `Ok(n)` where `n` is the number of ready fds (0 or 1), or

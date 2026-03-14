@@ -357,6 +357,42 @@ pub fn expand_string(string: &str) -> Result<String, ExpandError> {
     result
 }
 
+/// Expand an Exim configuration string using an explicit context.
+///
+/// Identical to [`expand_string`] but uses the supplied `ExpandContext`
+/// instead of a default empty context. This is necessary for modes like
+/// `-be` (expansion testing) where static variables such as
+/// `$version_number`, `$primary_hostname`, `$pid`, etc. must resolve
+/// to their actual values.
+///
+/// # Arguments
+///
+/// * `string` — The raw expansion string.
+/// * `ctx`    — Expansion context populated with variable values.
+///
+/// # Errors
+///
+/// Same as [`expand_string`].
+pub fn expand_string_with_context(
+    string: &str,
+    ctx: &variables::ExpandContext,
+) -> Result<String, ExpandError> {
+    tracing::debug!(input = %string, "expand_string_with_context entry");
+
+    // Fast path: no expansion characters → return input unchanged.
+    if !string.contains('$') && !string.contains('\\') {
+        return Ok(string.to_owned());
+    }
+
+    // Full expansion pipeline: tokenize → parse → evaluate.
+    let mut parser_inst = parser::Parser::new(string);
+    let ast = parser_inst.parse()?;
+
+    let mut eval = evaluator::Evaluator::new(ctx);
+    let flags = EsiFlags::ESI_HONOR_DOLLAR;
+    eval.evaluate(&ast, flags)
+}
+
 /// Expand an Exim configuration string with text-only detection.
 ///
 /// Behaves identically to [`expand_string`] but additionally sets
