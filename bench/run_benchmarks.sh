@@ -33,7 +33,7 @@
 # Output:
 #   bench/results/summary.json  — Aggregated results in JSON
 #   bench/results/summary.csv   — Aggregated results in CSV
-#   bench/BENCHMARK_REPORT.md   — Populated benchmark report
+#   bench/results/BENCHMARK_REPORT.md — Populated benchmark report
 #
 # Must be run from the repository ROOT directory.
 
@@ -64,7 +64,7 @@ PARSE_ITERATIONS="${PARSE_ITERATIONS:-1000}"
 
 # Output paths
 RESULTS_DIR="${RESULTS_DIR:-bench/results}"
-REPORT_FILE="${REPORT_FILE:-bench/BENCHMARK_REPORT.md}"
+REPORT_FILE="${REPORT_FILE:-bench/results/BENCHMARK_REPORT.md}"
 REPORT_TEMPLATE="bench/BENCHMARK_REPORT.md"
 
 # Port assignments for daemon benchmarks (high ports to avoid conflicts)
@@ -1000,14 +1000,15 @@ aggregate_results() {
         --arg rs_d "$RSS_DELTA" --arg rs_v "$RSS_VERDICT" \
         --arg pt_c "$PARSE_C_MEAN" --arg pt_r "$PARSE_RUST_MEAN" \
         --arg pt_d "$PARSE_DELTA" --arg pt_v "$PARSE_VERDICT" \
-        '{
+        'def safe_num: if . == "N/A" then null else tonumber end;
+        {
           timestamp: $ts,
           system: $sys[0],
           results: {
-            throughput: {c:($tp_c|tonumber), rust:($tp_r|tonumber), delta_pct:($tp_d|tonumber), threshold:10, verdict:$tp_v},
-            latency:    {c:($lt_c|tonumber), rust:($lt_r|tonumber), delta_pct:($lt_d|tonumber), threshold:5,  verdict:$lt_v},
-            memory:     {c:($rs_c|tonumber), rust:($rs_r|tonumber), delta_pct:($rs_d|tonumber), threshold:20, verdict:$rs_v},
-            parse_time: {c:($pt_c|tonumber), rust:($pt_r|tonumber), delta_pct:($pt_d|tonumber), threshold:null, verdict:$pt_v}
+            throughput: {c:($tp_c|safe_num), rust:($tp_r|safe_num), delta_pct:($tp_d|safe_num), threshold:10, verdict:$tp_v},
+            latency:    {c:($lt_c|safe_num), rust:($lt_r|safe_num), delta_pct:($lt_d|safe_num), threshold:5,  verdict:$lt_v},
+            memory:     {c:($rs_c|safe_num), rust:($rs_r|safe_num), delta_pct:($rs_d|safe_num), threshold:20, verdict:$rs_v},
+            parse_time: {c:($pt_c|safe_num), rust:($pt_r|safe_num), delta_pct:($pt_d|safe_num), threshold:null, verdict:$pt_v}
           },
           overall: $overall
         }' > "${RESULTS_DIR}/summary.json"
@@ -1236,7 +1237,7 @@ Environment variables (override defaults):
   MEMORY_ITERATIONS     RSS measurement iterations (default: 100)
   PARSE_ITERATIONS      Parse measurement iterations (default: 1000)
   RESULTS_DIR           Output directory (default: bench/results)
-  REPORT_FILE           Report output path (default: bench/BENCHMARK_REPORT.md)
+  REPORT_FILE           Report output path (default: bench/results/BENCHMARK_REPORT.md)
   SMTP_PORT_C           C daemon port (default: 10025)
   SMTP_PORT_RUST        Rust daemon port (default: 10026)
 

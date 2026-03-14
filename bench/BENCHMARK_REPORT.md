@@ -66,9 +66,9 @@ Each benchmark follows a rigorous methodology designed for statistical significa
 | **Message Count** | 10,000 messages per run |
 | **Delivery Method** | Localhost (127.0.0.1) loopback delivery |
 | **Configuration** | Default `src/src/configure.default` with local delivery enabled |
-| **Iterations** | 1,000 total messages measured across aggregated runs |
+| **Iterations** | 10,000 total messages measured across 1,000 iterations of 100-message batches |
 | **Metric** | Messages per second (msgs/sec) |
-| **Warm-up** | 100 messages discarded before measurement begins |
+| **Warm-up** | 3 warmup iterations (each sending the configured message batch) are discarded before measurement begins |
 
 Each binary is started in daemon mode listening on a designated localhost port. The `swaks` tool delivers 10,000 individual SMTP transactions (one message per TCP connection) to the daemon. Total wall-clock time is recorded and throughput is computed as total messages divided by elapsed seconds. Multiple runs are aggregated to produce mean, median, standard deviation, and percentile statistics.
 
@@ -76,8 +76,8 @@ Each binary is started in daemon mode listening on a designated localhost port. 
 
 | Parameter | Value |
 |-----------|-------|
-| **Tool** | `hyperfine` 1.20.0 |
-| **Connections** | 1,000 concurrent SMTP connections per iteration |
+| **Tool** | `hyperfine` __SYS_HYPERFINE_VERSION__ |
+| **Connections** | 1,000 sequential SMTP connections per iteration |
 | **Measurement** | Time-to-first-response (220 banner) after TCP connect |
 | **Iterations** | 100 iterations per binary |
 | **Metric** | Mean latency in milliseconds (ms) |
@@ -101,7 +101,7 @@ A 10 MB test message is injected into each binary using the batch SMTP mode (`ex
 
 | Parameter | Value |
 |-----------|-------|
-| **Tool** | `hyperfine` 1.20.0 |
+| **Tool** | `hyperfine` __SYS_HYPERFINE_VERSION__ |
 | **Config File** | `src/src/configure.default` |
 | **Mode** | Config print mode (`exim -bP`) |
 | **Iterations** | 1,000 iterations per binary |
@@ -170,7 +170,7 @@ __SMTP_THROUGHPUT_OBSERVATION__
 
 | Parameter | Value |
 |-----------|-------|
-| Concurrent Connections | 1,000 |
+| Sequential Connections | 1,000 |
 | Measurement | Time-to-first-response (220 banner) |
 | Iterations | 100 |
 
@@ -358,7 +358,7 @@ These thresholds are defined in the Exim C → Rust Migration Agent Action Plan 
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| `hyperfine` | 1.20.0 | Binary-level benchmark timing with statistical analysis |
+| `hyperfine` | __SYS_HYPERFINE_VERSION__ | Binary-level benchmark timing with statistical analysis |
 | `swaks` | latest | SMTP transaction generation for throughput testing |
 | `/usr/bin/time` | GNU time | Process resource usage measurement (RSS) |
 | `sed` | GNU sed | Template placeholder substitution in report generation |
