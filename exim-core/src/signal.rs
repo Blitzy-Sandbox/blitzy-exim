@@ -237,15 +237,21 @@ pub fn install_daemon_signals() {
         empty_mask,
     );
 
-    // SIGCHLD: Child-reap handler with SA_RESETHAND.
-    // SA_RESETHAND atomically resets the disposition to SIG_DFL when the
-    // handler is invoked, replicating the C pattern where main_sigchld_handler
-    // calls os_non_restarting_signal(SIGCHLD, SIG_DFL) as its first action.
-    // No SA_RESTART: we WANT poll() to be interrupted so the daemon loop
-    // can reap terminated children promptly.
+    // SIGCHLD: Child-reap handler — persistent (no SA_RESETHAND).
+    //
+    // The C code used SA_RESETHAND (reset to SIG_DFL on first delivery) and
+    // then re-installed the handler inside the reap loop. This Rust
+    // implementation uses a persistent handler instead: the handler simply
+    // sets an atomic flag, and the daemon event loop checks the flag on each
+    // iteration. No SA_RESTART: we WANT poll() to be interrupted so the
+    // daemon loop can reap terminated children promptly.
+    //
+    // Without persistent handling, only the first SIGCHLD is caught; all
+    // subsequent child exits produce zombie processes that accumulate until
+    // smtp_accept_max is reached, causing a denial-of-service condition.
     let sigchld_action = SigAction::new(
         SigHandler::Handler(sigchld_handler),
-        SaFlags::SA_RESETHAND,
+        SaFlags::empty(),
         empty_mask,
     );
 

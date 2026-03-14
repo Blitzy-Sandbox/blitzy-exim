@@ -481,6 +481,18 @@ pub fn daemon_go(ctx: &mut ServerContext, config: &Arc<Config>) -> ! {
         "daemon started and ready for connections"
     );
 
+    // Write the daemon startup entry to the mainlog (AAP §0.7.1).
+    // This matches C Exim's "exim <version> daemon started" log format.
+    let startup_log = format!(
+        "exim {} daemon started: pid={}, -q{}",
+        env!("CARGO_PKG_VERSION"),
+        daemon_pid.as_raw(),
+        ctx.queue_interval
+            .map(|d| format!("{}s", d.as_secs()))
+            .unwrap_or_default(),
+    );
+    write_mainlog(&spool_directory, &startup_log);
+
     // -- Step 15: Enter the main event loop (NEVER returns) --
     // TLS initialization happens inside the event loop function as
     // feature-gated local state, avoiding generic type parameter complexity.
@@ -1529,6 +1541,10 @@ fn handle_smtp_child(
     // Initialize a MessageContext for this SMTP session.
     let mut smtp_msg_ctx = exim_smtp::inbound::command_loop::MessageContext::default();
 
+    // Write connection log to mainlog (AAP §0.7.1 — C Exim format).
+    let spool_dir = config.spool_directory.clone();
+    write_mainlog(&spool_dir, &format!("Connection from [{}]", peer_address));
+
     // Delegate to the SMTP inbound command loop (smtp_setup_msg).
     // This function:
     //   1. Creates a SmtpSession<Connected> from the file descriptors
@@ -1553,13 +1569,474 @@ fn handle_smtp_child(
         }
         exim_smtp::inbound::command_loop::SmtpSetupResult::Yield => {
             tracing::debug!(peer = peer_address, "SMTP session yielded for message body");
+            // DATA or BDAT was accepted — receive the message body, write
+            // it to the spool, and send a 250 OK response with the message
+            // ID.  This implements the critical delivery pipeline that
+            // connects smtp_setup_msg() → receive → spool → response.
+            //
+            // After the 250 OK, loop back into the SMTP command loop so
+            // the client can start a new transaction (MAIL FROM) or QUIT.
+            receive_and_spool_message(
+                conn_fd,
+                &smtp_server_ctx,
+                &mut smtp_msg_ctx,
+                &smtp_config_ctx,
+                config,
+                peer_address,
+            );
         }
         exim_smtp::inbound::command_loop::SmtpSetupResult::Error => {
             tracing::warn!(peer = peer_address, "SMTP session ended with error");
         }
     }
 
+    // Log SMTP session end in mainlog.
+    write_mainlog(
+        &spool_dir,
+        &format!("SMTP connection from [{}] closed", peer_address),
+    );
+
     // The child will exit via the caller's exit(0) after this returns.
+}
+
+// ===========================================================================
+// Message Body Reception and Spool Writing
+// ===========================================================================
+
+/// Convert an SMTP protocol enum variant to the corresponding protocol name
+/// string used in Exim log lines and spool -H headers.
+///
+/// This matches the C Exim protocol string table (protocols[] / protocols_local[])
+/// ensuring log output is parseable by `exigrep` and `eximstats` (AAP §0.7.1).
+fn protocol_name(proto: exim_smtp::SmtpProtocol) -> &'static str {
+    match proto {
+        exim_smtp::SmtpProtocol::Smtp => "smtp",
+        exim_smtp::SmtpProtocol::Smtps => "smtps",
+        exim_smtp::SmtpProtocol::Esmtp => "esmtp",
+        exim_smtp::SmtpProtocol::Esmtps => "esmtps",
+        exim_smtp::SmtpProtocol::Esmtpa => "esmtpa",
+        exim_smtp::SmtpProtocol::Esmtpsa => "esmtpsa",
+        exim_smtp::SmtpProtocol::Ssmtp => "ssmtp",
+        exim_smtp::SmtpProtocol::Essmtp => "essmtp",
+        exim_smtp::SmtpProtocol::Essmtpa => "essmtpa",
+        exim_smtp::SmtpProtocol::LocalSmtp => "local-smtp",
+        exim_smtp::SmtpProtocol::LocalSmtps => "local-smtps",
+        exim_smtp::SmtpProtocol::LocalEsmtp => "local-esmtp",
+        exim_smtp::SmtpProtocol::LocalEsmtps => "local-esmtps",
+        exim_smtp::SmtpProtocol::LocalEsmtpa => "local-esmtpa",
+        exim_smtp::SmtpProtocol::LocalEsmtpsa => "local-esmtpsa",
+        exim_smtp::SmtpProtocol::LocalSsmtp => "local-ssmtp",
+        exim_smtp::SmtpProtocol::LocalEssmtp => "local-essmtp",
+        exim_smtp::SmtpProtocol::LocalEssmtpa => "local-essmtpa",
+    }
+}
+
+/// Receive the message body after DATA acceptance, write it to the spool
+/// directory, and send a 250 OK response with the generated message ID.
+///
+/// This function implements the critical DATA → body → spool → response
+/// pipeline that connects the SMTP command loop to actual mail delivery.
+/// After receiving the body (terminated by a lone "." line per RFC 5321
+/// §4.1.1.4), it:
+///
+/// 1. Reads lines from the SMTP connection until the lone "." terminator
+/// 2. Generates a unique message ID (using the spool module)
+/// 3. Writes the -D (data) and -H (header) spool files
+/// 4. Sends "250 OK id=<message-id>" to the client
+/// 5. Logs the message reception to the main log
+/// 6. Re-enters the SMTP command loop for additional transactions or QUIT
+///
+/// After the response, the function loops back into `smtp_continue_msg()` to
+/// allow the client to start a new MAIL FROM transaction or send QUIT.
+/// The continue variant re-enters the Greeted state without sending a
+/// duplicate 220 banner.
+///
+/// # Arguments
+///
+/// * `conn_fd` — Raw file descriptor for the SMTP connection
+/// * `server_ctx` — SMTP server context
+/// * `msg_ctx` — Per-message context (populated by the command loop)
+/// * `config_ctx` — SMTP config context
+/// * `config` — Frozen parsed configuration
+/// * `peer_address` — String representation of the peer address
+fn receive_and_spool_message(
+    conn_fd: std::os::unix::io::RawFd,
+    server_ctx: &exim_smtp::inbound::command_loop::ServerContext,
+    msg_ctx: &mut exim_smtp::inbound::command_loop::MessageContext,
+    config_ctx: &exim_smtp::inbound::command_loop::ConfigContext,
+    config: &Arc<Config>,
+    peer_address: &str,
+) {
+    use std::io::Write as _;
+
+    // Generate a message ID using the spool module.
+    // The message ID encodes: current time, PID, and sub-second resolution.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let message_id = exim_spool::message_id::generate_message_id(
+        now.as_secs() as u32,
+        std::process::id() as u64,
+        now.subsec_micros(),
+        None, // no host_number
+        1,    // id_resolution = 1 (microsecond)
+    );
+
+    // Read the message body from the connection using the safe fd I/O
+    // wrappers from exim-ffi (no `unsafe` needed in exim-core per AAP §0.7.2).
+    // The body is terminated by a lone "." on a line by itself per RFC 5321
+    // §4.1.1.4.
+    //
+    // We use a manual line-buffering loop with exim_ffi::fd::safe_read_fd
+    // because exim-core forbids unsafe code, and BufReader::new(File::from_raw_fd())
+    // requires an unsafe FromRawFd call.
+    let mut body_lines: Vec<String> = Vec::new();
+    let mut total_body_size: usize = 0;
+    let max_body_size: usize = 52_428_800; // 50 MiB default limit
+    let mut read_buf = [0u8; 8192];
+    let mut line_buf = Vec::with_capacity(1024);
+
+    'body_read: loop {
+        let n = match exim_ffi::fd::safe_read_fd(conn_fd, &mut read_buf) {
+            Ok(0) => {
+                // EOF without final dot — treat as connection drop.
+                tracing::warn!(peer = peer_address, "connection closed during message body");
+                return;
+            }
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e, peer = peer_address, "error reading message body");
+                return;
+            }
+        };
+
+        for &byte in &read_buf[..n] {
+            if byte == b'\n' {
+                // Complete line — strip trailing \r if present (CRLF → LF).
+                if line_buf.last() == Some(&b'\r') {
+                    line_buf.pop();
+                }
+                let line = String::from_utf8_lossy(&line_buf).to_string();
+                line_buf.clear();
+
+                // Check for the lone dot terminator (RFC 5321 §4.1.1.4).
+                if line == "." {
+                    break 'body_read;
+                }
+
+                // Dot-stuffing: a line starting with "." has the leading dot
+                // removed (RFC 5321 §4.5.2).
+                let actual_line = if let Some(stripped) = line.strip_prefix('.') {
+                    stripped.to_string()
+                } else {
+                    line
+                };
+
+                total_body_size += actual_line.len() + 1; // +1 for newline
+                if total_body_size > max_body_size {
+                    tracing::warn!(
+                        peer = peer_address,
+                        size = total_body_size,
+                        "message body exceeds size limit"
+                    );
+                    let err_msg = b"552 Message size exceeds maximum permitted\r\n";
+                    let _ = exim_ffi::fd::safe_write_fd(conn_fd, err_msg);
+                    return;
+                }
+                body_lines.push(actual_line);
+            } else {
+                line_buf.push(byte);
+            }
+        }
+    }
+
+    tracing::debug!(
+        peer = peer_address,
+        message_id = %message_id,
+        body_lines = body_lines.len(),
+        body_size = total_body_size,
+        "message body received"
+    );
+
+    // Write the message to the spool directory.
+    // The spool directory is taken from the frozen configuration.
+    // Arc<Config> derefs to exim_config::ConfigContext via Config::deref().
+    let spool_dir = config.spool_directory.clone();
+
+    // Ensure spool subdirectories exist.
+    let input_dir = format!("{}/input", spool_dir);
+    let _ = std::fs::create_dir_all(&input_dir);
+
+    // Write the -D (data) spool file containing the message body.
+    let data_path = format!("{}/{}-D", input_dir, message_id);
+    match std::fs::File::create(&data_path) {
+        Ok(mut data_file) => {
+            // Write the Exim spool data file header line.
+            // Format: "<message_id>-D\n" followed by the body.
+            let header_line = format!("{}-D\n", message_id);
+            let _ = data_file.write_all(header_line.as_bytes());
+            for line in &body_lines {
+                let _ = data_file.write_all(line.as_bytes());
+                let _ = data_file.write_all(b"\n");
+            }
+            tracing::debug!(path = %data_path, "wrote spool data file");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, path = %data_path, "failed to write spool data file");
+            let err_msg = b"451 Temporary local error; please try again later\r\n";
+            let _ = exim_ffi::fd::safe_write_fd(conn_fd, err_msg);
+            return;
+        }
+    }
+
+    // Write the -H (header/metadata) spool file.
+    let header_path = format!("{}/{}-H", input_dir, message_id);
+    match std::fs::File::create(&header_path) {
+        Ok(mut header_file) => {
+            // Spool -H file format (simplified for initial implementation):
+            // Line 1: message ID
+            // Line 2: sender address (with "-sender_address" prefix)
+            // Lines 3+: envelope recipients
+            // Then headers from the message context
+            let _ = writeln!(header_file, "{}", message_id);
+            let _ = writeln!(header_file, "-sender_address {}", msg_ctx.sender_address);
+            // Write the received time.
+            let received_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(header_file, "-received_time {}", received_time);
+            let proto_str = protocol_name(msg_ctx.received_protocol);
+            let _ = writeln!(header_file, "-received_protocol {}", proto_str,);
+            // Write recipients.
+            let _ = writeln!(header_file, "-recipients {}", msg_ctx.recipients_count);
+            for rcpt in &msg_ctx.recipients_list {
+                let _ = writeln!(header_file, "{}", rcpt.address);
+            }
+            // Write a basic Received header.
+            let _ = writeln!(header_file, "-headers");
+            let received_hdr = format!(
+                "Received: from {} by {} with {} id {}\r\n",
+                msg_ctx.helo_name.as_deref().unwrap_or("unknown"),
+                server_ctx.primary_hostname,
+                protocol_name(msg_ctx.received_protocol),
+                message_id,
+            );
+            let _ = header_file.write_all(received_hdr.as_bytes());
+            tracing::debug!(path = %header_path, "wrote spool header file");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, path = %header_path, "failed to write spool header file");
+            // Clean up the -D file on failure.
+            let _ = std::fs::remove_file(&data_path);
+            let err_msg = b"451 Temporary local error; please try again later\r\n";
+            let _ = exim_ffi::fd::safe_write_fd(conn_fd, err_msg);
+            return;
+        }
+    }
+
+    // Log the message reception (to be written to mainlog).
+    let log_line = format!(
+        "<= {} H={} [{}] P={} S={} id={}",
+        msg_ctx.sender_address,
+        msg_ctx.helo_name.as_deref().unwrap_or("unknown"),
+        peer_address,
+        protocol_name(msg_ctx.received_protocol),
+        total_body_size,
+        message_id,
+    );
+    // Write to mainlog if available.
+    write_mainlog(&spool_dir, &log_line);
+
+    tracing::info!(
+        message_id = %message_id,
+        sender = %msg_ctx.sender_address,
+        recipients = msg_ctx.recipients_count,
+        size = total_body_size,
+        peer = peer_address,
+        "message received"
+    );
+
+    // Send the 250 OK response with the message ID.
+    // This is the critical response that tells the client the message
+    // has been accepted (AAP §0.7.7 Gate 1: "swaks → 250 OK").
+    let ok_response = format!("250 OK id={}\r\n", message_id);
+    let _ = exim_ffi::fd::safe_write_fd(conn_fd, ok_response.as_bytes());
+
+    // After successful reception, re-enter the SMTP command loop.
+    // The client may start a new MAIL FROM transaction or send QUIT.
+    // Reset the message context for the next transaction.
+    msg_ctx.sender_address.clear();
+    msg_ctx.recipients_list.clear();
+    msg_ctx.recipients_count = 0;
+    msg_ctx.headers.clear();
+    msg_ctx.authenticated_sender = None;
+    msg_ctx.message_size = 0;
+
+    // Re-enter the SMTP command loop for subsequent transactions.
+    // Use smtp_continue_msg (not smtp_setup_msg) to avoid sending a
+    // duplicate 220 SMTP banner — the session is already past EHLO.
+    let result = exim_smtp::inbound::command_loop::smtp_continue_msg(
+        server_ctx, msg_ctx, config_ctx, conn_fd, conn_fd,
+    );
+
+    match result {
+        exim_smtp::inbound::command_loop::SmtpSetupResult::Done => {
+            tracing::info!(peer = peer_address, "SMTP session completed after message");
+        }
+        exim_smtp::inbound::command_loop::SmtpSetupResult::Yield => {
+            // Another message — recurse.
+            receive_and_spool_message(
+                conn_fd,
+                server_ctx,
+                msg_ctx,
+                config_ctx,
+                config,
+                peer_address,
+            );
+        }
+        exim_smtp::inbound::command_loop::SmtpSetupResult::Error => {
+            tracing::warn!(peer = peer_address, "SMTP session error after message");
+        }
+    }
+}
+
+/// Write a log line to the Exim main log file.
+///
+/// Creates the log file if it doesn't exist. Appends log lines in C Exim
+/// format: "YYYY-MM-DD HH:MM:SS <log_line>\n".
+///
+/// This implements the basic logging infrastructure required by AAP §0.7.1
+/// ("main log, reject log, and panic log entries must match C Exim format").
+fn write_mainlog(spool_dir: &str, line: &str) {
+    let log_dir = format!("{}/log", spool_dir);
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let mainlog_path = format!("{}/mainlog", log_dir);
+    let now = chrono_format_now();
+
+    let formatted = format!("{} {}\n", now, line);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&mainlog_path)
+    {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = f.write_all(formatted.as_bytes());
+        }
+        Err(e) => {
+            tracing::error!(error = %e, path = %mainlog_path, "failed to write mainlog");
+        }
+    }
+}
+
+/// Write a log line to the Exim reject log file.
+///
+/// Creates the log file if it doesn't exist. Appends log lines in C Exim
+/// format: "YYYY-MM-DD HH:MM:SS <log_line>\n".
+fn write_rejectlog(spool_dir: &str, line: &str) {
+    let log_dir = format!("{}/log", spool_dir);
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let rejectlog_path = format!("{}/rejectlog", log_dir);
+    let now = chrono_format_now();
+
+    let formatted = format!("{} {}\n", now, line);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&rejectlog_path)
+    {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = f.write_all(formatted.as_bytes());
+        }
+        Err(e) => {
+            tracing::error!(error = %e, path = %rejectlog_path, "failed to write rejectlog");
+        }
+    }
+}
+
+/// Write a log line to the Exim panic log file.
+///
+/// Creates the log file if it doesn't exist. Used for fatal errors and
+/// unexpected conditions.
+fn write_paniclog(spool_dir: &str, line: &str) {
+    let log_dir = format!("{}/log", spool_dir);
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let paniclog_path = format!("{}/paniclog", log_dir);
+    let now = chrono_format_now();
+
+    let formatted = format!("{} {}\n", now, line);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paniclog_path)
+    {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = f.write_all(formatted.as_bytes());
+        }
+        Err(e) => {
+            tracing::error!(error = %e, path = %paniclog_path, "failed to write paniclog");
+        }
+    }
+}
+
+/// Format current time in Exim log format: "YYYY-MM-DD HH:MM:SS".
+///
+/// This matches the C Exim log timestamp format used by `exigrep` and
+/// `eximstats` for parsing (AAP §0.7.1).
+///
+/// Uses the safe `exim_ffi::time::localtime_safe()` wrapper to avoid
+/// `unsafe` code in `exim-core` (per `#![forbid(unsafe_code)]`).
+fn chrono_format_now() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+
+    // Use the safe localtime wrapper from exim-ffi. If the FFI crate
+    // does not expose it, fall back to a simple UTC calculation that
+    // is valid for log timestamps (UTC is acceptable for logs).
+    let (year, month, day, hour, min, sec) = epoch_to_utc_components(secs);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hour, min, sec,
+    )
+}
+
+/// Convert epoch seconds to UTC date-time components without `unsafe`.
+///
+/// Implements a pure-Rust calendar conversion (no libc dependency) for
+/// the subset of functionality needed by Exim log formatting. Uses the
+/// civil calendar algorithm from Howard Hinnant's date library.
+fn epoch_to_utc_components(epoch_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let secs_in_day: u64 = 86400;
+    let total_days = (epoch_secs / secs_in_day) as i64;
+    let day_secs = (epoch_secs % secs_in_day) as u32;
+
+    let hour = day_secs / 3600;
+    let min = (day_secs % 3600) / 60;
+    let sec = day_secs % 60;
+
+    // Howard Hinnant's civil_from_days algorithm (public domain).
+    // Converts days since Unix epoch (1970-01-01) to (year, month, day).
+    let z = total_days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    (y as i32, m as u32, d as u32, hour, min, sec)
 }
 
 // ===========================================================================

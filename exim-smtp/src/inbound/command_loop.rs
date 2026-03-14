@@ -1573,6 +1573,52 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
 }
 
 impl<'ctx> SmtpSession<'ctx, Greeted> {
+    /// Create a new SMTP session directly in the `Greeted` state.
+    ///
+    /// This is used when re-entering the command loop after message reception.
+    /// The client has already completed EHLO/HELO, so we skip the banner and
+    /// the Connected → Greeted transition. The session continues accepting
+    /// MAIL FROM, RSET, QUIT, and other post-greeting commands.
+    ///
+    /// This avoids sending a duplicate 220 banner when the daemon loops back
+    /// after accepting a message (the "250 OK id=..." response already
+    /// acknowledged the message).
+    fn new_greeted(
+        in_fd: RawFd,
+        out_fd: RawFd,
+        server_ctx: &'ctx ServerContext,
+        message_ctx: &'ctx mut MessageContext,
+        config_ctx: &'ctx ConfigContext,
+    ) -> Self {
+        let io = SmtpIoState::new(in_fd, out_fd);
+        let chunking_ctx = ChunkingContext::new(false);
+
+        SmtpSession {
+            _state: PhantomData,
+            authenticated_by: None,
+            count_nonmail: None,
+            nonmail_command_count: 0,
+            synprot_error_count: 0,
+            unknown_command_count: 0,
+            sync_cmd_limit: SmtpCommand::Noop,
+            server_ctx,
+            message_ctx,
+            config_ctx,
+            flags: SmtpSessionFlags::default(),
+            io,
+            chunking_ctx,
+            #[cfg(feature = "prdr")]
+            prdr_state: PrdrState::default(),
+            cmd_buffer: vec![0u8; SMTP_CMD_BUFFER_SIZE],
+            resp_buffer: vec![0u8; SMTP_RESP_BUFFER_SIZE],
+            resp_ptr: 0,
+            connection_had: [SmtpCommandHistory::SchNone; SMTP_HISTRY_SIZE],
+            connection_had_index: 0,
+            smtp_write_error: 0,
+            rcpt_in_progress: false,
+        }
+    }
+
     /// Process MAIL FROM and transition to `MailFrom` state.
     ///
     /// Parses the sender address and MAIL FROM extensions (SIZE, BODY, AUTH,
@@ -2741,6 +2787,23 @@ pub fn smtp_setup_msg(
                 session.smtp_respond("503", false, "Command refused");
             }
 
+            // MAIL FROM, RCPT TO, and DATA are recognized SMTP commands
+            // but are not permitted before EHLO/HELO has been sent.
+            // RFC 5321 §4.1.4: "In the absence of an extension
+            // negotiated by the client and server, the server MUST return
+            // a 503 reply" for commands used out of sequence.
+            SmtpCommand::Mail => {
+                session.smtp_respond("503", false, "EHLO or HELO first");
+            }
+
+            SmtpCommand::Rcpt => {
+                session.smtp_respond("503", false, "EHLO or HELO first");
+            }
+
+            SmtpCommand::Data | SmtpCommand::Bdat => {
+                session.smtp_respond("503", false, "EHLO or HELO first");
+            }
+
             _ => {
                 // Unknown command
                 session.unknown_command_count += 1;
@@ -2754,6 +2817,34 @@ pub fn smtp_setup_msg(
             }
         }
     }
+}
+
+/// Continue an SMTP session after message reception.
+///
+/// This entry point is used after `receive_and_spool_message()` has accepted
+/// a message and sent the "250 OK id=..." response. It re-enters the
+/// command loop from the Greeted state WITHOUT sending a new 220 banner.
+///
+/// The client may start a new MAIL FROM transaction, send RSET, or QUIT.
+///
+/// # Arguments
+///
+/// * `server_ctx` — Daemon-lifetime server state
+/// * `message_ctx` — Per-message mutable state (already reset by caller)
+/// * `config_ctx` — Frozen parsed configuration
+/// * `in_fd` — Inbound socket file descriptor
+/// * `out_fd` — Outbound socket file descriptor
+pub fn smtp_continue_msg(
+    server_ctx: &ServerContext,
+    message_ctx: &mut MessageContext,
+    config_ctx: &ConfigContext,
+    in_fd: RawFd,
+    out_fd: RawFd,
+) -> SmtpSetupResult {
+    let session: SmtpSession<'_, Greeted> =
+        SmtpSession::new_greeted(in_fd, out_fd, server_ctx, message_ctx, config_ctx);
+
+    handle_greeted_session(session)
 }
 
 /// Handle the SMTP session after HELO/EHLO has been accepted.

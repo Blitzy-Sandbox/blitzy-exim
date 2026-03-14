@@ -300,6 +300,22 @@ pub enum Token {
     /// A recognised operator keyword (e.g. `lc`, `uc`, `md5`).
     OperatorKeyword(String),
 
+    /// A parametric operator keyword with embedded numeric arguments.
+    ///
+    /// C Exim supports two equivalent syntaxes for certain operators:
+    /// - Brace form: `${length{5}{string}}` — parsed as ItemKeyword
+    /// - Underscore form: `${length_5:string}` — parsed as ParametricOperator
+    ///
+    /// The underscore form encodes one or two numeric parameters directly
+    /// in the operator name, separated by underscores. Supported operators:
+    /// - `length_N` — first N characters
+    /// - `substr_N_M` — substring from position N, length M
+    /// - `hash_N_M` — hash to N chars from M-char pool
+    /// - `nhash_N` or `nhash_N_M` — numeric hash
+    ///
+    /// Fields: (operator_base_name, param1, optional_param2)
+    ParametricOperator(String, u64, Option<u64>),
+
     /// A recognised condition keyword (e.g. `match`, `eq`, `exists`).
     ConditionKeyword(String),
 
@@ -785,6 +801,24 @@ impl<'a> Tokenizer<'a> {
                 if keyword_lookup(name, OP_MAIN_KEYWORDS) {
                     return Token::OperatorKeyword(name.to_owned());
                 }
+                // Check for parametric operator forms with embedded numeric
+                // arguments (C Exim's underscore syntax).
+                //
+                // Supported patterns:
+                //   length_N        → ParametricOperator("length", N, None)
+                //   substr_N_M      → ParametricOperator("substr", N, Some(M))
+                //   hash_N_M        → ParametricOperator("hash", N, Some(M))
+                //   nhash_N         → ParametricOperator("nhash", N, None)
+                //   nhash_N_M       → ParametricOperator("nhash", N, Some(M))
+                //
+                // The C code (expand.c read_subs) parsed these by detecting
+                // that the operator name is in the op_table_underscore list
+                // and then scanning for _N or _N_M suffixes. We replicate
+                // this by checking if the identifier starts with a known
+                // parametric operator base name followed by _<digits>.
+                if let Some(token) = try_parametric_operator(name) {
+                    return token;
+                }
                 // Not a keyword — treat as a variable name in braced form
                 Token::Identifier(name.to_owned())
             }
@@ -1132,6 +1166,62 @@ impl<'a> Tokenizer<'a> {
 /// `table` MUST be sorted in ascending alphabetical order.
 fn keyword_lookup(name: &str, table: &[&str]) -> bool {
     table.binary_search(&name).is_ok()
+}
+
+/// Known parametric operator base names that support the `_N` or `_N_M`
+/// underscore suffix syntax in C Exim.
+///
+/// These are the operators listed in C expand.c's `op_table_underscore`
+/// that accept numeric parameters embedded in the operator name:
+/// - `hash` — hash to N chars from M-char pool
+/// - `length` — first N characters
+/// - `nhash` — numeric hash to N (or N_M)
+/// - `substr` — substring from position N, length M
+const PARAMETRIC_OPERATOR_BASES: &[&str] = &["hash", "length", "nhash", "substr"];
+
+/// Try to parse an identifier as a parametric operator with embedded
+/// numeric arguments.
+///
+/// Returns `Some(Token::ParametricOperator(...))` if the identifier
+/// matches the pattern `BASE_N` or `BASE_N_M` where `BASE` is one of
+/// the known parametric operators and `N`, `M` are sequences of digits.
+///
+/// # Examples
+///
+/// ```text
+/// "length_5"    → Some(ParametricOperator("length", 5, None))
+/// "substr_0_5"  → Some(ParametricOperator("substr", 0, Some(5)))
+/// "hash_5_3"    → Some(ParametricOperator("hash", 5, Some(3)))
+/// "nhash_100"   → Some(ParametricOperator("nhash", 100, None))
+/// "nhash_5_3"   → Some(ParametricOperator("nhash", 5, Some(3)))
+/// "length_abc"  → None (non-numeric suffix)
+/// "foo_5"       → None (unknown base)
+/// ```
+fn try_parametric_operator(name: &str) -> Option<Token> {
+    for &base in PARAMETRIC_OPERATOR_BASES {
+        if let Some(suffix) = name.strip_prefix(base) {
+            // Suffix must start with '_' followed by digits.
+            if let Some(rest) = suffix.strip_prefix('_') {
+                if rest.is_empty() {
+                    continue; // e.g. "length_" with nothing after
+                }
+                // Split on the next underscore for two-param form.
+                if let Some(underscore_pos) = rest.find('_') {
+                    let first_part = &rest[..underscore_pos];
+                    let second_part = &rest[underscore_pos + 1..];
+                    if let (Ok(n), Ok(m)) = (first_part.parse::<u64>(), second_part.parse::<u64>())
+                    {
+                        return Some(Token::ParametricOperator(base.to_owned(), n, Some(m)));
+                    }
+                    // If second part isn't numeric, fall through.
+                } else if let Ok(n) = rest.parse::<u64>() {
+                    // Single-param form: base_N
+                    return Some(Token::ParametricOperator(base.to_owned(), n, None));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Convert a hex digit character to its numeric value (0-15).

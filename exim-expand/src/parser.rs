@@ -1038,6 +1038,15 @@ impl Parser {
                     self.advance();
                     nodes.push(AstNode::Literal(s));
                 }
+                Token::ParametricOperator(base, p1, p2) => {
+                    // Parametric operator outside `$` context — literal text.
+                    self.advance();
+                    let text = match p2 {
+                        Some(m) => format!("{}_{p1}_{m}", base),
+                        None => format!("{}_{p1}", base),
+                    };
+                    nodes.push(AstNode::Literal(text));
+                }
             }
         }
 
@@ -1092,6 +1101,54 @@ impl Parser {
                     .ok_or_else(|| self.error(format!("unknown operator: {name}")))?;
                 self.advance(); // consume OperatorKeyword
                 self.parse_operator(kind)?
+            }
+            Token::ParametricOperator(ref base, ref param1, ref param2) => {
+                // Parametric operator with embedded numeric arguments.
+                // This is the underscore form: ${length_5:string}
+                //
+                // We desugar this into the equivalent Item form, which is
+                // the same as the brace form: ${length{5}{string}}
+                //
+                // The desugaring converts:
+                //   ${length_N:subject}    → Item(Length, [N, subject])
+                //   ${substr_N_M:subject}  → Item(Substr, [N, M, subject])
+                //   ${hash_N_M:subject}    → Item(Hash, [N, M, subject])
+                //   ${nhash_N:subject}     → Item(Nhash, [N, subject])
+                //   ${nhash_N_M:subject}   → Item(Nhash, [N, M, subject])
+                let item_kind = item_name_to_kind(base)
+                    .ok_or_else(|| self.error(format!("unknown parametric operator: {base}")))?;
+                let p1 = *param1;
+                let p2 = *param2;
+                self.advance(); // consume ParametricOperator
+
+                // Expect the colon separator (same as operator form).
+                if self.peek() == &Token::Colon {
+                    self.advance();
+                } else {
+                    return Err(self.error(format!(
+                        "expected ':' after parametric operator {}, got {:?}",
+                        base,
+                        self.peek()
+                    )));
+                }
+
+                // Parse the subject expression.
+                let subject = self.parse_sequence()?;
+
+                // Build args: numeric params as Literal nodes, then subject.
+                let mut args = Vec::new();
+                args.push(AstNode::Literal(p1.to_string()));
+                if let Some(m) = p2 {
+                    args.push(AstNode::Literal(m.to_string()));
+                }
+                args.push(subject);
+
+                AstNode::Item {
+                    kind: item_kind,
+                    args,
+                    yes_branch: None,
+                    no_branch: None,
+                }
             }
             Token::Identifier(ref name) => {
                 let name_owned = name.clone();

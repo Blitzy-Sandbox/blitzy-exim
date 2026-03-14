@@ -365,6 +365,7 @@ pub fn expansion_test_mode(
     test_message: Option<&str>,
     ctx: &ServerContext,
     config: &Arc<exim_config::Config>,
+    config_file: &str,
 ) -> ExitCode {
     tracing::debug!("expansion_test_mode: entering");
 
@@ -448,7 +449,7 @@ pub fn expansion_test_mode(
 
     // Build an expansion context populated with static variable values
     // so that expressions like ${version_number} resolve correctly.
-    let expand_ctx = build_expand_context(ctx, config);
+    let expand_ctx = build_expand_context(ctx, config, config_file);
 
     // Read expansion strings from stdin, one per line.
     // Each line is expanded independently and the result is printed.
@@ -534,6 +535,7 @@ fn expansion_test_line_ctx<W: Write>(
 fn build_expand_context(
     ctx: &ServerContext,
     config: &Arc<exim_config::Config>,
+    config_file: &str,
 ) -> exim_expand::variables::ExpandContext {
     use exim_store::taint::Clean;
 
@@ -556,6 +558,11 @@ fn build_expand_context(
     expand_ctx.spool_directory = Clean::new(config_spool_directory(config));
     expand_ctx.qualify_domain = Clean::new(ctx.primary_hostname.clone());
     expand_ctx.qualify_recipient = Clean::new(ctx.primary_hostname.clone());
+
+    // Configuration file path (Issue #7: $config_file variable).
+    // Per AAP §0.7.1: must match C Exim behavior where $config_file
+    // returns the path of the loaded configuration file.
+    expand_ctx.config_file = Clean::new(config_file.to_string());
 
     expand_ctx
 }

@@ -396,6 +396,7 @@ fn dispatch_mode(
             message_file.as_deref(),
             server_ctx,
             frozen_config,
+            &config_ctx.config_filename.to_string_lossy(),
         ),
 
         // ── Filter Testing ──────────────────────────────────────────────
@@ -543,7 +544,13 @@ fn dispatch_message_action(
         cli::MessageAction::LoadForExpansion => {
             if let Some(msg_id) = message_ids.first() {
                 info!(message_id = %msg_id, "loading message for expansion test");
-                modes::expansion_test_mode(Some(msg_id.as_str()), None, server_ctx, frozen_config)
+                modes::expansion_test_mode(
+                    Some(msg_id.as_str()),
+                    None,
+                    server_ctx,
+                    frozen_config,
+                    &config_ctx.config_filename.to_string_lossy(),
+                )
             } else {
                 ExitCode::FAILURE
             }
