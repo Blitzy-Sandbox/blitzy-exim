@@ -54,7 +54,7 @@
 //! by Rust Exim and vice versa. Both `-H` and `-D` file formats are
 //! byte-level compatible.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 // =============================================================================
 // Submodule Declarations

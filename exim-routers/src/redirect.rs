@@ -968,17 +968,58 @@ impl RedirectRouter {
             if entry.starts_with(":include:") {
                 if (opts.bit_options & RDO_INCLUDE) != 0 {
                     let include_path = entry.trim_start_matches(":include:").trim();
-                    // Validate include directory restriction
+                    // Validate include directory restriction.
+                    //
+                    // SECURITY (CWE-22): We must canonicalize the include path
+                    // BEFORE comparing with the allowed directory to prevent
+                    // path traversal via ".." components.  A path like
+                    // ":include:/allowed/dir/../../../etc/shadow" would pass a
+                    // naive starts_with() check but resolve outside the
+                    // allowed directory.
                     if let Some(ref inc_dir) = opts.include_directory {
-                        if !include_path.starts_with(inc_dir.as_str()) {
-                            syntax_errors.push(SyntaxErrorEntry {
-                                message: format!(
-                                    ":include: path '{include_path}' not within \
-                                     allowed directory '{inc_dir}'"
-                                ),
-                                address: Some(entry.to_string()),
-                            });
-                            continue;
+                        let include_path_obj = Path::new(include_path);
+                        match include_path_obj.canonicalize() {
+                            Ok(canonical_path) => {
+                                let canonical_dir = match Path::new(inc_dir.as_str()).canonicalize()
+                                {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        syntax_errors.push(SyntaxErrorEntry {
+                                            message: format!(
+                                                ":include: allowed directory '{inc_dir}' \
+                                                 cannot be resolved: {e}"
+                                            ),
+                                            address: Some(entry.to_string()),
+                                        });
+                                        continue;
+                                    }
+                                };
+                                if !canonical_path.starts_with(&canonical_dir) {
+                                    syntax_errors.push(SyntaxErrorEntry {
+                                        message: format!(
+                                            ":include: path '{}' resolves outside \
+                                             allowed directory '{}'",
+                                            canonical_path.display(),
+                                            canonical_dir.display()
+                                        ),
+                                        address: Some(entry.to_string()),
+                                    });
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                // If canonicalize fails (file not found, permission
+                                // denied), reject the path — we cannot verify it
+                                // is within the allowed directory.
+                                syntax_errors.push(SyntaxErrorEntry {
+                                    message: format!(
+                                        ":include: path '{include_path}' cannot be \
+                                         resolved: {e}"
+                                    ),
+                                    address: Some(entry.to_string()),
+                                });
+                                continue;
+                            }
                         }
                     }
                     // Read the included file and recursively parse
@@ -1993,10 +2034,11 @@ impl RouterDriver for RedirectRouter {
     /// main address.  Instead, it generates child addresses that are
     /// re-routed through the router chain (or have transports assigned
     /// to special deliveries like pipe/file/directory/reply).
+    ///
+    /// C: `.ri_flags = ri_notransport` (redirect.c line 813, value 0x0002).
     fn flags(&self) -> RouterFlags {
-        // ri_notransport equivalent — the redirect router does not require
-        // a transport on the router instance config itself.
-        RouterFlags::from_bits(0x0001)
+        // C: `.ri_flags = ri_notransport` — must NOT have a transport configured.
+        RouterFlags::NO_TRANSPORT
     }
 
     /// Return the driver name.
@@ -2009,6 +2051,7 @@ impl RouterDriver for RedirectRouter {
 //  Compile-Time Driver Registration
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "router-redirect")]
 inventory::submit! {
     RouterDriverFactory {
         name: "redirect",
@@ -2118,8 +2161,13 @@ mod tests {
     }
 
     #[test]
-    fn test_flags_not_zero() {
-        assert_ne!(RedirectRouter.flags().bits(), 0);
+    fn test_flags_notransport() {
+        let flags = RedirectRouter.flags();
+        // C: `.ri_flags = ri_notransport` (0x0002) — redirect must NOT have a transport.
+        assert_eq!(flags, RouterFlags::NO_TRANSPORT);
+        assert_eq!(flags.bits(), 0x0002);
+        assert!(!flags.is_empty());
+        assert!(!flags.contains(RouterFlags::YES_TRANSPORT));
     }
 
     #[test]

@@ -83,12 +83,14 @@
 //! ## Safety
 //!
 //! This crate contains **zero `unsafe` code** (per AAP §0.7.2).  The
-//! `#![deny(unsafe_code)]` attribute is applied crate-wide to enforce
-//! this invariant at compile time.
+//! `#![forbid(unsafe_code)]` attribute is applied crate-wide to enforce
+//! this invariant at compile time.  `forbid` is used instead of `deny`
+//! because `forbid` cannot be overridden by module-level `#[allow]`.
 
 // Forbid all unsafe code in this crate — AAP §0.7.2 requires zero
-// unsafe blocks outside the exim-ffi crate.
-#![deny(unsafe_code)]
+// unsafe blocks outside the exim-ffi crate.  `forbid` prevents any
+// module from locally overriding this with `#[allow(unsafe_code)]`.
+#![forbid(unsafe_code)]
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Shared Helpers Module (always available — NOT feature-gated)

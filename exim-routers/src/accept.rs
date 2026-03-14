@@ -73,11 +73,10 @@ use exim_drivers::router_driver::{
 use exim_drivers::DriverError;
 
 // ── Imports from exim-store (taint tracking) ───────────────────────────────
-
-#[allow(unused_imports)] // Tainted/Clean imported per AAP §0.7 for taint-aware design;
-// not directly constructed in accept.rs but present for type-level documentation
-// and potential future use when address data flows are fully taint-typed.
-use exim_store::taint::{Clean, Tainted};
+// Note: Tainted<T>/Clean<T> are not directly used in accept.rs because
+// the accept router unconditionally accepts addresses without data
+// transformation.  Taint tracking is handled by the delivery framework
+// after the routing decision.  No import needed here.
 
 // ── Imports from helpers ───────────────────────────────────────────────────
 //
@@ -385,9 +384,9 @@ impl RouterDriver for AcceptRouter {
     /// The `ri_yestransport` flag tells the configuration framework to
     /// require a `transport = <name>` directive for this router instance.
     fn flags(&self) -> RouterFlags {
-        // ri_yestransport in C — represented as bit 0x0001.
+        // C: `.ri_flags = ri_yestransport` (accept.c line 165).
         // The accept router requires a transport to be configured.
-        RouterFlags::from_bits(0x0001)
+        RouterFlags::YES_TRANSPORT
     }
 
     /// Returns the canonical driver name: `"accept"`.
@@ -509,7 +508,8 @@ mod tests {
     fn test_flags_yes_transport() {
         let router = AcceptRouter;
         let flags = router.flags();
-        // Accept router requires a transport (ri_yestransport = 0x0001).
+        // C: `.ri_flags = ri_yestransport` — accept router requires a transport.
+        assert_eq!(flags, RouterFlags::YES_TRANSPORT);
         assert!(!flags.is_empty());
         assert_eq!(flags.bits(), 0x0001);
     }

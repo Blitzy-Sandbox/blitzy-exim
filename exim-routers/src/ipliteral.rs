@@ -91,14 +91,9 @@ use exim_store::taint::{Clean, Tainted};
 
 /// Router flag: this router requires a transport to be assigned.
 ///
-/// Maps to C `ri_yestransport` (macros.h line 943):
-/// ```c
-/// #define ri_yestransport    0x0001    /* Must have a transport */
-/// ```
-///
-/// When this flag is set, the configuration validator reports an error
-/// if no `transport` is defined for an instance of this router.
-const RI_YESTRANSPORT: RouterFlags = RouterFlags::from_bits(0x0001);
+/// Aliases `RouterFlags::YES_TRANSPORT` for local readability.
+/// Maps to C `ri_yestransport` (macros.h line 943, value 0x0001).
+const RI_YESTRANSPORT: RouterFlags = RouterFlags::YES_TRANSPORT;
 
 /// Constant for MX = none (no MX record lookup performed — direct IP).
 ///

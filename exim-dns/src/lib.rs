@@ -76,8 +76,8 @@
 // =============================================================================
 
 // Compile-time guarantee of zero unsafe code in this crate (AAP §0.7.2).
-// All unsafe code is confined to the exim-ffi crate.
-#![deny(unsafe_code)]
+// `forbid` cannot be overridden by module-level `#[allow(unsafe_code)]`.
+#![forbid(unsafe_code)]
 // Encourage comprehensive documentation on all public items.
 #![warn(missing_docs)]
 // Comprehensive clippy lint enforcement (AAP §0.7.2).

@@ -7,7 +7,7 @@
 // - Zero-warning build
 // - Comprehensive clippy linting
 // - Documentation coverage encouraged
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![deny(warnings)]
 #![deny(clippy::all)]
 #![warn(missing_docs)]
@@ -74,7 +74,7 @@
 //!   enforce taint boundaries at compile time with zero runtime cost.
 //! - **Feature flags**: Cargo features replace all C `#ifdef` conditionals
 //!   (AAP §0.7.3).
-//! - **Zero unsafe code**: `#![deny(unsafe_code)]` guarantees no `unsafe`
+//! - **Zero unsafe code**: `#![forbid(unsafe_code)]` guarantees no `unsafe`
 //!   blocks in this entire crate (AAP §0.7.2).
 //!
 //! ## Consumers

@@ -22,7 +22,7 @@
 //! This file contains **zero** `unsafe` blocks (per AAP §0.7.2). All C library
 //! interactions are confined to the `exim-ffi` crate.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // Justification: exim-core is a binary crate with 7 sibling modules providing
 // public APIs consumed across module boundaries (daemon→process, daemon→signal,
 // queue_runner→process, modes→context, etc.). Dead-code analysis on `pub` items

@@ -62,9 +62,9 @@
 // `unsafe` code is confined to the `exim-ffi` crate.
 // =============================================================================
 
-// Deny unsafe code in this crate — no `unsafe` blocks permitted outside
-// the `exim-ffi` crate (AAP §0.7.2).
-#![deny(unsafe_code)]
+// Forbid unsafe code in this crate — `forbid` cannot be overridden by
+// module-level `#[allow]` (AAP §0.7.2).
+#![forbid(unsafe_code)]
 
 // =============================================================================
 // Feature-Gated Module Declarations

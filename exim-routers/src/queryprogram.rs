@@ -1015,9 +1015,15 @@ impl QueryProgramRouter {
                 // Build the host list (C line 519: host_build_hostlist).
                 // Wrap in Tainted since it comes from external program output.
                 let tainted_hosts: TaintedString = Tainted::new(hosts_str.to_string());
-                // Use force_clean() for host names — the delivery framework
-                // will perform DNS validation downstream per the
-                // host_find_failed_policy.
+                // TAINT BYPASS RATIONALE: Host names from external program output
+                // are inherently untrusted (tainted).  We use force_clean() here
+                // because the delivery framework (`exim-deliver/src/orchestrator.rs`)
+                // performs mandatory DNS validation on all host names before
+                // establishing SMTP connections.  The `host_find_failed_policy`
+                // controls behavior when DNS resolution fails (defer/fail/ignore).
+                // This matches the C architecture where host_build_hostlist()
+                // accepts tainted strings and host_find_bydns() validates them
+                // downstream.
                 let clean_hosts: Clean<String> = tainted_hosts.force_clean();
                 let hosts_inner: &str = clean_hosts.as_ref();
                 let hosts: Vec<String> = hosts_inner

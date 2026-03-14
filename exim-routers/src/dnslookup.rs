@@ -686,6 +686,20 @@ impl DnsLookupRouter {
     ///
     /// This is a simplified version of the C `match_isinlist()` function
     /// used throughout dnslookup.c for domain list checking.
+    /// Simplified domain matching for colon-separated domain lists.
+    ///
+    /// **Simplification note**: This is a reduced implementation compared to
+    /// C `match_isinlist()` which supports named lists (referenced via `+`),
+    /// negation (`!`), regular expressions, and lookup-based matching.
+    /// This implementation handles:
+    ///   - Exact domain match (case-insensitive)
+    ///   - Wildcard prefix match (`*.example.com`)
+    ///   - Bare wildcard (`*`)
+    ///
+    /// Full integration with the Exim match subsystem (named lists, negation,
+    /// regex, lookup operations) requires the `exim-expand` and `exim-lookups`
+    /// crates and is tracked as future integration work to achieve complete
+    /// behavioral parity with C Exim's `match_isinlist()`.
     fn domain_matches_list(domain: &str, domain_list: &str) -> bool {
         let domain_lower = domain.to_ascii_lowercase();
         for pattern in domain_list.split(':') {
@@ -769,6 +783,11 @@ impl DnsLookupRouter {
     /// 3. Tries the original domain again after widening (post-widen phase)
     ///
     /// Returns the DNS lookup result and the actual domain name that succeeded.
+    // Justification: This function is a direct translation of C dnslookup.c
+    // lines 140–320 (host_find_bydns call with its 8+ parameters).  The high
+    // parameter count preserves 1:1 correspondence with the C call site,
+    // making cross-reference during review straightforward.  Reducing arity
+    // would require introducing a parameter struct that obscures the mapping.
     #[allow(clippy::too_many_arguments)]
     fn perform_dns_lookup(
         resolver: &DnsResolver,
@@ -1646,17 +1665,15 @@ impl RouterDriver for DnsLookupRouter {
 
     /// Returns the descriptor flags for the DNS lookup router type.
     ///
-    /// C: `dnslookup_router_info.ri_flags = ri_yestransport`
+    /// C: `dnslookup_router_info.ri_flags = ri_yestransport` (dnslookup.c line 493).
     ///
-    /// The `ri_yestransport` flag indicates that this router requires a
-    /// transport to be configured. In the simplified Rust API, this is
-    /// communicated via `RouterFlags::NONE` since transport validation
-    /// is handled by the delivery orchestrator.
+    /// The `ri_yestransport` flag (0x0001) indicates that this router
+    /// requires a transport to be configured.  The configuration validator
+    /// will reject any dnslookup router instance without a `transport`
+    /// directive.
     fn flags(&self) -> RouterFlags {
-        // C uses ri_yestransport (value 1) here, but the Rust RouterFlags
-        // doesn't currently define a YES_TRANSPORT constant. The transport
-        // requirement is enforced at the config validation level.
-        RouterFlags::NONE
+        // C: `.ri_flags = ri_yestransport` — must have a transport configured.
+        RouterFlags::YES_TRANSPORT
     }
 
     /// Returns the canonical driver name: `"dnslookup"`.
@@ -1859,7 +1876,10 @@ mod tests {
     #[test]
     fn test_flags() {
         let router = DnsLookupRouter::new();
-        assert_eq!(router.flags(), RouterFlags::NONE);
+        // C: `.ri_flags = ri_yestransport` — dnslookup requires a transport.
+        assert_eq!(router.flags(), RouterFlags::YES_TRANSPORT);
+        assert!(!router.flags().is_empty());
+        assert_eq!(router.flags().bits(), 0x0001);
     }
 
     // ── Options Downcast Test ────────────────────────────────────────

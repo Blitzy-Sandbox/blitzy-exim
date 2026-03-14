@@ -64,10 +64,11 @@
 //!
 //! ## Safety
 //!
-//! This crate contains **no `unsafe` code**.  The `#![deny(unsafe_code)]`
-//! crate-level attribute enforces this guarantee at compile time.  All `unsafe`
-//! operations in the Exim Rust workspace are confined exclusively to the
-//! `exim-ffi` crate (per AAP §0.7.2).
+//! This crate contains **no `unsafe` code**.  The `#![forbid(unsafe_code)]`
+//! crate-level attribute enforces this guarantee at compile time.  `forbid`
+//! is stronger than `deny` because it cannot be overridden by module-level
+//! `#[allow(unsafe_code)]`.  All `unsafe` operations in the Exim Rust
+//! workspace are confined exclusively to the `exim-ffi` crate (per AAP §0.7.2).
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -76,8 +77,8 @@
 // ---------------------------------------------------------------------------
 
 // Compile-time guarantee that this crate contains zero unsafe code.
-// All unsafe operations are confined to the exim-ffi crate (AAP §0.7.2).
-#![deny(unsafe_code)]
+// `forbid` cannot be overridden by `#[allow]` in submodules (AAP §0.7.2).
+#![forbid(unsafe_code)]
 // Encourage comprehensive documentation on all public items.
 #![warn(missing_docs)]
 // Comprehensive clippy lint enforcement for code quality.

@@ -44,6 +44,17 @@
 //! | `iplookup_router_entry()` | [`IpLookupRouter::route()`] |
 //! | `iplookup_router_info` | [`inventory::submit!`] registration |
 //!
+//! ## Design Decisions
+//!
+//! **Self-reference detection**: In the C implementation, self-reference
+//! detection (checking whether this host is listed as a target in the
+//! external response) is performed inline within `iplookup_router_entry()`.
+//! In the Rust implementation, this check is deferred to the host-scanning
+//! layer in the delivery framework (`exim-deliver`), which already performs
+//! self-reference checks as part of host list processing for all routers.
+//! This avoids duplicating the logic and keeps the iplookup router focused
+//! on query/response I/O.
+//!
 //! ## Safety
 //!
 //! This module contains **zero `unsafe` code** (per AAP §0.7.2).
@@ -1270,15 +1281,16 @@ impl RouterDriver for IpLookupRouter {
 
     /// Return router flags.
     ///
-    /// The iplookup router sets `ri_notransport` (bit 0x0001) because it
+    /// The iplookup router sets `ri_notransport` (0x0002) because it
     /// generates child addresses rather than assigning a transport directly.
+    /// A `transport` directive on an iplookup router instance would be
+    /// a configuration error — the configuration validator should reject it.
     ///
     /// Corresponds to C `iplookup_router_info.ri_flags = ri_notransport`
-    /// at `iplookup.c` line 96.
+    /// at `iplookup.c` line 442.
     fn flags(&self) -> RouterFlags {
-        // ri_notransport = 0x0001 — this router generates child addresses,
-        // it does not directly assign a transport.
-        RouterFlags::from_bits(0x0001)
+        // C: `.ri_flags = ri_notransport` — must NOT have a transport configured.
+        RouterFlags::NO_TRANSPORT
     }
 
     /// Return the driver name for identification and configuration matching.
@@ -1660,9 +1672,11 @@ mod tests {
     fn test_flags_notransport() {
         let router = IpLookupRouter;
         let flags = router.flags();
-        // ri_notransport = 0x0001
-        assert_eq!(flags.bits(), 0x0001);
-        assert!(flags.contains(RouterFlags::from_bits(0x0001)));
+        // C: `.ri_flags = ri_notransport` (0x0002) — iplookup must NOT have a transport.
+        assert_eq!(flags, RouterFlags::NO_TRANSPORT);
+        assert_eq!(flags.bits(), 0x0002);
+        assert!(flags.contains(RouterFlags::NO_TRANSPORT));
+        assert!(!flags.contains(RouterFlags::YES_TRANSPORT));
         assert!(!flags.is_empty());
     }
 

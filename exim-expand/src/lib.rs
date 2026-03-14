@@ -32,11 +32,11 @@
 
 // ── Crate-level lint configuration ──────────────────────────────────────
 //
-// `deny(unsafe_code)` prevents unsafe code in ALL modules — no exceptions.
-// Per AAP §0.7.2, all unsafe operations (including libloading's `dlopen`/
-// `dlsym` wrappers formerly in the `dlfunc` module) are now centralised in
-// the `exim-ffi` crate.  This crate contains zero unsafe blocks.
-#![deny(unsafe_code)]
+// `forbid(unsafe_code)` prevents unsafe code in ALL modules — no exceptions.
+// `forbid` is stronger than `deny` because it cannot be overridden by
+// module-level `#[allow(unsafe_code)]`.  Per AAP §0.7.2, all unsafe
+// operations are centralised in the `exim-ffi` crate.
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![deny(clippy::all)]
 

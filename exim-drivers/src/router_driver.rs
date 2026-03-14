@@ -660,7 +660,38 @@ pub struct RouterFlags(u32);
 
 impl RouterFlags {
     /// No flags set — the default for most router drivers.
+    ///
+    /// Used by `manualroute` and `queryprogram` routers, which have no
+    /// special transport requirements (C: `.ri_flags = 0`).
     pub const NONE: Self = Self(0);
+
+    /// Router requires a transport to be configured (`ri_yestransport`).
+    ///
+    /// Maps to C `macros.h` line 943:
+    /// ```c
+    /// #define ri_yestransport    0x0001    /* Must have a transport */
+    /// ```
+    ///
+    /// When this flag is set, the configuration validator reports an error
+    /// if no `transport = <name>` directive is present for the router instance.
+    ///
+    /// Used by: `accept`, `dnslookup`, `ipliteral` routers.
+    pub const YES_TRANSPORT: Self = Self(0x0001);
+
+    /// Router must NOT have a transport configured (`ri_notransport`).
+    ///
+    /// Maps to C `macros.h` line 944:
+    /// ```c
+    /// #define ri_notransport     0x0002    /* Must not have a transport */
+    /// ```
+    ///
+    /// When this flag is set, the configuration validator reports an error
+    /// if a `transport = <name>` directive IS present for the router instance,
+    /// because the router generates child addresses rather than assigning a
+    /// transport directly to the original address.
+    ///
+    /// Used by: `iplookup`, `redirect` routers.
+    pub const NO_TRANSPORT: Self = Self(0x0002);
 
     /// Create a `RouterFlags` value from raw bits.
     ///
@@ -731,7 +762,23 @@ impl fmt::Display for RouterFlags {
         if self.is_empty() {
             write!(f, "RouterFlags(NONE)")
         } else {
-            write!(f, "RouterFlags(0x{:08x})", self.0)
+            let mut parts = Vec::new();
+            let mut remaining = self.0;
+            if self.contains(Self::YES_TRANSPORT) {
+                parts.push("YES_TRANSPORT");
+                remaining &= !Self::YES_TRANSPORT.0;
+            }
+            if self.contains(Self::NO_TRANSPORT) {
+                parts.push("NO_TRANSPORT");
+                remaining &= !Self::NO_TRANSPORT.0;
+            }
+            if remaining != 0 {
+                // Unknown bits present — fall back to full hex display for
+                // forward compatibility with future flag additions.
+                write!(f, "RouterFlags(0x{:08x})", self.0)
+            } else {
+                write!(f, "RouterFlags({})", parts.join("|"))
+            }
         }
     }
 }
@@ -1143,10 +1190,38 @@ mod tests {
     }
 
     #[test]
+    fn test_router_flags_yes_transport() {
+        assert!(!RouterFlags::YES_TRANSPORT.is_empty());
+        assert_eq!(RouterFlags::YES_TRANSPORT.bits(), 0x0001);
+        assert!(RouterFlags::YES_TRANSPORT.contains(RouterFlags::YES_TRANSPORT));
+        assert!(!RouterFlags::YES_TRANSPORT.contains(RouterFlags::NO_TRANSPORT));
+    }
+
+    #[test]
+    fn test_router_flags_no_transport() {
+        assert!(!RouterFlags::NO_TRANSPORT.is_empty());
+        assert_eq!(RouterFlags::NO_TRANSPORT.bits(), 0x0002);
+        assert!(RouterFlags::NO_TRANSPORT.contains(RouterFlags::NO_TRANSPORT));
+        assert!(!RouterFlags::NO_TRANSPORT.contains(RouterFlags::YES_TRANSPORT));
+    }
+
+    #[test]
+    fn test_router_flags_yes_no_transport_distinct() {
+        // ri_yestransport (0x0001) and ri_notransport (0x0002) must have
+        // distinct bit values — they represent mutually exclusive semantics.
+        assert_ne!(RouterFlags::YES_TRANSPORT, RouterFlags::NO_TRANSPORT);
+        assert_ne!(
+            RouterFlags::YES_TRANSPORT.bits(),
+            RouterFlags::NO_TRANSPORT.bits()
+        );
+    }
+
+    #[test]
     fn test_router_flags_from_bits() {
         let flags = RouterFlags::from_bits(0x0001);
         assert!(!flags.is_empty());
         assert_eq!(flags.bits(), 1);
+        assert_eq!(flags, RouterFlags::YES_TRANSPORT);
     }
 
     #[test]
@@ -1193,6 +1268,14 @@ mod tests {
     #[test]
     fn test_router_flags_display() {
         assert_eq!(RouterFlags::NONE.to_string(), "RouterFlags(NONE)");
+        assert_eq!(
+            RouterFlags::YES_TRANSPORT.to_string(),
+            "RouterFlags(YES_TRANSPORT)"
+        );
+        assert_eq!(
+            RouterFlags::NO_TRANSPORT.to_string(),
+            "RouterFlags(NO_TRANSPORT)"
+        );
         assert_eq!(
             RouterFlags::from_bits(0x42).to_string(),
             "RouterFlags(0x00000042)"

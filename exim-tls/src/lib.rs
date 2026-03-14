@@ -29,7 +29,7 @@
 //! - **rustls** (default, `tls-rustls` feature) — Memory-safe, no C dep
 //! - **openssl** (optional, `tls-openssl` feature) — For FIPS or legacy
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 // =============================================================================

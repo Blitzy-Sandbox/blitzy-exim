@@ -30,7 +30,7 @@
 // Per AAP §0.4.3: HashMap caches with explicit clear() replace C tree caches.
 // Per AAP §0.4.3: Tainted<T>/Clean<T> used for filename taint rejection.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 // =============================================================================
 // Backend Module Declarations (Feature-Gated)
