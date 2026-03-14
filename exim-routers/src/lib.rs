@@ -30,6 +30,9 @@ pub mod helpers;
 
 // ── Feature-gated router modules ────────────────────────────────────────────
 
+#[cfg(feature = "router-accept")]
+pub mod accept;
+
 #[cfg(feature = "router-dnslookup")]
 pub mod dnslookup;
 
