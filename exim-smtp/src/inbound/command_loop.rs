@@ -17,6 +17,7 @@
 // All `#ifdef` conditionals replaced with `#[cfg(feature = "...")]` — AAP §0.7.3.
 // No tokio in the daemon event loop — signal handling uses `nix` crate.
 
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::marker::PhantomData;
 use std::os::unix::io::RawFd;
@@ -135,6 +136,10 @@ pub struct MessageContext {
     pub message_id: String,
     /// Authenticated identity (set by AUTH command).
     pub authenticated_id: Option<String>,
+    /// RFC 1413 ident string or calling user login name.
+    /// In `-bs` mode this is `originator_login`; in `-bh` mode it is `None`.
+    /// Used in HELO/EHLO greeting: "Hello sender_ident at helo_name".
+    pub sender_ident: Option<String>,
     /// IP address of the sending host.
     pub sender_host_address: Option<String>,
     /// Resolved hostname of the sending host.
@@ -171,6 +176,11 @@ pub struct MessageContext {
     pub sender_verified: bool,
     /// The SMTP banner string (expanded from config).
     pub smtp_banner: Option<String>,
+    /// TLS backend extracted from the SMTP session when yielding for DATA/BDAT.
+    /// The daemon reads from this after `SmtpSetupResult::Yield` to continue
+    /// encrypted I/O during message body reception.  `None` for plaintext.
+    #[cfg(feature = "tls")]
+    pub tls_backend: Option<Box<exim_tls::rustls_backend::RustlsBackend>>,
 }
 
 /// TLS session information for logging and header generation.
@@ -231,6 +241,12 @@ pub struct RecipientItem {
 ///
 /// **Canonical source**: `exim-config/src/types.rs` `ConfigContext`.
 pub struct ConfigContext {
+    // Named ACL definitions parsed from the `begin acl` section.
+    // Key: ACL name (e.g., "a1"), Value: raw ACL body text.
+    // These are pre-parsed into `AclEvalContext::named_acls` before
+    // each ACL evaluation so the engine can resolve ACL names.
+    pub acl_definitions: HashMap<String, String>,
+
     // ACL definitions for each SMTP phase
     pub acl_smtp_helo: Option<String>,
     pub acl_smtp_mail: Option<String>,
@@ -266,6 +282,15 @@ pub struct ConfigContext {
 
     #[cfg(feature = "tls")]
     pub tls_advertise_hosts: Option<String>,
+    /// Path to PEM certificate chain for inbound STARTTLS.
+    #[cfg(feature = "tls")]
+    pub tls_certificate: Option<String>,
+    /// Path to PEM private key for inbound STARTTLS.
+    #[cfg(feature = "tls")]
+    pub tls_privatekey: Option<String>,
+    /// Cipher suite restriction string for inbound TLS.
+    #[cfg(feature = "tls")]
+    pub tls_require_ciphers: Option<String>,
 
     #[cfg(feature = "prdr")]
     pub prdr_enable: bool,
@@ -294,6 +319,14 @@ pub struct ConfigContext {
     pub submission_mode: bool,
     pub submission_domain: Option<String>,
     pub submission_name: Option<String>,
+
+    // Named lists from configuration for ACL condition evaluation.
+    // These are propagated into AclSessionState so conditions like
+    // `domains = +local_domains` can resolve `+` references.
+    pub named_domain_lists: HashMap<String, String>,
+    pub named_host_lists: HashMap<String, String>,
+    pub named_address_lists: HashMap<String, String>,
+    pub named_local_part_lists: HashMap<String, String>,
 }
 
 impl ConfigContext {
@@ -315,6 +348,14 @@ impl ConfigContext {
         auth_instances: Vec<AuthInstanceConfig>,
     ) -> Self {
         Self {
+            // Named ACL definitions — convert from BTreeMap<String, AclBlock>
+            // to HashMap<String, String> for efficient lookup during ACL evaluation
+            acl_definitions: cfg
+                .acl_definitions
+                .iter()
+                .map(|(name, block)| (name.clone(), block.raw_definition.clone()))
+                .collect(),
+
             // ACL definitions — propagated from the parsed config
             acl_smtp_helo: cfg.acl_smtp_helo.clone(),
             acl_smtp_mail: cfg.acl_smtp_mail.clone(),
@@ -355,6 +396,12 @@ impl ConfigContext {
 
             #[cfg(feature = "tls")]
             tls_advertise_hosts: cfg.tls_advertise_hosts.clone(),
+            #[cfg(feature = "tls")]
+            tls_certificate: cfg.tls_certificate.clone(),
+            #[cfg(feature = "tls")]
+            tls_privatekey: cfg.tls_privatekey.clone(),
+            #[cfg(feature = "tls")]
+            tls_require_ciphers: cfg.tls_require_ciphers.clone(),
 
             // PRDR is an extension feature; not yet represented in exim_config,
             // so default to disabled.
@@ -387,6 +434,32 @@ impl ConfigContext {
             submission_mode: false,
             submission_domain: None,
             submission_name: None,
+
+            // Named lists — propagated from parsed config for ACL condition resolution
+            named_domain_lists: cfg
+                .named_lists
+                .domain_lists
+                .iter()
+                .map(|(k, v)| (k.clone(), v.value.clone()))
+                .collect(),
+            named_host_lists: cfg
+                .named_lists
+                .host_lists
+                .iter()
+                .map(|(k, v)| (k.clone(), v.value.clone()))
+                .collect(),
+            named_address_lists: cfg
+                .named_lists
+                .address_lists
+                .iter()
+                .map(|(k, v)| (k.clone(), v.value.clone()))
+                .collect(),
+            named_local_part_lists: cfg
+                .named_lists
+                .localpart_lists
+                .iter()
+                .map(|(k, v)| (k.clone(), v.value.clone()))
+                .collect(),
         }
     }
 }
@@ -400,6 +473,7 @@ impl Default for MessageContext {
             headers: Vec::new(),
             message_id: String::new(),
             authenticated_id: None,
+            sender_ident: None,
             sender_host_address: None,
             sender_host_name: None,
             sender_host_port: 0,
@@ -418,6 +492,8 @@ impl Default for MessageContext {
             body_type: BodyType::SevenBit,
             sender_verified: false,
             smtp_banner: None,
+            #[cfg(feature = "tls")]
+            tls_backend: None,
         }
     }
 }
@@ -446,6 +522,9 @@ pub enum SmtpSetupResult {
     /// immediate session teardown.
     Error,
 }
+
+// TLS backend is deposited into `MessageContext::tls_backend` before
+// returning `Yield` — no return-type changes needed for SMTP functions.
 
 // =============================================================================
 // SMTP Command List — matches C cmd_list[] (smtp_in.c lines 195-224)
@@ -776,6 +855,29 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
 // =============================================================================
 
 impl<'ctx, S> SmtpSession<'ctx, S> {
+    // ── ACL Session State Builder ──
+
+    /// Build an `AclSessionState` from the current SMTP session, carrying
+    /// envelope sender, client IP, HELO name, and named lists into the
+    /// ACL evaluation context. Called before each `run_acl_check()` so that
+    /// conditions like `senders`, `hosts`, and `domains` can match against
+    /// real session data.
+    pub(crate) fn acl_session_state(&self) -> AclSessionState {
+        AclSessionState {
+            sender_address: self.message_ctx.sender_address.clone(),
+            client_ip: self
+                .message_ctx
+                .sender_host_address
+                .clone()
+                .unwrap_or_default(),
+            helo_name: self.message_ctx.helo_name.clone().unwrap_or_default(),
+            named_domain_lists: self.config_ctx.named_domain_lists.clone(),
+            named_host_lists: self.config_ctx.named_host_lists.clone(),
+            named_address_lists: self.config_ctx.named_address_lists.clone(),
+            named_local_part_lists: self.config_ctx.named_local_part_lists.clone(),
+        }
+    }
+
     // ── HAD Macro — Command History Ring Buffer (smtp_in.c:116-118) ──
 
     /// Record a command in the connection history ring buffer.
@@ -902,6 +1004,24 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
     /// ENOTSOCK for pipe-based fds in `-bs` mode).  This is the fix for
     /// QA Issue 6 ("SMTP socket write error: ENOTSOCK").
     fn write_to_socket(&mut self, buf: &[u8]) {
+        // When TLS is active, write through the encrypted TLS stream
+        // instead of the raw socket fd.
+        #[cfg(feature = "tls")]
+        if let Some(ref mut tls) = self.io.tls_backend {
+            let mut sent = 0usize;
+            while sent < buf.len() {
+                match tls.write(&buf[sent..]) {
+                    Ok(n) => sent += n,
+                    Err(e) => {
+                        error!("TLS write error: {}", e);
+                        self.smtp_write_error = 1;
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+
         let fd = self.io.out_fd;
         let mut sent = 0usize;
         while sent < buf.len() {
@@ -1526,8 +1646,13 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
 
         // Run HELO ACL if configured
         if let Some(ref acl) = self.config_ctx.acl_smtp_helo {
-            let (acl_rc, user_msg, log_msg) =
-                run_acl_check(AclWhere::Helo, Some(acl), Some(name_ref));
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::Helo,
+                Some(acl),
+                Some(name_ref),
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 let result = self.smtp_handle_acl_fail(AclWhere::Helo, acl_rc, &user_msg, &log_msg);
                 if result < 0 {
@@ -1553,12 +1678,25 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
         // Update protocol based on TLS and auth state
         self.update_received_protocol();
 
-        // Send response
+        // Send response — C Exim format (smtp_in.c:4224-4232):
+        //   "250 <hostname> Hello <sender_ident> at <helo_name> [<ip>]"
+        // sender_ident is present in -bs mode (originator_login), absent in -bh mode.
         if is_ehlo {
             self.send_ehlo_response();
         } else {
             let hostname = self.server_ctx.smtp_active_hostname.clone();
-            let response = format!("{} Hello {}", hostname, name_ref);
+            let ident_prefix = match &self.message_ctx.sender_ident {
+                Some(ident) if !ident.is_empty() => format!("{} at ", ident),
+                _ => String::new(),
+            };
+            let ip_suffix = match &self.message_ctx.sender_host_address {
+                Some(ip) if !ip.is_empty() => format!(" [{}]", ip),
+                _ => String::new(),
+            };
+            let response = format!(
+                "{} Hello {}{}{}",
+                hostname, ident_prefix, name_ref, ip_suffix
+            );
             self.smtp_respond("250", false, &response);
         }
 
@@ -1665,8 +1803,13 @@ impl<'ctx> SmtpSession<'ctx, Greeted> {
 
         // Run MAIL FROM ACL if configured
         if let Some(ref acl) = self.config_ctx.acl_smtp_mail {
-            let (acl_rc, user_msg, log_msg) =
-                run_acl_check(AclWhere::Mail, Some(acl), Some(&sender));
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::Mail,
+                Some(acl),
+                Some(&sender),
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 let result = self.smtp_handle_acl_fail(AclWhere::Mail, acl_rc, &user_msg, &log_msg);
                 if result < 0 {
@@ -1743,8 +1886,13 @@ impl<'ctx> SmtpSession<'ctx, MailFrom> {
         // Run RCPT TO ACL if configured
         self.rcpt_in_progress = true;
         if let Some(ref acl) = self.config_ctx.acl_smtp_rcpt {
-            let (acl_rc, user_msg, log_msg) =
-                run_acl_check(AclWhere::Rcpt, Some(acl), Some(&recipient));
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::Rcpt,
+                Some(acl),
+                Some(&recipient),
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 self.rcpt_in_progress = false;
                 let result = self.smtp_handle_acl_fail(AclWhere::Rcpt, acl_rc, &user_msg, &log_msg);
@@ -1826,8 +1974,13 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
         // Run RCPT TO ACL
         self.rcpt_in_progress = true;
         if let Some(ref acl) = self.config_ctx.acl_smtp_rcpt {
-            let (acl_rc, user_msg, log_msg) =
-                run_acl_check(AclWhere::Rcpt, Some(acl), Some(&recipient));
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::Rcpt,
+                Some(acl),
+                Some(&recipient),
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 self.rcpt_in_progress = false;
                 let result = self.smtp_handle_acl_fail(AclWhere::Rcpt, acl_rc, &user_msg, &log_msg);
@@ -1891,7 +2044,13 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
 
         // Run PREDATA ACL if configured
         if let Some(ref acl) = self.config_ctx.acl_smtp_predata {
-            let (acl_rc, user_msg, log_msg) = run_acl_check(AclWhere::Predata, Some(acl), None);
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::Predata,
+                Some(acl),
+                None,
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 let result =
                     self.smtp_handle_acl_fail(AclWhere::Predata, acl_rc, &user_msg, &log_msg);
@@ -1916,7 +2075,13 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
 
         // Run DATA ACL if configured
         if let Some(ref acl) = self.config_ctx.acl_smtp_data {
-            let (acl_rc, user_msg, log_msg) = run_acl_check(AclWhere::Data, Some(acl), None);
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::Data,
+                Some(acl),
+                None,
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 let result = self.smtp_handle_acl_fail(AclWhere::Data, acl_rc, &user_msg, &log_msg);
                 if result < 0 {
@@ -1999,10 +2164,18 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
     /// C reference: smtp_in.c lines 4330-4500.
     fn send_ehlo_response(&mut self) {
         let hostname = self.server_ctx.smtp_active_hostname.clone();
+        let helo_name = self.message_ctx.helo_name.as_deref().unwrap_or("unknown");
+        let ident_prefix = match &self.message_ctx.sender_ident {
+            Some(ident) if !ident.is_empty() => format!("{} at ", ident),
+            _ => String::new(),
+        };
+        let ip_suffix = match &self.message_ctx.sender_host_address {
+            Some(ip) if !ip.is_empty() => format!(" [{}]", ip),
+            _ => String::new(),
+        };
         let greeting = format!(
-            "{} Hello {}",
-            hostname,
-            self.message_ctx.helo_name.as_deref().unwrap_or("unknown")
+            "{} Hello {}{}{}",
+            hostname, ident_prefix, helo_name, ip_suffix
         );
 
         // Build capability list
@@ -2101,6 +2274,11 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 }
             }
         }
+
+        // HELP — always advertised as the last EHLO capability, matching C
+        // Exim's behaviour (smtp_in.c ehlo_response, always terminates the
+        // capability list with "HELP").
+        caps.push("HELP".to_string());
 
         // Send capabilities as multi-line response
         for (i, cap) in caps.iter().enumerate() {
@@ -2292,8 +2470,13 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
 
         // Run AUTH ACL if configured
         if let Some(ref acl) = self.config_ctx.acl_smtp_auth {
-            let (acl_rc, user_msg, log_msg) =
-                run_acl_check(AclWhere::Auth, Some(acl), Some(&mechanism));
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::Auth,
+                Some(acl),
+                Some(&mechanism),
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 let result = self.smtp_handle_acl_fail(AclWhere::Auth, acl_rc, &user_msg, &log_msg);
                 if result < 0 {
@@ -2387,7 +2570,13 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
 
         // Run STARTTLS ACL if configured
         if let Some(ref acl) = self.config_ctx.acl_smtp_starttls {
-            let (acl_rc, user_msg, log_msg) = run_acl_check(AclWhere::StartTls, Some(acl), None);
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::StartTls,
+                Some(acl),
+                None,
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 let result =
                     self.smtp_handle_acl_fail(AclWhere::StartTls, acl_rc, &user_msg, &log_msg);
@@ -2415,8 +2604,17 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
         // all subsequent reads and writes.  The SMTP session MUST be
         // reset (RFC 3207 §4.2) — HELO/AUTH state is cleared so the
         // client re-identifies itself over the encrypted channel.
-        match tls_server_start(self.io.in_fd) {
-            Ok(tls_session) => {
+        match tls_server_start(
+            self.io.in_fd,
+            self.config_ctx.tls_certificate.as_deref(),
+            self.config_ctx.tls_privatekey.as_deref(),
+            self.config_ctx.tls_require_ciphers.as_deref(),
+        ) {
+            Ok((tls_session, tls_backend)) => {
+                // Store the live TLS backend so all subsequent I/O goes
+                // through the encrypted stream.
+                self.io.tls_backend = Some(tls_backend);
+
                 // Populate TLS session metadata for logging and headers
                 self.message_ctx.tls_in.active = true;
                 self.message_ctx.tls_in.cipher = tls_session.cipher.clone();
@@ -2494,8 +2692,13 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
         self.had(SmtpCommandHistory::SchVrfy);
 
         if let Some(ref acl) = self.config_ctx.acl_smtp_vrfy {
-            let (acl_rc, user_msg, log_msg) =
-                run_acl_check(AclWhere::Vrfy, Some(acl), Some(argument));
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::Vrfy,
+                Some(acl),
+                Some(argument),
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 let _ = self.smtp_handle_acl_fail(AclWhere::Vrfy, acl_rc, &user_msg, &log_msg);
                 return;
@@ -2517,8 +2720,13 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
     /// Runs the ACL check and responds (typically refusing to expand).
     fn handle_expn(&mut self, argument: &str) {
         if let Some(ref acl) = self.config_ctx.acl_smtp_expn {
-            let (acl_rc, user_msg, log_msg) =
-                run_acl_check(AclWhere::Expn, Some(acl), Some(argument));
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::Expn,
+                Some(acl),
+                Some(argument),
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 let _ = self.smtp_handle_acl_fail(AclWhere::Expn, acl_rc, &user_msg, &log_msg);
                 return;
@@ -2542,8 +2750,13 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
         }
 
         if let Some(ref acl) = self.config_ctx.acl_smtp_etrn {
-            let (acl_rc, user_msg, log_msg) =
-                run_acl_check(AclWhere::Etrn, Some(acl), Some(argument));
+            let (acl_rc, user_msg, log_msg) = run_acl_check(
+                AclWhere::Etrn,
+                Some(acl),
+                Some(argument),
+                &self.config_ctx.acl_definitions,
+                &self.acl_session_state(),
+            );
             if acl_rc != AclResult::Ok {
                 let _ = self.smtp_handle_acl_fail(AclWhere::Etrn, acl_rc, &user_msg, &log_msg);
                 return;
@@ -2665,9 +2878,15 @@ pub fn smtp_setup_msg(
     let banner = if let Some(ref b) = message_ctx.smtp_banner {
         b.clone()
     } else {
+        // C Exim default banner: "$primary_hostname ESMTP Exim $version_number $tod_full"
+        // where $tod_full is a timestamp like "Tue, 2 Mar 1999 09:44:33 +0000".
+        // The test harness munges dates to a canonical form, so the exact format
+        // of the timestamp matters but the actual values are replaced.
+        let version = exim_ffi::get_patched_version();
+        let tod_full = format_tod_full();
         format!(
-            "220 {} ESMTP Exim 4.99 ready\r\n",
-            server_ctx.smtp_active_hostname
+            "220 {} ESMTP Exim {} {}\r\n",
+            server_ctx.smtp_active_hostname, version, tod_full
         )
     };
 
@@ -2889,7 +3108,18 @@ fn handle_greeted_session(mut session: SmtpSession<'_, Greeted>) -> SmtpSetupRes
                     session.send_ehlo_response();
                 } else {
                     let hostname = session.server_ctx.smtp_active_hostname.clone();
-                    let response = format!("{} Hello {}", hostname, argument);
+                    let ident_prefix = match &session.message_ctx.sender_ident {
+                        Some(ident) if !ident.is_empty() => format!("{} at ", ident),
+                        _ => String::new(),
+                    };
+                    let ip_suffix = match &session.message_ctx.sender_host_address {
+                        Some(ip) if !ip.is_empty() => format!(" [{}]", ip),
+                        _ => String::new(),
+                    };
+                    let response = format!(
+                        "{} Hello {}{}{}",
+                        hostname, ident_prefix, argument, ip_suffix
+                    );
                     session.smtp_respond("250", false, &response);
                 }
 
@@ -3166,8 +3396,15 @@ fn handle_rcptto_session(mut session: SmtpSession<'_, RcptTo>) -> SmtpSetupResul
             SmtpCommand::Data => {
                 session.had(SmtpCommandHistory::SchData);
                 match session.data() {
-                    Ok(_data_session) => {
-                        // DATA accepted — yield to message reception
+                    Ok(mut _data_session) => {
+                        // DATA accepted — yield to message reception.
+                        // Deposit the TLS backend into MessageContext so the
+                        // daemon can read the body through the encrypted channel.
+                        #[cfg(feature = "tls")]
+                        {
+                            _data_session.message_ctx.tls_backend =
+                                _data_session.io.tls_backend.take();
+                        }
                         return SmtpSetupResult::Yield;
                     }
                     Err(boxed_err) => {
@@ -3207,7 +3444,11 @@ fn handle_rcptto_session(mut session: SmtpSession<'_, RcptTo>) -> SmtpSetupResul
                     session.chunking_ctx.state = crate::inbound::chunking::ChunkingState::Active;
                 }
 
-                // Yield to message reception
+                // Deposit TLS backend into MessageContext before yielding.
+                #[cfg(feature = "tls")]
+                {
+                    session.message_ctx.tls_backend = session.io.tls_backend.take();
+                }
                 return SmtpSetupResult::Yield;
             }
 
@@ -3375,24 +3616,68 @@ fn parse_size_string(s: &str) -> Option<u64> {
 /// `ServerContext` → `SmtpSession` so that credentials loaded at daemon startup
 /// are reused across connections.
 #[cfg(feature = "tls")]
-fn tls_server_start(fd: RawFd) -> Result<exim_tls::TlsSession, exim_tls::TlsError> {
-    let mut backend = exim_tls::rustls_backend::RustlsBackend::new();
+fn tls_server_start(
+    fd: RawFd,
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+    ciphers: Option<&str>,
+) -> Result<
+    (
+        exim_tls::TlsSession,
+        Box<exim_tls::rustls_backend::RustlsBackend>,
+    ),
+    exim_tls::TlsError,
+> {
+    let cert = cert_path.ok_or_else(|| {
+        exim_tls::TlsError::HandshakeError("tls_certificate not configured".into())
+    })?;
+    let key = key_path.unwrap_or(cert);
+
+    let mut backend = Box::new(exim_tls::rustls_backend::RustlsBackend::new());
+
+    // Load server credentials (certificate chain + private key) before
+    // attempting the handshake — without this the ServerConfig is None
+    // and the handshake would fail with "not initialized".
+    let creds = exim_tls::rustls_backend::ServerCredsConfig {
+        certificate: cert,
+        privatekey: key,
+        ciphers,
+        min_version: None,
+        ca_file: None,
+        require_client_cert: false,
+    };
+    backend
+        .server_creds_init(&creds)
+        .map_err(|e| exim_tls::TlsError::HandshakeError(e.to_string()))?;
+
     backend
         .server_start(fd)
         .map_err(|e| exim_tls::TlsError::HandshakeError(e.to_string()))?;
-    // Build TlsSession from the backend's post-handshake accessor methods
-    Ok(exim_tls::TlsSession {
+
+    // Build TlsSession metadata from the backend's post-handshake accessors.
+    let session = exim_tls::TlsSession {
         active: true,
         cipher: backend.cipher_name().map(String::from),
         protocol_version: backend.protocol_version().map(String::from),
-        bits: 0, // Bit strength not directly exposed by rustls backend
+        bits: 0,
         certificate_verified: backend.peer_dn().is_some(),
         peer_dn: backend.peer_dn().map(String::from),
         sni: backend.sni().map(String::from),
         peer_cert: None,
         channel_binding: None,
         resumption: exim_tls::ResumptionFlags::default(),
-    })
+    };
+    // Return both the session metadata and the live backend so the caller
+    // can store the backend for subsequent encrypted I/O.
+    Ok((session, backend))
+}
+
+/// Format the current local time as C Exim's `$tod_full`, e.g.
+/// `"Tue, 2 Mar 1999 09:44:33 +0000"`.  Uses the `exim-ffi` safe wrapper
+/// around `strftime` to produce locale-independent RFC-2822-style output
+/// matching the C binary exactly.
+fn format_tod_full() -> String {
+    exim_ffi::format_tod_full()
 }
 
 /// Extract the numeric response code from an SMTP response string.
@@ -3428,10 +3713,36 @@ fn strip_response_code(response: &str) -> &str {
 /// # Returns
 ///
 /// (AclResult, user_message, log_message)
+/// Session state passed from the SMTP handler into ACL evaluation.
+///
+/// This struct carries the envelope sender, client IP, HELO name, and
+/// named lists from the configuration so that ACL conditions like
+/// `hosts`, `senders`, `domains`, and `local_parts` can evaluate
+/// against the actual session data instead of empty defaults.
+#[derive(Default)]
+pub(crate) struct AclSessionState {
+    /// Envelope sender address from MAIL FROM (empty for null sender).
+    pub sender_address: String,
+    /// Client IP address (`sender_host_address`). Empty for local (-bs) connections.
+    pub client_ip: String,
+    /// Client's HELO/EHLO name.
+    pub helo_name: String,
+    /// Named domain lists from configuration (`domainlist local_domains = ...`).
+    pub named_domain_lists: HashMap<String, String>,
+    /// Named host lists from configuration (`hostlist ...`).
+    pub named_host_lists: HashMap<String, String>,
+    /// Named address lists from configuration (`addresslist ...`).
+    pub named_address_lists: HashMap<String, String>,
+    /// Named local-part lists from configuration (`localpartlist ...`).
+    pub named_local_part_lists: HashMap<String, String>,
+}
+
 pub(crate) fn run_acl_check(
     where_phase: AclWhere,
     acl_text: Option<&str>,
     recipient: Option<&str>,
+    acl_definitions: &HashMap<String, String>,
+    session_state: &AclSessionState,
 ) -> (AclResult, String, String) {
     // Create ACL evaluation context
     let mut eval_ctx = exim_acl::engine::AclEvalContext::default();
@@ -3439,6 +3750,52 @@ pub(crate) fn run_acl_check(
     let mut var_store = exim_acl::AclVarStore::default();
     let mut user_msg: Option<String> = None;
     let mut log_msg: Option<String> = None;
+
+    // Populate ACL message context with session state so that conditions
+    // like `senders`, `hosts`, `domains`, `local_parts` have the actual
+    // values to match against.
+    acl_msg_ctx.sender_address = session_state.sender_address.clone();
+    acl_msg_ctx.named_domain_lists = session_state.named_domain_lists.clone();
+    acl_msg_ctx.named_host_lists = session_state.named_host_lists.clone();
+    acl_msg_ctx.named_address_lists = session_state.named_address_lists.clone();
+    acl_msg_ctx.named_local_part_lists = session_state.named_local_part_lists.clone();
+
+    // Set client IP and HELO name on the eval context
+    eval_ctx.client_ip = session_state.client_ip.clone();
+    eval_ctx.sender_helo_name = session_state.helo_name.clone();
+
+    // Initialize DNS resolver for ACL conditions that need DNS lookups
+    // (hosts, dnslists, verify, etc.). In C Exim, the DNS resolver is a
+    // global singleton initialised once at startup. Here we create it
+    // per-evaluation because DnsResolver is not Clone and the eval context
+    // takes ownership. The resolver reads /etc/resolv.conf and caches
+    // results internally, so repeated creation is acceptable for
+    // correctness even if not optimal for throughput.
+    match exim_dns::DnsResolver::from_system() {
+        Ok(resolver) => {
+            eval_ctx.dns_resolver = Some(resolver);
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to initialise DNS resolver for ACL evaluation");
+        }
+    }
+
+    // Pre-parse all named ACL definitions from the config into the eval
+    // context's named_acls map.
+    for (name, raw_body) in acl_definitions {
+        match exim_acl::engine::acl_read(raw_body, Some(name), 0) {
+            Ok(blocks) => {
+                eval_ctx.named_acls.insert(name.clone(), blocks);
+            }
+            Err(e) => {
+                warn!(
+                    acl = %name,
+                    error = %e,
+                    "failed to parse named ACL definition"
+                );
+            }
+        }
+    }
 
     let result = exim_acl::acl_check(
         &mut eval_ctx,

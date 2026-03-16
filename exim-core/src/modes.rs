@@ -43,8 +43,12 @@ use exim_config::types::ServerContext as CfgServerContext;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Exim version string matching C Exim's `version_string` global.
-const EXIM_VERSION: &str = "4.99";
+/// Exim version string — reads the patchable version marker from the
+/// binary so that `test/patchexim` can replace `4.99` with `x.yz` for
+/// version-independent test output.
+fn exim_version() -> &'static str {
+    exim_ffi::get_patched_version()
+}
 
 /// Build number (corresponds to C `version_cnumber`).
 const EXIM_BUILD_NUMBER: i32 = 0;
@@ -542,7 +546,7 @@ fn build_expand_context(
     let mut expand_ctx = exim_expand::variables::ExpandContext::new();
 
     // Version information.
-    expand_ctx.exim_version = Clean::new(EXIM_VERSION.to_string());
+    expand_ctx.exim_version = Clean::new(exim_version().to_string());
     expand_ctx.compile_number = Clean::new(EXIM_BUILD_NUMBER.to_string());
     expand_ctx.compile_date = Clean::new(build_date_string());
 
@@ -741,6 +745,26 @@ pub fn config_check_mode(
         "config_check_mode: entering"
     );
 
+    // When debug is enabled (-d flag), the C Exim binary prints startup
+    // diagnostic information that the test/runtest harness parses. The
+    // harness merges stdout and stderr (via 2>&1) and scans for patterns
+    // such as `TRUSTED_CONFIG_LIST: "..."` and `Configure owner: uid:gid`.
+    // We emit these lines to stderr to match the C Exim debug channel
+    // and ensure the harness can extract them.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        eprintln!("Configure owner: {uid}:{gid}");
+
+        let trusted_config_list = std::env::var("EXIM_TRUSTED_CONFIG_LIST")
+            .unwrap_or_else(|_| super::TRUSTED_CONFIG_LIST.to_string());
+        if trusted_config_list.is_empty() {
+            eprintln!("TRUSTED_CONFIG_LIST unset");
+        } else {
+            eprintln!("TRUSTED_CONFIG_LIST: \"{trusted_config_list}\"");
+        }
+    }
+
     let config_ctx = build_config_context(config);
 
     if list_config {
@@ -843,7 +867,9 @@ pub fn version_mode() -> ExitCode {
     let build_date = build_date_string();
     println!(
         "Exim version {} #{} built {}",
-        EXIM_VERSION, EXIM_BUILD_NUMBER, build_date,
+        exim_version(),
+        EXIM_BUILD_NUMBER,
+        build_date,
     );
     println!("Copyright (c) University of Cambridge, 1995 - 2018");
     println!("Copyright (c) The Exim Maintainers, 2020 - 2025");
@@ -887,7 +913,25 @@ pub fn version_mode() -> ExitCode {
     // Print fixed/never features (matching C Exim -bV format).
     println!("Fixed never_users: 0");
 
+    // Configure owner: matches C Exim's config_uid:config_gid output.
+    // In Rust Exim, the configure file owner is the running process UID/GID.
+    let config_uid = nix::unistd::getuid().as_raw();
+    let config_gid = nix::unistd::getgid().as_raw();
+    println!("Configure owner: {config_uid}:{config_gid}");
+
     println!("Size of off_t: {}", std::mem::size_of::<i64>());
+
+    // TRUSTED_CONFIG_LIST — required by test/runtest harness for config
+    // file trust verification. Matches the C Exim output format exactly:
+    //   TRUSTED_CONFIG_LIST: "/path/to/list"
+    // The harness parses this with: /^TRUSTED_CONFIG_LIST:.*?"(.*?)"$/
+    let trusted_config_list = std::env::var("EXIM_TRUSTED_CONFIG_LIST")
+        .unwrap_or_else(|_| super::TRUSTED_CONFIG_LIST.to_string());
+    if trusted_config_list.is_empty() {
+        println!("TRUSTED_CONFIG_LIST unset");
+    } else {
+        println!("TRUSTED_CONFIG_LIST: \"{trusted_config_list}\"");
+    }
 
     // Print the configuration file path (matching C Exim -bV format).
     println!("Configuration file is {}", super::CONFIGURE_FILE_LIST);

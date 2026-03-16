@@ -1010,6 +1010,18 @@ fn parse_listener_spec(spec: &str, default_port: u16) -> Result<(IpAddr, u16)> {
         return Ok((ip, default_port));
     }
 
+    // Handle C Exim dot notation: "127.0.0.1.1025" where the last dotted
+    // component is a port number appended to an IPv4 address.  We split
+    // at the last dot and try to parse the left part as an IPv4 address
+    // and the right part as a port.
+    if let Some(last_dot) = spec.rfind('.') {
+        let ip_part = &spec[..last_dot];
+        let port_part = &spec[last_dot + 1..];
+        if let (Ok(ip), Ok(port)) = (ip_part.parse::<Ipv4Addr>(), port_part.parse::<u16>()) {
+            return Ok((IpAddr::V4(ip), port));
+        }
+    }
+
     // Handle bracketed IPv6: [::1]:587
     if spec.starts_with('[') {
         if let Some(bracket_end) = spec.find(']') {
@@ -1574,6 +1586,11 @@ fn handle_smtp_child(
             // ID.  This implements the critical delivery pipeline that
             // connects smtp_setup_msg() → receive → spool → response.
             //
+            // Extract the TLS backend that the SMTP session deposited
+            // into MessageContext.  When present, all further I/O with
+            // the client MUST go through this backend.
+            let tls_backend = smtp_msg_ctx.tls_backend.take();
+
             // After the 250 OK, loop back into the SMTP command loop so
             // the client can start a new transaction (MAIL FROM) or QUIT.
             receive_and_spool_message(
@@ -1583,6 +1600,7 @@ fn handle_smtp_child(
                 &smtp_config_ctx,
                 config,
                 peer_address,
+                tls_backend,
             );
         }
         exim_smtp::inbound::command_loop::SmtpSetupResult::Error => {
@@ -1666,6 +1684,7 @@ fn receive_and_spool_message(
     config_ctx: &exim_smtp::inbound::command_loop::ConfigContext,
     config: &Arc<Config>,
     peer_address: &str,
+    mut tls_backend: Option<Box<exim_tls::rustls_backend::RustlsBackend>>,
 ) {
     use std::io::Write as _;
 
@@ -1682,14 +1701,20 @@ fn receive_and_spool_message(
         1,    // id_resolution = 1 (microsecond)
     );
 
-    // Read the message body from the connection using the safe fd I/O
-    // wrappers from exim-ffi (no `unsafe` needed in exim-core per AAP §0.7.2).
+    // Helper: write bytes to the client, dispatching through TLS when active.
+    let write_to_client =
+        |data: &[u8], tls: &mut Option<Box<exim_tls::rustls_backend::RustlsBackend>>| {
+            if let Some(ref mut backend) = tls {
+                let _ = backend.write(data);
+            } else {
+                let _ = exim_ffi::fd::safe_write_fd(conn_fd, data);
+            }
+        };
+
+    // Read the message body from the connection.  When TLS is active,
+    // reads go through the RustlsBackend; otherwise they use safe fd I/O.
     // The body is terminated by a lone "." on a line by itself per RFC 5321
     // §4.1.1.4.
-    //
-    // We use a manual line-buffering loop with exim_ffi::fd::safe_read_fd
-    // because exim-core forbids unsafe code, and BufReader::new(File::from_raw_fd())
-    // requires an unsafe FromRawFd call.
     let mut body_lines: Vec<String> = Vec::new();
     let mut total_body_size: usize = 0;
     let max_body_size: usize = 52_428_800; // 50 MiB default limit
@@ -1697,16 +1722,31 @@ fn receive_and_spool_message(
     let mut line_buf = Vec::with_capacity(1024);
 
     'body_read: loop {
-        let n = match exim_ffi::fd::safe_read_fd(conn_fd, &mut read_buf) {
-            Ok(0) => {
-                // EOF without final dot — treat as connection drop.
-                tracing::warn!(peer = peer_address, "connection closed during message body");
-                return;
+        let n = if let Some(ref mut tls) = tls_backend {
+            // TLS path — decrypt through RustlsBackend.
+            match tls.read(&mut read_buf) {
+                Ok(0) => {
+                    tracing::warn!(peer = peer_address, "TLS connection closed during body");
+                    return;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = %e, peer = peer_address, "TLS read error during body");
+                    return;
+                }
             }
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(error = %e, peer = peer_address, "error reading message body");
-                return;
+        } else {
+            // Plaintext path — read from raw fd.
+            match exim_ffi::fd::safe_read_fd(conn_fd, &mut read_buf) {
+                Ok(0) => {
+                    tracing::warn!(peer = peer_address, "connection closed during body");
+                    return;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = %e, peer = peer_address, "read error during body");
+                    return;
+                }
             }
         };
 
@@ -1740,7 +1780,7 @@ fn receive_and_spool_message(
                         "message body exceeds size limit"
                     );
                     let err_msg = b"552 Message size exceeds maximum permitted\r\n";
-                    let _ = exim_ffi::fd::safe_write_fd(conn_fd, err_msg);
+                    write_to_client(err_msg, &mut tls_backend);
                     return;
                 }
                 body_lines.push(actual_line);
@@ -1784,54 +1824,88 @@ fn receive_and_spool_message(
         Err(e) => {
             tracing::error!(error = %e, path = %data_path, "failed to write spool data file");
             let err_msg = b"451 Temporary local error; please try again later\r\n";
-            let _ = exim_ffi::fd::safe_write_fd(conn_fd, err_msg);
+            write_to_client(err_msg, &mut tls_backend);
             return;
         }
     }
 
-    // Write the -H (header/metadata) spool file.
+    // Write the -H (header/metadata) spool file using the standard Exim
+    // spool format via exim_spool::spool_write_header. This ensures the
+    // header file is byte-level compatible with the queue runner's
+    // spool_read_header() parser (AAP §0.3.1 spool file compatibility).
     let header_path = format!("{}/{}-H", input_dir, message_id);
-    match std::fs::File::create(&header_path) {
-        Ok(mut header_file) => {
-            // Spool -H file format (simplified for initial implementation):
-            // Line 1: message ID
-            // Line 2: sender address (with "-sender_address" prefix)
-            // Lines 3+: envelope recipients
-            // Then headers from the message context
-            let _ = writeln!(header_file, "{}", message_id);
-            let _ = writeln!(header_file, "-sender_address {}", msg_ctx.sender_address);
-            // Write the received time.
-            let received_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let _ = writeln!(header_file, "-received_time {}", received_time);
-            let proto_str = protocol_name(msg_ctx.received_protocol);
-            let _ = writeln!(header_file, "-received_protocol {}", proto_str,);
-            // Write recipients.
-            let _ = writeln!(header_file, "-recipients {}", msg_ctx.recipients_count);
-            for rcpt in &msg_ctx.recipients_list {
-                let _ = writeln!(header_file, "{}", rcpt.address);
+    {
+        let received_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Build Received header line matching C Exim format.
+        let received_hdr = format!(
+            "Received: from {} by {} with {} id {}",
+            msg_ctx.helo_name.as_deref().unwrap_or("unknown"),
+            server_ctx.primary_hostname,
+            protocol_name(msg_ctx.received_protocol),
+            message_id,
+        );
+
+        // Build recipient list from the message context.
+        let recipients: Vec<exim_spool::RecipientItem> = msg_ctx
+            .recipients_list
+            .iter()
+            .map(|r| exim_spool::RecipientItem {
+                address: r.address.clone(),
+                pno: -1,
+                errors_to: None,
+                orcpt: None,
+                dsn_flags: 0,
+            })
+            .collect();
+
+        // Determine originator login from the current process user.
+        let originator_login = exim_ffi::get_login_name().unwrap_or_default();
+
+        let spool_data = exim_spool::SpoolHeaderData {
+            message_id: message_id.clone(),
+            originator_login,
+            sender_address: msg_ctx.sender_address.clone(),
+            received_time_sec: received_time,
+            headers: vec![exim_spool::HeaderLine {
+                header_type: ' ',
+                slen: received_hdr.len(),
+                text: received_hdr,
+            }],
+            recipients,
+            non_recipients_tree: None,
+        };
+
+        match std::fs::File::create(&header_path) {
+            Ok(file) => {
+                if let Err(e) = exim_spool::spool_write_header(&spool_data, file) {
+                    tracing::error!(
+                        error = %e,
+                        path = %header_path,
+                        "failed to write spool header file"
+                    );
+                    let _ = std::fs::remove_file(&data_path);
+                    let _ = std::fs::remove_file(&header_path);
+                    let err_msg = b"451 Temporary local error; please try again later\r\n";
+                    write_to_client(err_msg, &mut tls_backend);
+                    return;
+                }
+                tracing::debug!(path = %header_path, "wrote spool header file");
             }
-            // Write a basic Received header.
-            let _ = writeln!(header_file, "-headers");
-            let received_hdr = format!(
-                "Received: from {} by {} with {} id {}\r\n",
-                msg_ctx.helo_name.as_deref().unwrap_or("unknown"),
-                server_ctx.primary_hostname,
-                protocol_name(msg_ctx.received_protocol),
-                message_id,
-            );
-            let _ = header_file.write_all(received_hdr.as_bytes());
-            tracing::debug!(path = %header_path, "wrote spool header file");
-        }
-        Err(e) => {
-            tracing::error!(error = %e, path = %header_path, "failed to write spool header file");
-            // Clean up the -D file on failure.
-            let _ = std::fs::remove_file(&data_path);
-            let err_msg = b"451 Temporary local error; please try again later\r\n";
-            let _ = exim_ffi::fd::safe_write_fd(conn_fd, err_msg);
-            return;
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %header_path,
+                    "failed to create spool header file"
+                );
+                let _ = std::fs::remove_file(&data_path);
+                let err_msg = b"451 Temporary local error; please try again later\r\n";
+                write_to_client(err_msg, &mut tls_backend);
+                return;
+            }
         }
     }
 
@@ -1861,7 +1935,7 @@ fn receive_and_spool_message(
     // This is the critical response that tells the client the message
     // has been accepted (AAP §0.7.7 Gate 1: "swaks → 250 OK").
     let ok_response = format!("250 OK id={}\r\n", message_id);
-    let _ = exim_ffi::fd::safe_write_fd(conn_fd, ok_response.as_bytes());
+    write_to_client(ok_response.as_bytes(), &mut tls_backend);
 
     // After successful reception, re-enter the SMTP command loop.
     // The client may start a new MAIL FROM transaction or send QUIT.
@@ -1885,7 +1959,8 @@ fn receive_and_spool_message(
             tracing::info!(peer = peer_address, "SMTP session completed after message");
         }
         exim_smtp::inbound::command_loop::SmtpSetupResult::Yield => {
-            // Another message — recurse.
+            // Another message — recurse.  Extract TLS backend again.
+            let tls_backend = msg_ctx.tls_backend.take();
             receive_and_spool_message(
                 conn_fd,
                 server_ctx,
@@ -1893,6 +1968,7 @@ fn receive_and_spool_message(
                 config_ctx,
                 config,
                 peer_address,
+                tls_backend,
             );
         }
         exim_smtp::inbound::command_loop::SmtpSetupResult::Error => {

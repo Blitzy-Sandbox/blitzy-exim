@@ -256,3 +256,106 @@ pub mod lmdb;
 /// Source: `src/src/hintsdb/hints_*.h` — replaces `USE_DB`/`USE_GDBM`/
 /// `USE_NDBM`/`USE_TDB` preprocessor conditionals.
 pub mod hintsdb;
+
+// =============================================================================
+// Patchable version string for test harness compatibility
+// =============================================================================
+
+/// Binary-embedded version marker that the `test/patchexim` script finds
+/// and replaces with `x.yz\0***...` so that test output is stable across
+/// Exim releases. The marker `<<eximversion>>` is the sentinel searched by
+/// the Perl regex in `patchexim`.
+///
+/// C equivalent: `version_string = US EXIM_VERSION_STR "\0<<eximversion>>";`
+/// in `src/src/version.c`.
+///
+/// # Safety of `static mut`
+///
+/// `patchexim` modifies the binary **file** before execution — it does NOT
+/// modify process memory at runtime. Once the binary is loaded, this data
+/// is effectively read-only. The `static mut` is required so the linker
+/// emits the data in a writable section (`.data`) rather than `.rodata`,
+/// which is necessary for `patchexim`'s binary-level byte replacement to
+/// succeed on platforms that map `.rodata` as read-only in the filesystem
+/// image.
+#[used]
+#[no_mangle]
+pub static mut EXIM_VERSION_DATA: [u8; 20] = *b"4.99\0<<eximversion>>";
+
+/// Returns the (possibly patched) Exim version string.
+///
+/// After `patchexim` rewrites the binary, the data becomes `x.yz\0***...`.
+/// This function reads up to the first NUL byte and returns the result as
+/// a `&'static str`.
+///
+/// # Safety
+///
+/// Reads from `EXIM_VERSION_DATA` which is only modified at binary-file
+/// level by `patchexim` before execution — never at runtime. The read is
+/// therefore data-race-free.
+pub fn get_patched_version() -> &'static str {
+    // SAFETY: EXIM_VERSION_DATA is modified only at binary-file level by
+    // patchexim before the process starts. During execution it is never
+    // written, so this read is safe and data-race-free.
+    let data: &[u8] = unsafe { &*core::ptr::addr_of!(EXIM_VERSION_DATA) };
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    match core::str::from_utf8(&data[..end]) {
+        Ok(s) => s,
+        Err(_) => "4.99",
+    }
+}
+
+/// Format the current local time as C Exim's `$tod_full`, e.g.
+/// `"Tue, 02 Mar 1999 09:44:33 +0000"`.
+///
+/// Uses `libc::strftime` for locale-independent RFC-2822-style output
+/// that exactly matches the C binary's timestamp format.
+/// Returns the login name of the calling process's effective user.
+///
+/// Equivalent to C Exim's `originator_login` which is set from
+/// `getpwuid(getuid())->pw_name`. Used as `sender_ident` in `-bs` mode
+/// for the HELO greeting: "250 host Hello CALLER at helo_name".
+pub fn get_login_name() -> Option<String> {
+    // SAFETY: getuid() is a simple syscall returning the process UID.
+    // getpwuid() returns a pointer to a static struct passwd which is
+    // valid until the next call to getpwuid/getpwnam in this thread.
+    // We copy the name immediately and do not retain the pointer.
+    unsafe {
+        let uid = libc::getuid();
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr((*pw).pw_name);
+        name.to_str().ok().map(|s| s.to_string())
+    }
+}
+
+pub fn format_tod_full() -> String {
+    // SAFETY: libc time/localtime/strftime are standard C library functions.
+    // localtime returns a pointer to a static `struct tm` which is valid
+    // until the next call to localtime/gmtime in this thread. We read it
+    // immediately in strftime and do not retain the pointer.
+    unsafe {
+        let mut t: libc::time_t = 0;
+        libc::time(&mut t);
+        let tm = libc::localtime(&t);
+        if tm.is_null() {
+            return String::from("Thu, 01 Jan 1970 00:00:00 +0000");
+        }
+        let mut buf = [0u8; 128];
+        let fmt = b"%a, %d %b %Y %H:%M:%S %z\0";
+        let len = libc::strftime(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            fmt.as_ptr() as *const libc::c_char,
+            tm,
+        );
+        if len == 0 {
+            return String::from("Thu, 01 Jan 1970 00:00:00 +0000");
+        }
+        std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char)
+            .to_string_lossy()
+            .into_owned()
+    }
+}

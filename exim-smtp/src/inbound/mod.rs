@@ -955,10 +955,18 @@ pub fn smtp_start_session(
     );
 
     // ── Phase 11: Banner construction ──
-    let banner = format!(
-        "220 {} ESMTP Exim 4.99 ready\r\n",
-        server_ctx.smtp_active_hostname
-    );
+    // C Exim default: "$primary_hostname ESMTP Exim $version_number $tod_full"
+    // We match this exactly so the test harness can munge dates and version.
+    let version = exim_ffi::get_patched_version();
+    let tod_full = exim_ffi::format_tod_full();
+    let banner = if let Some(ref custom) = config_ctx.smtp_banner {
+        format!("220 {}\r\n", custom)
+    } else {
+        format!(
+            "220 {} ESMTP Exim {} {}\r\n",
+            server_ctx.smtp_active_hostname, version, tod_full
+        )
+    };
     message_ctx.smtp_banner = Some(banner);
     debug!(
         hostname = server_ctx.smtp_active_hostname.as_str(),

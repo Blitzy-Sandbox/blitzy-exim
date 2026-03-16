@@ -2258,25 +2258,342 @@ pub fn wellknown_process(
 // Main condition dispatch — acl_check_condition() (acl.c lines 3273–4408)
 // ---------------------------------------------------------------------------
 
-/// Evaluate a single ACL condition or apply a modifier.
-/// Translates C `acl_check_condition()` (acl.c lines 3273–4408).
+// Evaluate a single ACL condition or apply a modifier.
+// Translates C `acl_check_condition()` (acl.c lines 3273–4408).
+//
+// This is the central dispatch function for all ACL condition/modifier types.
+// For each condition in an ACL verb's condition list:
+// 1. Expand the argument string via `expand_string()` if ACD_EXP is set
+// 2. Check phase forbids — reject conditions not valid in current ACL phase
+// 3. Dispatch to the appropriate handler based on `AclCondition` variant
+// 4. Handle negation ('!' prefix)
+// 5. Return OK/FAIL/DEFER/ERROR
+//
+// Parameters:
+// - `condition`: The condition type to evaluate
+// - `arg`: The condition argument string (may contain ${...} expansions)
+// - `negate`: Whether the condition result should be negated
+// - `where_phase`: Current ACL phase (connect, helo, mail, rcpt, data, etc.)
+// - `ctx`: Mutable message context for side effects
+// - `resolver`: DNS resolver for DNSBL, CSA, reverse lookups
+// - `var_store`: ACL variable store for SET modifier
+
+// =============================================================================
+// Exim List Matching — Core Matching Engine
+// =============================================================================
+//
+// Implements the Exim list matching semantics used by ACL conditions:
+// `hosts`, `senders`, `domains`, `local_parts`, `sender_domains`, `recipients`.
+//
+// Exim lists are colon-separated. Each element can be:
+// - Exact match (case-insensitive for domains/hosts)
+// - `!pattern` — negation (inverts match)
+// - `*` or `*.domain` — wildcard matching
+// - `^regex` — PCRE regex match
+// - `+listname` — reference to a named list from config
+// - `lsearch;filename` — file-based lookup
+// - Empty element — matches an empty value
+//
+// Translates C match_check_list() / match_check_string() (match.c).
+
+/// Split an Exim colon-separated list into individual items,
+/// handling backslash-escaped colons within items.
+fn split_list(list: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut chars = list.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                current.push(next);
+                chars.next();
+            }
+        } else if ch == ':' {
+            items.push(current.trim().to_string());
+            current = String::new();
+        } else {
+            current.push(ch);
+        }
+    }
+    items.push(current.trim().to_string());
+    items
+}
+
+/// Match a single pattern item against a value.
 ///
-/// This is the central dispatch function for all ACL condition/modifier types.
-/// For each condition in an ACL verb's condition list:
-/// 1. Expand the argument string via `expand_string()` if ACD_EXP is set
-/// 2. Check phase forbids — reject conditions not valid in current ACL phase
-/// 3. Dispatch to the appropriate handler based on `AclCondition` variant
-/// 4. Handle negation ('!' prefix)
-/// 5. Return OK/FAIL/DEFER/ERROR
+/// `caseless` controls whether comparison is case-insensitive (used for
+/// domains and hostnames). Returns `Some(true)` for match, `Some(false)` for
+/// explicit non-match (negation), `None` if the item doesn't match.
+fn match_single_item(
+    pattern: &str,
+    value: &str,
+    caseless: bool,
+    named_lists: &HashMap<String, String>,
+) -> Option<bool> {
+    let (negated, pat) = if let Some(rest) = pattern.strip_prefix('!') {
+        (true, rest.trim())
+    } else {
+        (false, pattern.trim())
+    };
+
+    // Empty pattern matches empty value
+    if pat.is_empty() {
+        let matched = value.is_empty();
+        return if matched { Some(!negated) } else { None };
+    }
+
+    // Named list reference: +listname
+    if let Some(list_name) = pat.strip_prefix('+') {
+        let list_name = list_name.trim();
+        if let Some(list_body) = named_lists.get(list_name) {
+            let sub_result = match_list(list_body, value, caseless, named_lists);
+            return if negated {
+                Some(!sub_result)
+            } else {
+                Some(sub_result)
+            };
+        }
+        // Named list not found — treat as no match
+        trace!(list_name = list_name, "named list not found");
+        return None;
+    }
+
+    // Regex match: ^pattern or ^\\Dpattern (\\D = case-sensitive flag in Exim)
+    if let Some(regex_body) = pat.strip_prefix('^') {
+        let (regex_pat, case_flag) = if let Some(inner) = regex_body.strip_prefix("\\D") {
+            (inner, false) // \\D means case-sensitive
+        } else {
+            (regex_body, caseless)
+        };
+        match regex::RegexBuilder::new(regex_pat)
+            .case_insensitive(case_flag)
+            .build()
+        {
+            Ok(re) => {
+                let matched = re.is_match(value);
+                return if negated {
+                    Some(!matched)
+                } else if matched {
+                    Some(true)
+                } else {
+                    None
+                };
+            }
+            Err(e) => {
+                warn!(pattern = regex_pat, error = %e, "invalid regex in ACL list");
+                return None;
+            }
+        }
+    }
+
+    // Address-pattern matching for senders: user@domain or @domain
+    // Handle `lsearch*@;file` (lookup by domain, match local part with wildcard)
+    // and `@@lsearch*;file` (lookup by domain from sender)
+    if pat.contains(';') {
+        // Lookup-based matching — complex, requires file I/O
+        // For now, handle lsearch;file patterns
+        if let Some(file_part) = pat
+            .strip_prefix("lsearch;")
+            .or_else(|| pat.strip_prefix("lsearch*;"))
+            .or_else(|| pat.strip_prefix("lsearch*@;"))
+        {
+            let matched = lsearch_match(file_part.trim(), value, caseless);
+            return if negated {
+                Some(!matched)
+            } else if matched {
+                Some(true)
+            } else {
+                None
+            };
+        }
+        if let Some(file_part) = pat.strip_prefix("@@lsearch*;") {
+            // @@lsearch: look up by the domain part of the value
+            let domain = value.rsplit('@').next().unwrap_or("");
+            let matched = lsearch_match(file_part.trim(), domain, caseless);
+            return if negated {
+                Some(!matched)
+            } else if matched {
+                Some(true)
+            } else {
+                None
+            };
+        }
+        // Other lookup types — skip for now
+        trace!(pattern = pat, "unhandled lookup pattern in ACL list");
+        return None;
+    }
+
+    // Wildcard matching
+    if pat.contains('*') {
+        let matched = wildcard_match(pat, value, caseless);
+        return if negated {
+            Some(!matched)
+        } else if matched {
+            Some(true)
+        } else {
+            None
+        };
+    }
+
+    // @domain match for address lists (match any local_part at domain)
+    if let Some(domain_pat) = pat.strip_prefix('@') {
+        if !domain_pat.is_empty() {
+            let value_domain = value.rsplit('@').next().unwrap_or("");
+            let matched = if caseless {
+                domain_pat.eq_ignore_ascii_case(value_domain)
+            } else {
+                domain_pat == value_domain
+            };
+            return if negated {
+                Some(!matched)
+            } else if matched {
+                Some(true)
+            } else {
+                None
+            };
+        }
+    }
+
+    // Exact match (case-insensitive for domains)
+    let matched = if caseless {
+        pat.eq_ignore_ascii_case(value)
+    } else {
+        pat == value
+    };
+    if negated {
+        Some(!matched)
+    } else if matched {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Perform a line-search file lookup.
+/// Opens the file and checks each line for a match.
+/// Lines starting with `#` are comments. Each line has format `key: data`.
+fn lsearch_match(filename: &str, value: &str, caseless: bool) -> bool {
+    let content = match std::fs::read_to_string(filename) {
+        Ok(c) => c,
+        Err(e) => {
+            trace!(file = filename, error = %e, "lsearch: cannot open file");
+            return false;
+        }
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Get the key part (before `:` or whitespace)
+        let key = line
+            .split(|c: char| c == ':' || c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .trim();
+        let matched = if caseless {
+            key.eq_ignore_ascii_case(value)
+        } else {
+            key == value
+        };
+        if matched {
+            return true;
+        }
+    }
+    false
+}
+
+/// Wildcard pattern matching. Supports `*` as a glob wildcard.
+fn wildcard_match(pattern: &str, value: &str, caseless: bool) -> bool {
+    let pat = if caseless {
+        pattern.to_ascii_lowercase()
+    } else {
+        pattern.to_string()
+    };
+    let val = if caseless {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    };
+
+    // Simple wildcard matching with single `*`
+    if pat == "*" {
+        return true;
+    }
+    if let Some(suffix) = pat.strip_prefix('*') {
+        return val.ends_with(suffix);
+    }
+    if let Some(prefix) = pat.strip_suffix('*') {
+        return val.starts_with(prefix);
+    }
+    // Pattern with * in the middle
+    if let Some(star_pos) = pat.find('*') {
+        let prefix = &pat[..star_pos];
+        let suffix = &pat[star_pos + 1..];
+        return val.starts_with(prefix)
+            && val.ends_with(suffix)
+            && val.len() >= prefix.len() + suffix.len();
+    }
+    // No wildcard — exact match
+    pat == val
+}
+
+/// Match a value against a colon-separated Exim list.
 ///
-/// # Parameters
-/// - `condition`: The condition type to evaluate
-/// - `arg`: The condition argument string (may contain ${...} expansions)
-/// - `negate`: Whether the condition result should be negated
-/// - `where_phase`: Current ACL phase (connect, helo, mail, rcpt, data, etc.)
-/// - `ctx`: Mutable message context for side effects
-/// - `resolver`: DNS resolver for DNSBL, CSA, reverse lookups
-/// - `var_store`: ACL variable store for SET modifier
+/// Returns `true` if the value matches any item in the list (respecting
+/// negation semantics). The matching follows Exim's list processing rules:
+///
+/// 1. Items are processed left to right.
+/// 2. First match wins (either positive or negative via `!`).
+/// 3. If no item matches, the result is `false` (no match).
+fn match_list(
+    list: &str,
+    value: &str,
+    caseless: bool,
+    named_lists: &HashMap<String, String>,
+) -> bool {
+    let items = split_list(list);
+    for item in &items {
+        if let Some(result) = match_single_item(item, value, caseless, named_lists) {
+            return result;
+        }
+    }
+    false
+}
+
+/// Match a host (IP address) against an Exim host list.
+///
+/// In Exim, `hosts = :` means the list contains a single empty element,
+/// which matches only when the sender host address is empty (local/pipe
+/// connections). For `-bh` mode, `sender_host_address` is set to the
+/// argument IP, so the empty element does NOT match.
+fn match_host_list(
+    list: &str,
+    client_ip: &str,
+    _sender_helo_name: &str,
+    named_lists: &HashMap<String, String>,
+) -> bool {
+    match_list(list, client_ip, false, named_lists)
+}
+
+/// Match a sender address against an Exim sender list.
+///
+/// Exim's sender matching is case-insensitive on the domain part.
+/// The list can contain full addresses, `@domain` patterns, wildcards,
+/// regex patterns, and lookup references.
+fn match_sender_list(
+    list: &str,
+    sender_address: &str,
+    named_lists: &HashMap<String, String>,
+) -> bool {
+    // Senders matching in Exim is caseless on the domain part
+    // but caseful on the local part by default.
+    // For simplicity, we use the full matching with case-insensitive
+    // comparison on the whole address (matching C Exim's default behavior
+    // where senders uses caseless matching by default).
+    match_list(list, sender_address, true, named_lists)
+}
+
 /// - `csa_cache`: CSA verification result cache
 /// - `ratelimiters_conn`: Per-connection rate limit state
 /// - `ratelimiters_mail`: Per-mail rate limit state
@@ -2479,12 +2796,25 @@ pub fn acl_check_condition(
         }
 
         AclCondition::Domains => {
-            // Match recipient domain against domain list
-            trace!(pattern = %expanded_arg, "checking domains");
+            // Match current recipient domain against domain list.
+            // ctx.domain is set by acl_check() when splitting the recipient
+            // address during RCPT/VRFY/PRDR phases.
+            let domain = &ctx.domain;
+            trace!(pattern = %expanded_arg, domain = %domain, "checking domains");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                Ok(AclResult::Ok)
+                let matched = match_list(
+                    &expanded_arg,
+                    domain,
+                    true, // domains are matched case-insensitively
+                    &ctx.named_domain_lists,
+                );
+                if matched {
+                    Ok(AclResult::Ok)
+                } else {
+                    Ok(AclResult::Fail)
+                }
             }
         }
 
@@ -2505,22 +2835,47 @@ pub fn acl_check_condition(
         }
 
         AclCondition::Hosts => {
-            // Match client host against host list
-            trace!(pattern = %expanded_arg, "checking hosts");
+            // Match client host/IP against host list.
+            // In C Exim, this calls verify_check_this_host() which uses
+            // match_check_list() against sender_host_address.
+            // Empty list element matches only when sender_host_address is empty
+            // (local/pipe connection, not -bh simulated connections).
+            trace!(pattern = %expanded_arg, client = %client_ip, "checking hosts");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                Ok(AclResult::Ok)
+                let matched = match_host_list(
+                    &expanded_arg,
+                    client_ip,
+                    sender_helo_name,
+                    &ctx.named_host_lists,
+                );
+                if matched {
+                    Ok(AclResult::Ok)
+                } else {
+                    Ok(AclResult::Fail)
+                }
             }
         }
 
         AclCondition::LocalParts => {
-            // Match local part against local part list
-            trace!(pattern = %expanded_arg, "checking local_parts");
+            // Match current recipient local part against local-part list.
+            let local = &ctx.local_part;
+            trace!(pattern = %expanded_arg, local_part = %local, "checking local_parts");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                Ok(AclResult::Ok)
+                let matched = match_list(
+                    &expanded_arg,
+                    local,
+                    false, // local parts are case-sensitive by default
+                    &ctx.named_local_part_lists,
+                );
+                if matched {
+                    Ok(AclResult::Ok)
+                } else {
+                    Ok(AclResult::Fail)
+                }
             }
         }
 
@@ -2583,12 +2938,23 @@ pub fn acl_check_condition(
         }
 
         AclCondition::Recipients => {
-            // Match recipient count or list
-            trace!(pattern = %expanded_arg, "checking recipients");
+            // Match full recipient address against address list.
+            let recipient = format!("{}@{}", ctx.local_part, ctx.domain);
+            trace!(pattern = %expanded_arg, recipient = %recipient, "checking recipients");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                Ok(AclResult::Ok)
+                let matched = match_list(
+                    &expanded_arg,
+                    &recipient,
+                    true, // caseless on domain part
+                    &ctx.named_address_lists,
+                );
+                if matched {
+                    Ok(AclResult::Ok)
+                } else {
+                    Ok(AclResult::Fail)
+                }
             }
         }
 
@@ -2611,22 +2977,42 @@ pub fn acl_check_condition(
         }
 
         AclCondition::SenderDomains => {
-            // Match sender domain
-            trace!(pattern = %expanded_arg, "checking sender_domains");
+            // Match sender domain part against domain list.
+            let sender = &ctx.sender_address;
+            let sender_domain = sender.rsplit('@').next().unwrap_or("");
+            trace!(pattern = %expanded_arg, sender_domain = %sender_domain, "checking sender_domains");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                Ok(AclResult::Ok)
+                let matched = match_list(
+                    &expanded_arg,
+                    sender_domain,
+                    true, // domains are case-insensitive
+                    &ctx.named_domain_lists,
+                );
+                if matched {
+                    Ok(AclResult::Ok)
+                } else {
+                    Ok(AclResult::Fail)
+                }
             }
         }
 
         AclCondition::Senders => {
-            // Match sender address
-            trace!(pattern = %expanded_arg, "checking senders");
+            // Match envelope sender address against sender list.
+            // Uses ctx.sender_address populated from the SMTP session's
+            // MAIL FROM command.
+            let sender = &ctx.sender_address;
+            trace!(pattern = %expanded_arg, sender = %sender, "checking senders");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                Ok(AclResult::Ok)
+                let matched = match_sender_list(&expanded_arg, sender, &ctx.named_address_lists);
+                if matched {
+                    Ok(AclResult::Ok)
+                } else {
+                    Ok(AclResult::Fail)
+                }
             }
         }
 

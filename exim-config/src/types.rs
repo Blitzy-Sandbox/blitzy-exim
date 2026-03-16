@@ -653,6 +653,14 @@ pub struct ConfigContext {
     /// (C: `message_body_newlines`, default: FALSE).
     pub message_body_newlines: bool,
 
+    /// Exim runtime UID — the user the daemon drops privileges to.
+    /// (C: `exim_uid` global, default: compile-time EXIM_UID or looked up from `exim` user).
+    pub exim_uid: u32,
+
+    /// Exim runtime GID — the group the daemon drops privileges to.
+    /// (C: `exim_gid` global, default: compile-time EXIM_GID or looked up from `exim` group).
+    pub exim_gid: u32,
+
     /// Deliver without privilege drop (C: `deliver_drop_privilege`, default: FALSE).
     pub deliver_drop_privilege: bool,
 
@@ -807,6 +815,109 @@ pub struct ConfigContext {
     /// Deliver queue load max (C: `deliver_queue_load_max`, default: -1).
     pub deliver_queue_load_max: i32,
 
+    // ── Additional integer config options ────────────────────────────────
+    /// Max username length for lookups (C: `max_username_length`, default: 0).
+    pub max_username_length: i32,
+
+    /// Retries for user lookups (C: `finduser_retries`, default: 0).
+    pub finduser_retries: i32,
+
+    /// Localhost number for cluster setups (C: `localhost_number`, default: -1).
+    pub localhost_number: i32,
+
+    /// Slow lookup log threshold in ms (C: `slow_lookup_log`, default: 0).
+    pub slow_lookup_log: i32,
+
+    /// SMTP backlog monitor threshold (C: `smtp_backlog_monitor`, default: 0).
+    pub smtp_backlog_monitor: i32,
+
+    /// Return size limit (C: `return_size_limit`, default: 102400).
+    pub return_size_limit: i32,
+
+    /// RFC 1413 ident port (C: `rfc1413_port`, default: 113).
+    pub rfc1413_port: i32,
+
+    // ── Additional boolean config options ────────────────────────────────
+    /// Debug store allocations (C: `debug_store` in flags, default: FALSE).
+    pub debug_store: bool,
+
+    /// MUA wrapper mode (C: `mua_wrapper`, default: FALSE).
+    pub mua_wrapper: bool,
+
+    /// Panic coredump enabled (C: `panic_coredump`, default: FALSE).
+    pub panic_coredump: bool,
+
+    /// Log port numbers in SMTP transactions (C: `log_ports`, default: FALSE).
+    pub log_ports: bool,
+
+    // ── Additional string config options ────────────────────────────────
+    /// Exim version string (C: `version_string`, aliased as `exim_version`).
+    /// Defaults to the compiled-in version "4.99" but can be overridden in config.
+    pub exim_version: Option<String>,
+
+    /// Exim binary path (C: `exim_path`, default: None → compiled default).
+    pub exim_path: Option<String>,
+
+    /// Headers charset (C: `headers_charset`, default: "UTF-8" when i18n).
+    pub headers_charset: Option<String>,
+
+    /// Unknown login name (C: `unknown_login`, default: None).
+    pub unknown_login: Option<String>,
+
+    /// Unknown username for GECOS (C: `unknown_username`, default: None).
+    pub unknown_username: Option<String>,
+
+    /// Warning message template file (C: `warn_message_file`, default: None).
+    pub warn_message_file: Option<String>,
+
+    /// Timezone override (C: `timezone_string`, default: None).
+    pub timezone: Option<String>,
+
+    /// UUCP from pattern (C: `uucp_from_pattern`, default: None).
+    pub uucp_from_pattern: Option<String>,
+
+    /// UUCP from sender (C: `uucp_from_sender`, default: None).
+    pub uucp_from_sender: Option<String>,
+
+    /// Untrusted set sender list (C: `untrusted_set_sender`, default: None).
+    pub untrusted_set_sender: Option<String>,
+
+    /// Process log path (C: `process_log_path`, default: None).
+    pub process_log_path: Option<String>,
+
+    /// Message ID header domain override (C: `message_id_header_domain`, default: None).
+    pub message_id_header_domain: Option<String>,
+
+    /// Message ID header text override (C: `message_id_header_text`, default: None).
+    pub message_id_header_text: Option<String>,
+
+    /// DNS name syntax check pattern (C: `check_dns_names_pattern`).
+    /// Also accepted as `dns_check_names_pattern` alias.
+    pub dns_check_names_pattern: Option<String>,
+
+    /// DNS DNSSEC OK flag (C: `dns_dnssec_ok`, default: -1).
+    pub dns_dnssec_ok: i32,
+
+    /// DNS use EDNS0 (C: `dns_use_edns0`, default: -1).
+    pub dns_use_edns0: i32,
+
+    /// TLS DH max bits (C: `tls_dh_max_bits`, default: 2236).
+    pub tls_dh_max_bits: i32,
+
+    // ── UID/GID list string storage (deferred expansion) ────────────────
+    /// Trusted users raw string — may contain `$` expansions
+    /// (C: `trusted_users`, printed by -bP).
+    pub trusted_users: Option<String>,
+
+    /// Trusted groups raw string (C: `trusted_groups`).
+    pub trusted_groups: Option<String>,
+
+    /// Never users raw string (C: `never_users`).
+    pub never_users: Option<String>,
+
+    /// Admin groups raw string (C: `admin_groups`).
+    pub admin_groups: Option<String>,
+
     // ── String config options ───────────────────────────────────────────
     /// Hosts to advertise AUTH to (C: `auth_advertise_hosts`, default: "*").
     pub auth_advertise_hosts: Option<String>,
@@ -823,9 +934,6 @@ pub struct ConfigContext {
     /// Callout random local part for verification
     /// (C default: "$primary_hostname-$tod_epoch-testing").
     pub callout_random_local_part: Option<String>,
-
-    /// DNS name syntax check pattern (C: `check_dns_names_pattern`).
-    pub check_dns_names_pattern: Option<String>,
 
     /// Hosts for CHUNKING advertisement (C: `chunking_advertise_hosts`, default: "*").
     pub chunking_advertise_hosts: Option<String>,
@@ -1179,6 +1287,8 @@ impl Default for ConfigContext {
             dns_csa_use_reverse: true, // C: TRUE
             ignore_fromline_local: false, // C: FALSE
             message_body_newlines: false, // C: FALSE
+            exim_uid: 0,           // resolved at startup
+            exim_gid: 0,           // resolved at startup
             deliver_drop_privilege: false, // C: FALSE
             extract_addresses_remove_arguments: true, // C: TRUE
             pipelining_enable: true, // C: TRUE (global flag)
@@ -1232,13 +1342,53 @@ impl Default for ConfigContext {
             queue_only_load: -1,         // C: -1
             deliver_queue_load_max: -1,  // C: -1
 
+            // Additional integer options
+            max_username_length: 0,        // C: 0
+            finduser_retries: 0,           // C: 0
+            localhost_number: -1,          // C: -1
+            slow_lookup_log: 0,            // C: 0
+            smtp_backlog_monitor: 0,       // C: 0
+            return_size_limit: 100 * 1024, // C: 102400
+            rfc1413_port: 113,             // C: 113
+            dns_dnssec_ok: -1,             // C: -1
+            dns_use_edns0: -1,             // C: -1
+            tls_dh_max_bits: 2236,         // C: 2236
+
+            // Additional boolean options
+            debug_store: false,    // C: FALSE
+            mua_wrapper: false,    // C: FALSE
+            panic_coredump: false, // C: FALSE
+            log_ports: false,      // C: FALSE
+
+            // Additional string options
+            exim_version: Some("4.99".to_string()),
+            exim_path: None,
+            headers_charset: Some("UTF-8".to_string()), // C: US"UTF-8" when i18n
+            unknown_login: None,
+            unknown_username: None,
+            warn_message_file: None,
+            timezone: None,
+            uucp_from_pattern: None,
+            uucp_from_sender: None,
+            untrusted_set_sender: None,
+            process_log_path: None,
+            message_id_header_domain: None,
+            message_id_header_text: None,
+            dns_check_names_pattern: None,
+
+            // UID/GID list string storage
+            trusted_users: None,
+            trusted_groups: None,
+            never_users: None,
+            admin_groups: None,
+
             // String config options
             auth_advertise_hosts: Some("*".to_string()), // C: US"*"
             bounce_message_file: None,
             bounce_message_text: None,
             bounce_sender_authentication: None,
             callout_random_local_part: None,
-            check_dns_names_pattern: None,
+
             chunking_advertise_hosts: Some("*".to_string()), // C: US"*"
             daemon_smtp_port: Some("smtp".to_string()),
             delay_warning_condition: None,
@@ -1274,7 +1424,7 @@ impl Default for ConfigContext {
             queue_domains: None,
             queue_smtp_domains: None,
             queue_only_file: None,
-            notifier_socket: None,
+            notifier_socket: Some("$spool_directory/exim_daemon_notify".to_string()),
             percent_hack_domains: None,
             pipelining_advertise_hosts: Some("*".to_string()), // C: US"*"
             received_header_text: None,

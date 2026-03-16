@@ -49,8 +49,9 @@ use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
 use exim_config::types::{ConfigContext, DeliveryContext, MessageContext, ServerContext};
+use exim_drivers::registry::DriverRegistry;
 use exim_drivers::router_driver::RouterResult;
-use exim_drivers::transport_driver::TransportResult;
+use exim_drivers::transport_driver::{TransportInstanceConfig, TransportResult};
 use exim_drivers::DriverError;
 use exim_spool::{spool_read_header, SpoolError, SpoolHeaderData};
 use exim_store::{MessageArena, Tainted};
@@ -1287,26 +1288,156 @@ fn deliver_local(
         "resolved delivery credentials"
     );
 
-    // In a full implementation, we would:
-    // 1. Create a pipe for parent-child communication
-    // 2. Fork a child process
-    // 3. In the child: setuid/setgid, execute transport, write result to pipe
-    // 4. In the parent: read result from pipe, call post_process_one()
+    // Resolve transport driver from the registry and execute delivery.
     //
-    // For the orchestrator framework, we simulate the transport dispatch
-    // by directly invoking the transport result path. The actual fork/exec
-    // logic is implemented in the transport_dispatch module.
+    // This replaces the C fork/exec/pipe pattern in deliver_local() (deliver.c
+    // line 2129). In the C code, a child process was forked, the child set
+    // uid/gid and called the transport's code() function, then wrote the result
+    // to a pipe read by the parent. In Rust, we call the transport driver
+    // directly since process isolation is not required for memory-safe code.
+    //
+    // Two-step resolution:
+    // 1. Find the transport INSTANCE config by instance name (e.g., "local_delivery")
+    // 2. Find the transport DRIVER factory by driver type name (e.g., "appendfile")
+    let result = {
+        // Step 1: Find the transport instance config
+        let transport_config = config.transport_instances.iter().find_map(|arc| {
+            arc.downcast_ref::<TransportInstanceConfig>()
+                .filter(|tc| tc.name == transport_name)
+        });
 
-    // Simulate transport execution result
-    // In production, this calls the actual transport driver via:
-    //   let transport_driver = DriverRegistry::find_transport(transport_name)?;
-    //   let result = transport_driver.transport_entry(addr, msg_ctx, delivery_ctx, config)?;
+        match transport_config {
+            Some(tc) => {
+                let driver_type = tc.driver_name.clone();
 
-    let result = TransportResult::Deferred {
-        message: Some(format!(
-            "local delivery for {address_str} via {transport_name} pending transport implementation"
-        )),
-        errno: None,
+                // Step 2: Find the driver factory by driver type name
+                match DriverRegistry::find_transport(&driver_type) {
+                    Some(factory) => {
+                        let driver = (factory.create)();
+                        debug!(
+                            address = %address_str,
+                            transport = transport_name,
+                            driver = %driver_type,
+                            "invoking transport driver"
+                        );
+
+                        // Build a transport config copy with spool data
+                        // injected so the transport can access the actual
+                        // message content. The message data is read from
+                        // the spool -D file and passed via private_options_map.
+                        let mut tc_with_data = TransportInstanceConfig {
+                            name: tc.name.clone(),
+                            driver_name: tc.driver_name.clone(),
+                            srcfile: tc.srcfile.clone(),
+                            srcline: tc.srcline,
+                            batch_max: tc.batch_max,
+                            batch_id: tc.batch_id.clone(),
+                            home_dir: tc.home_dir.clone(),
+                            current_dir: tc.current_dir.clone(),
+                            expand_multi_domain: tc.expand_multi_domain.clone(),
+                            multi_domain: tc.multi_domain,
+                            overrides_hosts: tc.overrides_hosts,
+                            max_addresses: tc.max_addresses.clone(),
+                            connection_max_messages: tc.connection_max_messages,
+                            deliver_as_creator: tc.deliver_as_creator,
+                            disable_logging: tc.disable_logging,
+                            initgroups: tc.initgroups,
+                            uid_set: tc.uid_set,
+                            gid_set: tc.gid_set,
+                            uid: tc.uid,
+                            gid: tc.gid,
+                            expand_uid: tc.expand_uid.clone(),
+                            expand_gid: tc.expand_gid.clone(),
+                            warn_message: tc.warn_message.clone(),
+                            shadow: tc.shadow.clone(),
+                            shadow_condition: tc.shadow_condition.clone(),
+                            filter_command: tc.filter_command.clone(),
+                            filter_timeout: tc.filter_timeout,
+                            event_action: tc.event_action.clone(),
+                            add_headers: tc.add_headers.clone(),
+                            remove_headers: tc.remove_headers.clone(),
+                            return_path: tc.return_path.clone(),
+                            debug_string: tc.debug_string.clone(),
+                            max_parallel: tc.max_parallel.clone(),
+                            message_size_limit: tc.message_size_limit.clone(),
+                            headers_rewrite: tc.headers_rewrite.clone(),
+                            body_only: tc.body_only,
+                            delivery_date_add: tc.delivery_date_add,
+                            envelope_to_add: tc.envelope_to_add,
+                            headers_only: tc.headers_only,
+                            rcpt_include_affixes: tc.rcpt_include_affixes,
+                            return_path_add: tc.return_path_add,
+                            return_output: tc.return_output,
+                            return_fail_output: tc.return_fail_output,
+                            log_output: tc.log_output,
+                            log_fail_output: tc.log_fail_output,
+                            log_defer_output: tc.log_defer_output,
+                            retry_use_local_part: tc.retry_use_local_part,
+                            options: Box::new(()),
+                            private_options_map: tc.private_options_map.clone(),
+                        };
+
+                        // Inject spool directory and message ID so the
+                        // transport can read the actual message -D data file.
+                        tc_with_data.private_options_map.insert(
+                            "__spool_directory".to_string(),
+                            config.spool_directory.clone(),
+                        );
+                        tc_with_data
+                            .private_options_map
+                            .insert("__message_id".to_string(), msg_ctx.message_id.clone());
+                        tc_with_data.private_options_map.insert(
+                            "__sender_address".to_string(),
+                            msg_ctx.sender_address.clone(),
+                        );
+
+                        match driver.transport_entry(&tc_with_data, &address_str) {
+                            Ok(tr) => tr,
+                            Err(e) => {
+                                warn!(
+                                    address = %address_str,
+                                    transport = transport_name,
+                                    error = %e,
+                                    "transport driver returned error"
+                                );
+                                TransportResult::Deferred {
+                                    message: Some(format!("transport error: {e}")),
+                                    errno: None,
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        warn!(
+                            address = %address_str,
+                            transport = transport_name,
+                            driver = %driver_type,
+                            "transport driver type not found in registry"
+                        );
+                        TransportResult::Failed {
+                            message: Some(format!(
+                                "transport driver type '{driver_type}' not found"
+                            )),
+                        }
+                    }
+                }
+            }
+            None => {
+                // Transport instance not found in config — this means the
+                // router assigned a transport name that doesn't exist.
+                warn!(
+                    address = %address_str,
+                    transport = transport_name,
+                    "transport instance not found in configuration"
+                );
+                TransportResult::Deferred {
+                    message: Some(format!(
+                        "transport instance '{transport_name}' not found in configuration"
+                    )),
+                    errno: None,
+                }
+            }
+        }
     };
 
     post_process_one(addr, &result, addr_lists, msg_ctx, delivery_ctx, config)?;
@@ -1610,11 +1741,16 @@ fn route_single_address(
 ) -> Result<RouterResult, DeliveryError> {
     let address_str = addr.address.as_ref().to_string();
 
-    // Walk through configured router instances
-    // In production, each router_instances entry would be downcast to
-    // RouterInstanceConfig and its driver would be resolved via DriverRegistry.
-    // For the orchestrator framework, we return Decline to trigger the
-    // "unrouteable address" path.
+    // Walk through configured router instances. Each entry is an
+    // Arc<dyn Any + Send + Sync> wrapping a RouterInstanceConfig created
+    // during configuration parsing in exim-config/driver_init.rs.
+    //
+    // For each router, we:
+    //   1. Downcast the Arc to RouterInstanceConfig
+    //   2. Look up the driver factory in the DriverRegistry
+    //   3. Create a driver instance via the factory
+    //   4. Call driver.route() with the config and address
+    //   5. Handle the result (Accept/Decline/Pass/Fail/Defer/Error/Rerouted)
 
     if config.router_instances.is_empty() {
         debug!(
@@ -1624,19 +1760,125 @@ fn route_single_address(
         return Ok(RouterResult::Decline);
     }
 
-    // In a full implementation:
-    // for router_arc in &config.router_instances {
-    //     let router_config = router_arc.downcast_ref::<RouterInstanceConfig>().unwrap();
-    //     let driver = DriverRegistry::find_router(&router_config.driver_name)?;
-    //     match driver.route(addr, router_config, msg_ctx, delivery_ctx, config)? {
-    //         RouterResult::Accept { .. } | RouterResult::Fail { .. }
-    //         | RouterResult::Defer { .. } | RouterResult::Rerouted { .. } => return result,
-    //         RouterResult::Decline | RouterResult::Pass => continue,
-    //         RouterResult::Error { .. } => return result,
-    //     }
-    // }
+    for router_arc in &config.router_instances {
+        // Downcast the Arc to the concrete RouterInstanceConfig type.
+        let router_config =
+            match router_arc.downcast_ref::<exim_drivers::router_driver::RouterInstanceConfig>() {
+                Some(cfg) => cfg,
+                None => {
+                    warn!(
+                        address = %address_str,
+                        "router instance is not a RouterInstanceConfig — skipping"
+                    );
+                    continue;
+                }
+            };
 
-    // Default: all routers declined
+        debug!(
+            router = %router_config.name,
+            driver = %router_config.driver_name,
+            address = %address_str,
+            "trying router"
+        );
+
+        // Look up the driver factory in the registry.
+        let factory =
+            match exim_drivers::registry::DriverRegistry::find_router(&router_config.driver_name) {
+                Some(f) => f,
+                None => {
+                    warn!(
+                        router = %router_config.name,
+                        driver = %router_config.driver_name,
+                        "router driver not found in registry — skipping"
+                    );
+                    continue;
+                }
+            };
+
+        // Create a driver instance and call route().
+        let driver = (factory.create)();
+        let result = driver.route(router_config, &address_str, None);
+
+        match result {
+            Ok(RouterResult::Accept {
+                transport_name,
+                host_list,
+            }) => {
+                let tname = transport_name.as_deref().unwrap_or("<none>");
+                debug!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    transport = %tname,
+                    "router accepted address"
+                );
+                return Ok(RouterResult::Accept {
+                    transport_name,
+                    host_list,
+                });
+            }
+            Ok(RouterResult::Decline) | Ok(RouterResult::Pass) => {
+                debug!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    "router declined — trying next"
+                );
+                continue;
+            }
+            Ok(RouterResult::Fail { message }) => {
+                let msg = message.as_deref().unwrap_or("");
+                debug!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    message = %msg,
+                    "router permanently failed address"
+                );
+                return Ok(RouterResult::Fail { message });
+            }
+            Ok(RouterResult::Defer { message }) => {
+                let msg = message.as_deref().unwrap_or("");
+                debug!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    message = %msg,
+                    "router deferred address"
+                );
+                return Ok(RouterResult::Defer { message });
+            }
+            Ok(result @ RouterResult::Error { .. }) => {
+                warn!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    "router error"
+                );
+                return Ok(result);
+            }
+            Ok(RouterResult::Rerouted { new_addresses }) => {
+                debug!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    "router rerouted address"
+                );
+                return Ok(RouterResult::Rerouted { new_addresses });
+            }
+            Err(e) => {
+                warn!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    error = %e,
+                    "router returned error"
+                );
+                return Ok(RouterResult::Defer {
+                    message: Some(format!("router error: {}", e)),
+                });
+            }
+        }
+    }
+
+    // All routers declined — address is unrouteable.
+    debug!(
+        address = %address_str,
+        "all routers declined — address unrouteable"
+    );
     Ok(RouterResult::Decline)
 }
 

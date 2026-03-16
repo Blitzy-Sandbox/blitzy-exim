@@ -1548,6 +1548,24 @@ fn build_transport_instance_config(
             true,
         ),
         options: Box::new(state.private_options.clone()),
+        private_options_map: {
+            let mut map = std::collections::HashMap::new();
+            for opt in &state.private_options {
+                // Extract the value part from the raw line stored in the
+                // OptionValue::Str. The raw line is "name = value", so we
+                // split on '=' and take everything after.
+                if let OptionValue::Str(ref raw_line) = opt.value {
+                    if let Some(eq_pos) = raw_line.find('=') {
+                        let val = raw_line[eq_pos + 1..].trim().to_string();
+                        map.insert(opt.name.clone(), val);
+                    } else {
+                        // Boolean-style option without '=' — store empty value
+                        map.insert(opt.name.clone(), String::new());
+                    }
+                }
+            }
+            map
+        },
     };
 
     Ok(config)

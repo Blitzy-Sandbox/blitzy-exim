@@ -320,7 +320,13 @@ pub fn atrn_handle_provider<S>(
     //   rc = acl_check(ACL_WHERE_ATRN, NULL, exp_acl, user_msgp, log_msgp);
     //   if (rc != OK)
     //     return smtp_handle_acl_fail(ACL_WHERE_ATRN, rc, *user_msgp, *log_msgp);
-    let (acl_rc, user_msg, log_msg) = run_acl_check(AclWhere::Atrn, Some(&exp_acl), None);
+    let (acl_rc, user_msg, log_msg) = run_acl_check(
+        AclWhere::Atrn,
+        Some(&exp_acl),
+        None,
+        &session.config_ctx.acl_definitions,
+        &session.acl_session_state(),
+    );
     if acl_rc != AclResult::Ok {
         return Err(session.smtp_handle_acl_fail(AclWhere::Atrn, acl_rc, &user_msg, &log_msg));
     }

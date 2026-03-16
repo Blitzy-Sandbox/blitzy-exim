@@ -195,39 +195,31 @@ pub fn call_dlfunc(
     ///   `int (*)(uschar **result, int argc, uschar *argv[])`
     type EximDlfuncFn = unsafe extern "C" fn(*mut *mut c_char, c_int, *mut *mut c_char) -> c_int;
 
-    // SAFETY: `Library::get` wraps `dlsym(handle, symbol_name)`.
+    // SAFETY: `Library::get` wraps `dlsym(handle, symbol_name)`, then we call
+    // the loaded C function and copy its result. Both operations are consolidated
+    // into one unsafe block as they form a single FFI call-chain.
     //
-    // Contracts upheld:
-    // 1. The library handle is valid — managed by the `LIBRARY_CACHE` and
-    //    guaranteed to exist by the cache lookup above.
-    // 2. The function name is a valid C symbol identifier originating from
-    //    the administrator's configuration (verified above to contain no
-    //    interior null bytes).
-    // 3. We assert the function conforms to the `exim_dlfunc_t` ABI:
-    //      int func(uschar **result, int argc, uschar *argv[])
-    //    This is the documented plugin contract — dlfunc plugins MUST
-    //    adhere to this signature.
-    let func: libloading::Symbol<'_, EximDlfuncFn> = unsafe { lib.get(function_name.as_bytes()) }
-        .map_err(|e| DlfuncError::SymbolNotFound {
-        symbol: function_name.to_owned(),
-        path: library_path.to_owned(),
-        detail: e.to_string(),
-    })?;
-
-    // SAFETY: We call the loaded C function through its `Symbol` pointer,
-    // then immediately copy the result string from C memory.
+    // Symbol lookup contracts:
+    // 1. Library handle is valid — managed by LIBRARY_CACHE, guaranteed to exist.
+    // 2. Function name is a valid C symbol (verified above: no interior null bytes).
+    // 3. Function conforms to the `exim_dlfunc_t` ABI (documented plugin contract).
     //
-    // Contracts upheld:
-    // - `result_ptr`: valid mutable pointer to a `*mut c_char` local variable.
+    // Function call contracts:
+    // - `result_ptr`: valid mutable pointer to a local `*mut c_char`.
     // - `argc`: accurately reflects the number of pointers in `c_arg_ptrs`.
-    // - `c_arg_ptrs.as_mut_ptr()`: points to a contiguous array of valid,
-    //   null-terminated C string pointers owned by `c_args` (alive for the
-    //   duration of this call).
-    // - The function conforms to the `exim_dlfunc_t` ABI.
-    // - After the call, `result_ptr` (if non-null) is a valid C string that
-    //   we copy into a Rust `String` immediately, creating no lifetime
-    //   dependency on the C allocator.
+    // - `c_arg_ptrs.as_mut_ptr()`: contiguous array of valid, null-terminated
+    //   C string pointers owned by `c_args` (alive for the call duration).
+    // - After the call, `result_ptr` (if non-null) is a valid C string copied
+    //   into a Rust `String` immediately, creating no C allocator dependency.
     let (status_code, result_string) = unsafe {
+        let func: libloading::Symbol<'_, EximDlfuncFn> = lib
+            .get(function_name.as_bytes())
+            .map_err(|e| DlfuncError::SymbolNotFound {
+                symbol: function_name.to_owned(),
+                path: library_path.to_owned(),
+                detail: e.to_string(),
+            })?;
+
         let code = func(
             &mut result_ptr as *mut *mut c_char,
             argc,

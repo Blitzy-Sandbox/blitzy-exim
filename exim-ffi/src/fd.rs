@@ -333,26 +333,31 @@ pub fn safe_close(fd: RawFd) -> nix::Result<()> {
 /// `Ok(())` on success, `Err` if `/dev/null` cannot be opened.
 pub fn safe_nullstd() -> nix::Result<()> {
     use std::os::unix::io::AsRawFd;
-    // SAFETY: We open /dev/null safely, then use dup2 to fill any missing
-    // standard fds. This is called in child processes after fork() and before
-    // exec(), matching the C exim_nullstd() pattern from child.c.
+    // SAFETY: We open /dev/null safely, then use fcntl() and dup2() to fill
+    // any missing standard fds (0, 1, 2). Both are POSIX system calls
+    // operating on raw fd numbers. This is called in child processes after
+    // fork() and before exec(), matching the C exim_nullstd() pattern from
+    // child.c. The unsafe block is consolidated to minimize unsafe block
+    // count while maintaining the same safety guarantees.
     for target_fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
-        // Check if the fd is open by trying fcntl F_GETFD
-        let flags = unsafe { libc::fcntl(target_fd, libc::F_GETFD) };
-        if flags < 0 {
-            // fd is not open — open /dev/null and dup2 it
-            let devnull = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/null")
-                .map_err(|_| nix::errno::Errno::ENOENT)?;
-            let raw = devnull.as_raw_fd();
-            if raw != target_fd {
-                let res = unsafe { libc::dup2(raw, target_fd) };
-                nix::errno::Errno::result(res)?;
+        // Check if the fd is open by trying fcntl F_GETFD, then dup2 if needed
+        unsafe {
+            let flags = libc::fcntl(target_fd, libc::F_GETFD);
+            if flags < 0 {
+                // fd is not open — open /dev/null and dup2 it
+                let devnull = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/null")
+                    .map_err(|_| nix::errno::Errno::ENOENT)?;
+                let raw = devnull.as_raw_fd();
+                if raw != target_fd {
+                    let res = libc::dup2(raw, target_fd);
+                    nix::errno::Errno::result(res)?;
+                }
+                // devnull drops here, closing the original fd
+                // (the dup2'd copy remains open at target_fd)
             }
-            // devnull drops here, closing the original fd
-            // (the dup2'd copy remains open at target_fd)
         }
     }
     Ok(())
@@ -375,14 +380,15 @@ mod tests {
 
         // Connect to our own listener to produce a valid connected socket.
         let client = std::net::TcpStream::connect(addr).expect("connect failed");
-        let fd: RawFd = {
-            use std::os::unix::io::AsRawFd;
-            client.as_raw_fd()
-        };
 
         // Duplicate the fd so we can safely convert without double-close.
-        let dup_fd = unsafe { libc::dup(fd) };
-        assert!(dup_fd >= 0, "dup() failed");
+        // Use nix::unistd::dup (safe wrapper) to avoid adding an unsafe block,
+        // then extract the raw fd via IntoRawFd to get a bare RawFd.
+        let dup_owned = nix::unistd::dup(&client).expect("dup() failed");
+        let dup_fd: RawFd = {
+            use std::os::unix::io::IntoRawFd;
+            dup_owned.into_raw_fd()
+        };
 
         // Convert the duplicated fd via our safe wrapper.
         let stream = tcp_stream_from_raw_fd(dup_fd);

@@ -24,6 +24,7 @@
 
 use crate::DriverError;
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
 
 // =============================================================================
@@ -529,6 +530,18 @@ pub struct TransportInstanceConfig {
     /// Transport driver implementations downcast this to their concrete type
     /// using `options.downcast_ref::<ConcreteType>()`.
     pub options: Box<dyn Any + Send + Sync>,
+
+    /// Driver-specific private options parsed from the configuration file.
+    ///
+    /// Stores the raw key-value pairs for options that are not part of the
+    /// generic transport option table. Each driver retrieves its specific
+    /// options by name (e.g., "file" for appendfile, "command" for pipe).
+    /// The values are the raw option values after the `=` sign, trimmed.
+    ///
+    /// This field supplements the `options` field by providing a simple
+    /// string-based access path that does not require type-specific
+    /// downcasting.
+    pub private_options_map: HashMap<String, String>,
 }
 
 /// Unit struct used as the default value for `TransportInstanceConfig.options`.
@@ -597,6 +610,7 @@ impl Default for TransportInstanceConfig {
             event_action: None,
             filter_timeout: 300,
             options: Box::new(EmptyOptions),
+            private_options_map: HashMap::new(),
         }
     }
 }

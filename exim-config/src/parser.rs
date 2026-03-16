@@ -41,8 +41,8 @@ use regex::Regex;
 use crate::driver_init::{self, ConfigLines};
 use crate::macros::{ConditionalAction, ConditionalProcessor, MacroStore};
 use crate::options::{
-    find_option, handle_option, parse_fixed, parse_time, read_name, OptionEntry,
-    MAIN_CONFIG_OPTIONS,
+    find_option, handle_option, parse_fixed, parse_time, read_name, HandleOptionResult,
+    OptionEntry, OptionValue, MAIN_CONFIG_OPTIONS,
 };
 use crate::types::{
     AclBlock, Config, ConfigContext, ConfigError, NamedList, NamedLists, RetryConfig, RetryRule,
@@ -582,11 +582,44 @@ pub fn parse_main_config(
             continue;
         }
 
-        // First verify the option exists via binary search.
-        if find_option(name, &option_table).is_some() {
+        // Strip `no_` / `not_` prefix for the preliminary lookup so that
+        // negated boolean forms like `no_accept_8bitmime` are found in the
+        // option table (which stores only the canonical unprefixed name).
+        // `handle_option()` also strips the prefix internally, so this is
+        // only needed for the guard check.
+        let lookup_name = if let Some(stripped) = name.strip_prefix("not_") {
+            stripped
+        } else if let Some(stripped) = name.strip_prefix("no_") {
+            stripped
+        } else {
+            name
+        };
+
+        // Also skip `hide` prefix — the actual name follows it.
+        let lookup_name = if lookup_name == "hide" {
+            // Re-read the name after "hide".
+            let (_hide, rest_after_hide) = read_name(trimmed);
+            let (inner_name, _) = read_name(rest_after_hide);
+            let n = if let Some(s) = inner_name.strip_prefix("not_") {
+                s
+            } else if let Some(s) = inner_name.strip_prefix("no_") {
+                s
+            } else {
+                inner_name
+            };
+            n
+        } else {
+            lookup_name
+        };
+
+        if find_option(lookup_name, &option_table).is_some() {
             match handle_option(trimmed, &mut option_table, &mut ctx, None) {
-                Ok(_result) => {
+                Ok(Some(result)) => {
+                    apply_option_to_ctx(&result, &mut ctx);
                     tracing::debug!(option = %name, "processed config option");
+                }
+                Ok(None) => {
+                    tracing::debug!(option = %name, "config option not found (ignored)");
                 }
                 Err(e) => {
                     tracing::error!(
@@ -635,6 +668,13 @@ pub fn parse_main_config(
     tracing::debug!(syslog_facility = %facility, "syslog facility configured");
 
     tracing::info!("main configuration section parsed successfully");
+
+    // ── Post-parse clamping (C readconf.c:3507) ─────────────────────
+    // C Exim enforces: if (retry_interval_max > 24*60*60) retry_interval_max = 24*60*60;
+    const MAX_RETRY_INTERVAL: i32 = 24 * 60 * 60; // 1 day
+    if ctx.retry_interval_max > MAX_RETRY_INTERVAL {
+        ctx.retry_interval_max = MAX_RETRY_INTERVAL;
+    }
 
     Ok((ctx, state))
 }
@@ -1558,6 +1598,788 @@ fn collect_section_lines(state: &mut ParserState) -> Vec<(String, u32)> {
         lines.push((line, lineno));
     }
     lines
+}
+
+// =============================================================================
+// apply_option_to_ctx — Store parsed option values into ConfigContext
+// =============================================================================
+// Lightweight config-time string expansion
+// =============================================================================
+
+/// Performs lightweight string expansion during configuration parsing.
+///
+/// In C Exim, `readconf.c` calls `expand_string()` on most option values
+/// after reading them from the config file. This function implements the
+/// subset of expansion operators commonly used in config-time contexts:
+///
+/// - `${readfile{filename}{separator}}` — read file contents
+/// - `${if eq{s1}{s2}{yes}{no}}` — string equality conditional
+/// - `${if ={n1}{n2}{yes}{no}}` — numeric equality conditional
+///
+/// Operators that reference message variables or dynamic state are left
+/// unexpanded (the raw `${...}` is preserved), matching C Exim's behavior
+/// of deferring expansion of dynamic references until runtime.
+fn expand_config_string(input: &str) -> String {
+    if !input.contains("${") {
+        return input.to_string();
+    }
+
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '$' && chars.peek() == Some(&'{') {
+            // Consume '{'
+            chars.next();
+            // Collect the operator name
+            let mut op = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == '{' || c == ' ' || c == '}' {
+                    break;
+                }
+                op.push(c);
+                chars.next();
+            }
+
+            match op.as_str() {
+                "readfile" => {
+                    // ${readfile{filename}{separator}}
+                    if let Some(expanded) = expand_readfile(&mut chars) {
+                        result.push_str(&expanded);
+                        continue;
+                    }
+                    // Fallback: emit raw
+                    result.push_str("${readfile");
+                    result.push_str(&op);
+                }
+                "if" => {
+                    // ${if eq{s1}{s2}{yes}{no}} or ${if ={n1}{n2}{yes}{no}}
+                    if let Some(expanded) = expand_if_condition(&mut chars) {
+                        result.push_str(&expanded);
+                        continue;
+                    }
+                    // Fallback: emit raw
+                    result.push_str("${if");
+                }
+                _ => {
+                    // Unknown operator — emit raw (deferred expansion)
+                    result.push_str("${");
+                    result.push_str(&op);
+                    // Consume until matching '}'
+                    let mut depth = 1i32;
+                    for c in chars.by_ref() {
+                        result.push(c);
+                        if c == '{' {
+                            depth += 1;
+                        } else if c == '}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
+/// Extract a brace-delimited argument from the iterator: `{content}`
+/// Handles nested braces.
+fn extract_braced_arg(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    // Skip whitespace
+    while let Some(&c) = chars.peek() {
+        if c == ' ' || c == '\t' {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if chars.peek() != Some(&'{') {
+        return None;
+    }
+    chars.next(); // consume '{'
+
+    let mut content = String::new();
+    let mut depth = 1i32;
+    for c in chars.by_ref() {
+        if c == '{' {
+            depth += 1;
+            content.push(c);
+        } else if c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(content);
+            }
+            content.push(c);
+        } else {
+            content.push(c);
+        }
+    }
+    None // unterminated
+}
+
+/// Expand `${readfile{filename}{separator}}` — reads the file and joins
+/// lines with the given separator.
+fn expand_readfile(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    let filename = extract_braced_arg(chars)?;
+    let separator = extract_braced_arg(chars);
+    // Consume the closing '}' of the ${readfile...}
+    while let Some(&c) = chars.peek() {
+        if c == ' ' || c == '\t' {
+            chars.next();
+        } else if c == '}' {
+            chars.next();
+            break;
+        } else {
+            break;
+        }
+    }
+
+    // Read the file
+    let sep = separator.unwrap_or_default();
+    let sep_char = if sep == ":" {
+        ":"
+    } else if sep.is_empty() {
+        "\n"
+    } else {
+        &sep
+    };
+
+    match std::fs::read_to_string(&filename) {
+        Ok(contents) => {
+            // Split by newlines, filter empty, join with separator
+            let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+            Some(lines.join(sep_char))
+        }
+        Err(e) => {
+            tracing::warn!(file = %filename, error = %e, "readfile expansion failed");
+            None
+        }
+    }
+}
+
+/// Expand `${if eq{s1}{s2}{yes}{no}}` or `${if ={n1}{n2}{yes}{no}}`
+fn expand_if_condition(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    // Skip whitespace after "if"
+    while let Some(&c) = chars.peek() {
+        if c == ' ' || c == '\t' {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    // Read the condition operator
+    let mut op = String::new();
+    while let Some(&c) = chars.peek() {
+        if c == '{' || c == ' ' {
+            break;
+        }
+        op.push(c);
+        chars.next();
+    }
+
+    let arg1 = expand_config_string(&extract_braced_arg(chars)?);
+    let arg2 = expand_config_string(&extract_braced_arg(chars)?);
+    let yes_branch = extract_braced_arg(chars)?;
+    let no_branch = extract_braced_arg(chars)?;
+
+    // Consume the closing '}' of the ${if...}
+    while let Some(&c) = chars.peek() {
+        if c == ' ' || c == '\t' {
+            chars.next();
+        } else if c == '}' {
+            chars.next();
+            break;
+        } else {
+            break;
+        }
+    }
+
+    let condition_met = match op.as_str() {
+        "eq" => arg1 == arg2,
+        "!=" | "ne" => arg1 != arg2,
+        "=" | "==" => {
+            let n1 = arg1.trim().parse::<i64>().unwrap_or(0);
+            let n2 = arg2.trim().parse::<i64>().unwrap_or(0);
+            n1 == n2
+        }
+        ">" | "gt" => {
+            let n1 = arg1.trim().parse::<i64>().unwrap_or(0);
+            let n2 = arg2.trim().parse::<i64>().unwrap_or(0);
+            n1 > n2
+        }
+        _ => return None,
+    };
+
+    let branch = if condition_met { yes_branch } else { no_branch };
+    Some(expand_config_string(&branch))
+}
+
+// =============================================================================
+
+/// Apply a parsed option result to the [`ConfigContext`], storing the value
+/// in the corresponding struct field.
+///
+/// This is the critical bridge between the option parser (`handle_option`)
+/// and the configuration data model. Without this function, parsed config
+/// values would be discarded after parsing. Every option recognized by the
+/// `-bP` printer (`validate.rs` `resolve_*_option` functions) must have a
+/// corresponding assignment arm here.
+///
+/// # Arguments
+/// * `result` — The parsed option name, value, and metadata from `handle_option`.
+/// * `ctx` — The mutable configuration context being populated during parsing.
+fn apply_option_to_ctx(result: &HandleOptionResult, ctx: &mut ConfigContext) {
+    let name = result.name.as_str();
+    match &result.value {
+        // ── Boolean options ─────────────────────────────────────────
+        OptionValue::Bool(v) => apply_bool_option(name, *v, ctx),
+
+        // ── String options ──────────────────────────────────────────
+        OptionValue::Str(v) => apply_string_option(name, v, ctx),
+
+        // ── Integer options (Int, Mkint, OctInt) ────────────────────
+        OptionValue::Int(v) => apply_int_option(name, *v, ctx),
+
+        // ── Time options (seconds) ──────────────────────────────────
+        OptionValue::Time(v) => apply_time_option(name, *v, ctx),
+
+        // ── Kint options (kilobyte-unit integers) ───────────────────
+        OptionValue::Kint(v) => apply_kint_option(name, *v, ctx),
+
+        // ── Fixed-point options ─────────────────────────────────────
+        OptionValue::Fixed(v) => apply_fixed_option(name, *v, ctx),
+
+        // ── UID / GID scalar options ────────────────────────────────
+        OptionValue::Uid(v) => {
+            tracing::trace!(option = %name, uid = %v, "applying UID option");
+            match name {
+                "exim_user" => ctx.exim_uid = *v,
+                _ => tracing::warn!(option = %name, "unhandled UID option in apply_option_to_ctx"),
+            }
+        }
+        OptionValue::Gid(v) => {
+            tracing::trace!(option = %name, gid = %v, "applying GID option");
+            match name {
+                "exim_group" => ctx.exim_gid = *v,
+                _ => tracing::warn!(option = %name, "unhandled GID option in apply_option_to_ctx"),
+            }
+        }
+
+        // ── Expandable UID / GID (may contain `$` for deferred expansion) ──
+        OptionValue::ExpandUid(ref eid) => {
+            tracing::trace!(option = %name, "applying ExpandUid option");
+            match name {
+                "exim_user" => {
+                    if let crate::options::ExpandableId::Resolved(uid) = eid {
+                        ctx.exim_uid = *uid;
+                    }
+                    // Deferred values are stored in the option table for
+                    // runtime expansion; the ctx field remains at its default
+                    // until the expansion resolves.
+                }
+                _ => tracing::warn!(option = %name, "unhandled ExpandUid option"),
+            }
+        }
+        OptionValue::ExpandGid(ref eid) => {
+            tracing::trace!(option = %name, "applying ExpandGid option");
+            match name {
+                "exim_group" => {
+                    if let crate::options::ExpandableId::Resolved(gid) = eid {
+                        ctx.exim_gid = *gid;
+                    }
+                }
+                _ => tracing::warn!(option = %name, "unhandled ExpandGid option"),
+            }
+        }
+
+        // ── UID / GID list options ──────────────────────────────────
+        // Store the raw string representation for -bP printing. Expansion
+        // happens at runtime when the list is actually needed for access
+        // control decisions.
+        OptionValue::UidList(ref list) => {
+            let raw_str = match list {
+                crate::options::ExpandableIdList::Deferred(s) => {
+                    // C Exim expands the string at config time, then parses UIDs
+                    let expanded = expand_config_string(s);
+                    if expanded.contains('$') {
+                        // Still contains unexpandable references — store raw
+                        Some(expanded)
+                    } else {
+                        // Expanded successfully — resolve UIDs to names
+                        let parts: Vec<&str> = expanded
+                            .split(':')
+                            .map(|p| p.trim())
+                            .filter(|p| !p.is_empty())
+                            .collect();
+                        let names: Vec<String> = parts
+                            .iter()
+                            .map(|&part| {
+                                if let Ok(uid) = part.parse::<u32>() {
+                                    match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(
+                                        uid,
+                                    )) {
+                                        Ok(Some(u)) => u.name,
+                                        _ => uid.to_string(),
+                                    }
+                                } else {
+                                    part.to_string()
+                                }
+                            })
+                            .collect();
+                        if names.is_empty() {
+                            None
+                        } else {
+                            Some(names.join(":"))
+                        }
+                    }
+                }
+                crate::options::ExpandableIdList::Resolved(ids) => {
+                    if ids.is_empty() {
+                        None
+                    } else {
+                        // Convert resolved UIDs back to names for storage
+                        let names: Vec<String> = ids
+                            .iter()
+                            .map(|&uid| {
+                                match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+                                    Ok(Some(u)) => u.name,
+                                    _ => uid.to_string(),
+                                }
+                            })
+                            .collect();
+                        Some(names.join(":"))
+                    }
+                }
+            };
+            match name {
+                "trusted_users" => ctx.trusted_users = raw_str,
+                "never_users" => ctx.never_users = raw_str,
+                "admin_groups" => ctx.admin_groups = raw_str,
+                _ => {
+                    tracing::trace!(option = %name, "UidList stored in option table only");
+                }
+            }
+        }
+        OptionValue::GidList(ref list) => {
+            let raw_str = match list {
+                crate::options::ExpandableIdList::Deferred(s) => {
+                    let expanded = expand_config_string(s);
+                    if expanded.contains('$') {
+                        Some(expanded)
+                    } else {
+                        let parts: Vec<&str> = expanded
+                            .split(':')
+                            .map(|p| p.trim())
+                            .filter(|p| !p.is_empty())
+                            .collect();
+                        let names: Vec<String> = parts
+                            .iter()
+                            .map(|&part| {
+                                if let Ok(gid) = part.parse::<u32>() {
+                                    match nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(
+                                        gid,
+                                    )) {
+                                        Ok(Some(g)) => g.name,
+                                        _ => gid.to_string(),
+                                    }
+                                } else {
+                                    part.to_string()
+                                }
+                            })
+                            .collect();
+                        if names.is_empty() {
+                            None
+                        } else {
+                            Some(names.join(":"))
+                        }
+                    }
+                }
+                crate::options::ExpandableIdList::Resolved(ids) => {
+                    if ids.is_empty() {
+                        None
+                    } else {
+                        let names: Vec<String> = ids
+                            .iter()
+                            .map(|&gid| {
+                                match nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(gid))
+                                {
+                                    Ok(Some(g)) => g.name,
+                                    _ => gid.to_string(),
+                                }
+                            })
+                            .collect();
+                        Some(names.join(":"))
+                    }
+                }
+            };
+            match name {
+                "trusted_groups" => ctx.trusted_groups = raw_str,
+                _ => {
+                    tracing::trace!(option = %name, "GidList stored in option table only");
+                }
+            }
+        }
+
+        // ── Time list options ───────────────────────────────────────
+        OptionValue::TimeList(_) => {
+            tracing::trace!(option = %name, "time list option stored in option table");
+            // Time lists (e.g. delay_warning) are read back from the
+            // option table at runtime. No dedicated ConfigContext field.
+        }
+
+        // ── Rewrite rules ───────────────────────────────────────────
+        OptionValue::Rewrite(_) => {
+            tracing::trace!(option = %name, "rewrite option handled by section parser");
+        }
+
+        // ── Function / Module delegation ────────────────────────────
+        OptionValue::Func(_) => {
+            tracing::trace!(option = %name, "func option handled by custom handler");
+        }
+        OptionValue::ModuleDelegate { module, .. } => {
+            tracing::trace!(option = %name, module = %module, "module-delegated option");
+        }
+    }
+}
+
+/// Apply a boolean option value to the correct [`ConfigContext`] field.
+///
+/// The mapping mirrors `resolve_bool_option()` in `validate.rs` to ensure
+/// that `-bP` printing reads back the same field that was written here.
+fn apply_bool_option(name: &str, value: bool, ctx: &mut ConfigContext) {
+    match name {
+        "accept_8bitmime" => ctx.accept_8bitmime = value,
+        "allow_domain_literals" => ctx.allow_domain_literals = value,
+        "allow_mx_to_ip" => ctx.allow_mx_to_ip = value,
+        "bounce_return_body" => ctx.bounce_return_body = value,
+        "bounce_return_message" => ctx.bounce_return_message = value,
+        "check_rfc2047_length" => ctx.check_rfc2047_length = value,
+        "commandline_checks_require_admin" => ctx.commandline_checks_require_admin = value,
+        "delivery_date_remove" => ctx.delivery_date_remove = value,
+        "deliver_drop_privilege" => ctx.deliver_drop_privilege = value,
+        "disable_ipv6" => ctx.disable_ipv6 = value,
+        "dns_csa_use_reverse" => ctx.dns_csa_use_reverse = value,
+        "envelope_to_remove" => ctx.envelope_to_remove = value,
+        "extract_addresses_remove_arguments" => ctx.extract_addresses_remove_arguments = value,
+        "ignore_fromline_local" => ctx.ignore_fromline_local = value,
+        "local_from_check" => ctx.local_from_check = value,
+        "local_sender_retain" => ctx.local_sender_retain = value,
+        "log_timezone" => ctx.log_timezone = value,
+        "message_body_newlines" => ctx.message_body_newlines = value,
+        "message_logs" => ctx.message_logs = value,
+        "pipelining_enable" => ctx.pipelining_enable = value,
+        "preserve_message_logs" => ctx.preserve_message_logs = value,
+        "print_topbitchars" => ctx.print_topbitchars = value,
+        "prod_requires_admin" => ctx.prod_requires_admin = value,
+        "queue_list_requires_admin" => ctx.queue_list_requires_admin = value,
+        "queue_only" => ctx.queue_only = value,
+        "queue_only_load_latch" => ctx.queue_only_load_latch = value,
+        "queue_only_override" => ctx.queue_only_override = value,
+        "queue_run_in_order" => ctx.queue_run_in_order = value,
+        "recipients_max_reject" => ctx.recipients_max_reject = value,
+        "return_path_remove" => ctx.return_path_remove = value,
+        "smtp_accept_keepalive" => ctx.smtp_accept_keepalive = value,
+        "smtp_check_spool_space" => ctx.smtp_check_spool_space = value,
+        "smtp_enforce_sync" => ctx.smtp_enforce_sync = value,
+        "smtp_etrn_serialize" => ctx.smtp_etrn_serialize = value,
+        "smtp_return_error_details" => ctx.smtp_return_error_details = value,
+        "split_spool_directory" => ctx.split_spool_directory = value,
+        "spool_wireformat" => ctx.spool_wireformat = value,
+        "strict_acl_vars" => ctx.strict_acl_vars = value,
+        "strip_excess_angle_brackets" => ctx.strip_excess_angle_brackets = value,
+        "strip_trailing_dot" => ctx.strip_trailing_dot = value,
+        "syslog_duplication" => ctx.syslog_duplication = value,
+        "syslog_pid" => ctx.syslog_pid = value,
+        "syslog_timestamp" => ctx.syslog_timestamp = value,
+        "tcp_nodelay" => ctx.tcp_nodelay = value,
+        "timestamps_utc" => ctx.timestamps_utc = value,
+        "write_rejectlog" => ctx.write_rejectlog = value,
+        "debug_store" => ctx.debug_store = value,
+        "mua_wrapper" => ctx.mua_wrapper = value,
+        "panic_coredump" => ctx.panic_coredump = value,
+        "log_ports" => ctx.log_ports = value,
+        _ => {
+            tracing::trace!(option = %name, value = %value, "bool option stored in option table only");
+        }
+    }
+}
+
+/// Apply a string option value to the correct [`ConfigContext`] field.
+///
+/// The mapping mirrors `resolve_string_option()` in `validate.rs`.
+fn apply_string_option(name: &str, value: &str, ctx: &mut ConfigContext) {
+    // C Exim calls expand_string() on most string option values after reading
+    // them from the config file (readconf.c). Perform lightweight expansion
+    // here so that ${readfile{...}}, ${if ...}, etc. are resolved at parse time.
+    let expanded = expand_config_string(value);
+    let value = expanded.as_str();
+
+    // Helper: set an Option<String> field. Empty strings become None
+    // to match the C behavior where empty string pointers are treated
+    // as unset.
+    let opt_val = if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    };
+
+    match name {
+        // ACL definitions
+        "acl_not_smtp" => ctx.acl_not_smtp = opt_val,
+        "acl_not_smtp_start" => ctx.acl_not_smtp_start = opt_val,
+        "acl_smtp_atrn" => ctx.acl_smtp_atrn = opt_val,
+        "acl_smtp_auth" => ctx.acl_smtp_auth = opt_val,
+        "acl_smtp_connect" => ctx.acl_smtp_connect = opt_val,
+        "acl_smtp_data" => ctx.acl_smtp_data = opt_val,
+        "acl_smtp_etrn" => ctx.acl_smtp_etrn = opt_val,
+        "acl_smtp_expn" => ctx.acl_smtp_expn = opt_val,
+        "acl_smtp_helo" => ctx.acl_smtp_helo = opt_val,
+        "acl_smtp_mail" => ctx.acl_smtp_mail = opt_val,
+        "acl_smtp_mailauth" => ctx.acl_smtp_mailauth = opt_val,
+        "acl_smtp_notquit" => ctx.acl_smtp_notquit = opt_val,
+        "acl_smtp_predata" => ctx.acl_smtp_predata = opt_val,
+        "acl_smtp_quit" => ctx.acl_smtp_quit = opt_val,
+        "acl_smtp_rcpt" => ctx.acl_smtp_rcpt = opt_val,
+        "acl_smtp_vrfy" => ctx.acl_smtp_vrfy = opt_val,
+        #[cfg(feature = "tls")]
+        "acl_smtp_starttls" => ctx.acl_smtp_starttls = opt_val,
+        #[cfg(feature = "prdr")]
+        "acl_smtp_data_prdr" => ctx.acl_smtp_data_prdr = opt_val,
+        #[cfg(feature = "dkim")]
+        "acl_smtp_dkim" => ctx.acl_smtp_dkim = opt_val,
+        #[cfg(feature = "content-scan")]
+        "acl_not_smtp_mime" => ctx.acl_not_smtp_mime = opt_val,
+        #[cfg(feature = "content-scan")]
+        "acl_smtp_mime" => ctx.acl_smtp_mime = opt_val,
+        #[cfg(feature = "wellknown")]
+        "acl_smtp_wellknown" => ctx.acl_smtp_wellknown = opt_val,
+
+        // String options — alphabetical
+        "add_environment" => ctx.add_environment = opt_val,
+        "auth_advertise_hosts" => ctx.auth_advertise_hosts = opt_val,
+        "bi_command" => ctx.bi_command = opt_val,
+        "bounce_message_file" => ctx.bounce_message_file = opt_val,
+        "bounce_message_text" => ctx.bounce_message_text = opt_val,
+        "bounce_sender_authentication" => ctx.bounce_sender_authentication = opt_val,
+        "callout_random_local_part" => ctx.callout_random_local_part = opt_val,
+        "check_dns_names_pattern" => ctx.dns_check_names_pattern = opt_val,
+        "chunking_advertise_hosts" => ctx.chunking_advertise_hosts = opt_val,
+        "daemon_smtp_port" | "daemon_smtp_ports" => ctx.daemon_smtp_port = opt_val,
+        "daemon_modules_load" => ctx.daemon_modules_load = opt_val,
+        "delay_warning_condition" => ctx.delay_warning_condition = opt_val,
+        "dns_again_means_nonexist" => ctx.dns_again_means_nonexist = opt_val,
+        "dns_ipv4_lookup" => ctx.dns_ipv4_lookup = opt_val,
+        "dns_trust_aa" => ctx.dns_trust_aa = opt_val,
+        "dsn_from" => ctx.dsn_from = opt_val,
+        "dsn_advertise_hosts" => ctx.dsn_advertise_hosts = opt_val,
+        "errors_copy" => ctx.errors_copy = opt_val,
+        "errors_reply_to" => ctx.errors_reply_to = opt_val,
+        "extra_local_interfaces" => ctx.extra_local_interfaces = opt_val,
+        "freeze_tell" => ctx.freeze_tell = opt_val,
+        "gecos_name" => ctx.gecos_name = opt_val,
+        "gecos_pattern" => ctx.gecos_pattern = opt_val,
+        "helo_accept_junk_hosts" => ctx.helo_accept_junk_hosts = opt_val,
+        "helo_allow_chars" => ctx.helo_allow_chars = opt_val,
+        "helo_lookup_domains" => ctx.helo_lookup_domains = opt_val,
+        "helo_try_verify_hosts" => ctx.helo_try_verify_hosts = opt_val,
+        "helo_verify_hosts" => ctx.helo_verify_hosts = opt_val,
+        "hold_domains" => ctx.hold_domains = opt_val,
+        "host_lookup" => ctx.host_lookup = opt_val,
+        "host_lookup_order" => ctx.host_lookup_order = opt_val,
+        "host_reject_connection" => ctx.host_reject_connection = opt_val,
+        "hosts_connection_nolog" => ctx.hosts_connection_nolog = opt_val,
+        "hosts_require_helo" => ctx.hosts_require_helo = opt_val,
+        "hosts_treat_as_local" => ctx.hosts_treat_as_local = opt_val,
+        "ignore_fromline_hosts" => ctx.ignore_fromline_hosts = opt_val,
+        "keep_environment" => ctx.keep_environment = opt_val,
+        "local_from_prefix" => ctx.local_from_prefix = opt_val,
+        "local_from_suffix" => ctx.local_from_suffix = opt_val,
+        "local_interfaces" => ctx.local_interfaces = opt_val,
+        "log_selector" => ctx.log_selector_string = opt_val,
+        "message_size_limit" => ctx.message_size_limit = opt_val,
+        "notifier_socket" => ctx.notifier_socket = opt_val,
+        "percent_hack_domains" => ctx.percent_hack_domains = opt_val,
+        "pipelining_advertise_hosts" => ctx.pipelining_advertise_hosts = opt_val,
+        "received_header_text" => ctx.received_header_text = opt_val,
+        "recipient_unqualified_hosts" => ctx.recipient_unqualified_hosts = opt_val,
+        "recipients_max" => ctx.recipients_max = opt_val,
+        "remote_sort_domains" => ctx.remote_sort_domains = opt_val,
+        "rfc1413_hosts" => ctx.rfc1413_hosts = opt_val,
+        "sender_unqualified_hosts" => ctx.sender_unqualified_hosts = opt_val,
+        "smtp_accept_max_per_connection" => ctx.smtp_accept_max_per_connection = opt_val,
+        "smtp_accept_max_per_host" => ctx.smtp_accept_max_per_host = opt_val,
+        "smtp_accept_max_nonmail_hosts" => ctx.smtp_accept_max_nonmail_hosts = opt_val,
+        "smtp_active_hostname" => ctx.smtp_active_hostname = opt_val,
+        "smtp_banner" => ctx.smtp_banner = opt_val,
+        "smtp_etrn_command" => ctx.smtp_etrn_command = opt_val,
+        "smtp_ratelimit_hosts" => ctx.smtp_ratelimit_hosts = opt_val,
+        "smtp_ratelimit_mail" => ctx.smtp_ratelimit_mail = opt_val,
+        "smtp_ratelimit_rcpt" => ctx.smtp_ratelimit_rcpt = opt_val,
+        "smtp_reserve_hosts" => ctx.smtp_reserve_hosts = opt_val,
+        "syslog_processname" => ctx.syslog_processname = opt_val,
+        "system_filter" => ctx.system_filter = opt_val,
+        "system_filter_directory_transport" => ctx.system_filter_directory_transport = opt_val,
+        "system_filter_file_transport" => ctx.system_filter_file_transport = opt_val,
+        "system_filter_pipe_transport" => ctx.system_filter_pipe_transport = opt_val,
+        "system_filter_reply_transport" => ctx.system_filter_reply_transport = opt_val,
+        "tls_advertise_hosts" => ctx.tls_advertise_hosts = opt_val,
+        "queue_domains" => ctx.queue_domains = opt_val,
+        "queue_only_file" => ctx.queue_only_file = opt_val,
+        "queue_run_max" => ctx.queue_run_max = opt_val,
+        "queue_smtp_domains" => ctx.queue_smtp_domains = opt_val,
+        "smtp_receive_timeout_s" => ctx.smtp_receive_timeout_s = opt_val,
+        "exim_version" => ctx.exim_version = opt_val,
+        "exim_path" => ctx.exim_path = opt_val,
+        "headers_charset" => ctx.headers_charset = opt_val,
+        "unknown_login" => ctx.unknown_login = opt_val,
+        "unknown_username" => ctx.unknown_username = opt_val,
+        "warn_message_file" => ctx.warn_message_file = opt_val,
+        "timezone" => ctx.timezone = opt_val,
+        "uucp_from_pattern" => ctx.uucp_from_pattern = opt_val,
+        "uucp_from_sender" => ctx.uucp_from_sender = opt_val,
+        "untrusted_set_sender" => ctx.untrusted_set_sender = opt_val,
+        "process_log_path" => ctx.process_log_path = opt_val,
+        "message_id_header_domain" => ctx.message_id_header_domain = opt_val,
+        "message_id_header_text" => ctx.message_id_header_text = opt_val,
+        "dns_check_names_pattern" => ctx.dns_check_names_pattern = opt_val,
+
+        // Direct String fields (non-Option) — these are never None,
+        // so we assign the value directly instead of using opt_val.
+        "spool_directory" => ctx.spool_directory = value.to_string(),
+        "log_file_path" => ctx.log_file_path = value.to_string(),
+        "pid_file_path" => ctx.pid_file_path = value.to_string(),
+        "primary_hostname" => ctx.primary_hostname = value.to_string(),
+        "qualify_domain" => ctx.qualify_domain_sender = value.to_string(),
+        "qualify_recipient" => ctx.qualify_domain_recipient = value.to_string(),
+
+        // TLS options (feature-gated)
+        #[cfg(feature = "tls")]
+        "tls_certificate" => ctx.tls_certificate = opt_val,
+        #[cfg(feature = "tls")]
+        "tls_privatekey" => ctx.tls_privatekey = opt_val,
+        #[cfg(feature = "tls")]
+        "tls_verify_certificates" => ctx.tls_verify_certificates = opt_val,
+        #[cfg(feature = "tls")]
+        "tls_crl" => ctx.tls_crl = opt_val,
+        #[cfg(feature = "tls")]
+        "tls_require_ciphers" => ctx.tls_require_ciphers = opt_val,
+        #[cfg(feature = "tls")]
+        "tls_try_verify_hosts" => ctx.tls_try_verify_hosts = opt_val,
+        #[cfg(feature = "tls")]
+        "tls_verify_hosts" => ctx.tls_verify_hosts = opt_val,
+
+        // Content scanning (feature-gated)
+        #[cfg(feature = "content-scan")]
+        "av_scanner" => ctx.av_scanner = opt_val,
+        #[cfg(feature = "content-scan")]
+        "spamd_address" => ctx.spamd_address = opt_val,
+
+        _ => {
+            tracing::trace!(option = %name, "string option stored in option table only");
+        }
+    }
+}
+
+/// Apply an integer option value to the correct [`ConfigContext`] field.
+///
+/// The mapping mirrors `resolve_int_option()` in `validate.rs`.
+fn apply_int_option(name: &str, value: i64, ctx: &mut ConfigContext) {
+    match name {
+        "bounce_return_linesize_limit" => ctx.bounce_return_linesize_limit = value as i32,
+        "bounce_return_size_limit" => ctx.bounce_return_size_limit = value as i32,
+        "check_log_inodes" => ctx.check_log_inodes = value as i32,
+        "check_spool_inodes" => ctx.check_spool_inodes = value as i32,
+        "connection_max_messages" => ctx.connection_max_messages = value as i32,
+        "daemon_startup_retries" => ctx.daemon_startup_retries = value as i32,
+        "dns_cname_loops" => ctx.dns_cname_loops = value as i32,
+        "dns_csa_search_limit" => ctx.dns_csa_search_limit = value as i32,
+        "dns_retry" => ctx.dns_retry = value as i32,
+        "header_line_maxsize" => ctx.header_line_maxsize = value as i32,
+        "header_maxsize" => ctx.header_maxsize = value as i32,
+        "header_insert_maxlen" => ctx.header_insert_maxlen = value as i32,
+        "lookup_open_max" => ctx.lookup_open_max = value as i32,
+        "message_body_visible" => ctx.message_body_visible = value as i32,
+        "received_headers_max" => ctx.received_headers_max = value as i32,
+        "remote_max_parallel" => ctx.remote_max_parallel = value as i32,
+        "smtp_accept_max" => ctx.smtp_accept_max = value as i32,
+        "smtp_accept_max_nonmail" => ctx.smtp_accept_max_nonmail = value as i32,
+        "smtp_accept_queue" => ctx.smtp_accept_queue = value as i32,
+        "smtp_accept_queue_per_connection" => ctx.smtp_accept_queue_per_connection = value as i32,
+        "smtp_accept_reserve" => ctx.smtp_accept_reserve = value as i32,
+        "smtp_connect_backlog" => ctx.smtp_connect_backlog = value as i32,
+        "smtp_max_synprot_errors" => ctx.smtp_max_synprot_errors = value as i32,
+        "smtp_max_unknown_commands" => ctx.smtp_max_unknown_commands = value as i32,
+        "smtp_load_reserve" => ctx.smtp_load_reserve = value as i32,
+        "queue_only_load" => ctx.queue_only_load = value as i32,
+        "deliver_queue_load_max" => ctx.deliver_queue_load_max = value as i32,
+        "max_username_length" => ctx.max_username_length = value as i32,
+        "finduser_retries" => ctx.finduser_retries = value as i32,
+        "localhost_number" => ctx.localhost_number = value as i32,
+        "slow_lookup_log" => ctx.slow_lookup_log = value as i32,
+        "smtp_backlog_monitor" => ctx.smtp_backlog_monitor = value as i32,
+        "return_size_limit" => ctx.return_size_limit = value as i32,
+        "rfc1413_port" => ctx.rfc1413_port = value as i32,
+        "dns_dnssec_ok" => ctx.dns_dnssec_ok = value as i32,
+        "dns_use_edns0" => ctx.dns_use_edns0 = value as i32,
+        "tls_dh_max_bits" => ctx.tls_dh_max_bits = value as i32,
+        _ => {
+            tracing::trace!(option = %name, value = %value, "int option stored in option table only");
+        }
+    }
+}
+
+/// Apply a time option value (seconds) to the correct [`ConfigContext`] field.
+///
+/// The mapping mirrors `resolve_time_option()` in `validate.rs`.
+fn apply_time_option(name: &str, value: i32, ctx: &mut ConfigContext) {
+    match name {
+        "auto_thaw" => ctx.auto_thaw = value,
+        "callout_domain_positive_expire" => ctx.callout_cache_domain_positive_expire = value,
+        "callout_domain_negative_expire" => ctx.callout_cache_domain_negative_expire = value,
+        "callout_positive_expire" => ctx.callout_cache_positive_expire = value,
+        "callout_negative_expire" => ctx.callout_cache_negative_expire = value,
+        "daemon_startup_sleep" => ctx.daemon_startup_sleep = value,
+        "dns_retrans" => ctx.dns_retrans = value,
+        "ignore_bounce_errors_after" => ctx.ignore_bounce_errors_after = value,
+        "keep_malformed" => ctx.keep_malformed = value,
+        "queue_interval" => ctx.queue_interval = value,
+        "receive_timeout" => ctx.receive_timeout = value,
+        "retry_data_expire" => ctx.retry_data_expire = value,
+        "retry_interval_max" => ctx.retry_interval_max = value,
+        "rfc1413_query_timeout" => ctx.rfc1413_query_timeout = value,
+        "smtp_receive_timeout" => ctx.smtp_receive_timeout = value,
+        "timeout_frozen_after" => ctx.timeout_frozen_after = value,
+        _ => {
+            tracing::trace!(option = %name, value = %value, "time option stored in option table only");
+        }
+    }
+}
+
+/// Apply a Kint (kilobyte-unit integer) option value to the correct field.
+///
+/// The mapping mirrors `resolve_kint_option()` in `validate.rs`.
+fn apply_kint_option(name: &str, value: i64, ctx: &mut ConfigContext) {
+    match name {
+        "check_log_space" => ctx.check_log_space = value,
+        "check_spool_space" => ctx.check_spool_space = value,
+        _ => {
+            tracing::trace!(option = %name, value = %value, "kint option stored in option table only");
+        }
+    }
+}
+
+/// Apply a fixed-point option value (× 1000) to the correct field.
+fn apply_fixed_option(name: &str, _value: i32, _ctx: &mut ConfigContext) {
+    // Currently no ConfigContext fields use the fixed-point type directly.
+    // The option table stores the value, which is read back for -bP printing.
+    tracing::trace!(option = %name, "fixed option stored in option table only");
 }
 
 // =============================================================================

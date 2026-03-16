@@ -307,6 +307,8 @@ enum Krb5Ffi {
     Krb5FreeContext {
         ctx: ffi::krb5_context,
     },
+    /// Retrieve the GSS_C_NT_HOSTBASED_SERVICE OID constant from the GSSAPI library.
+    GetNtHostbasedService,
 }
 
 /// Result types returned by the consolidated Kerberos FFI dispatch function.
@@ -319,6 +321,8 @@ enum Krb5FfiResult {
     Bytes(Vec<u8>),
     /// Operation completed (void return or unused status).
     Done,
+    /// GSSAPI OID value retrieved from the C library.
+    Oid(ffi::gss_OID),
 }
 
 /// Consolidated FFI dispatch for all GSSAPI/Kerberos unsafe operations.
@@ -444,6 +448,12 @@ fn krb5_ffi(op: Krb5Ffi) -> Krb5FfiResult {
                 ffi::krb5_free_context(ctx);
                 Krb5FfiResult::Done
             }
+            // SAFETY: GSS_C_NT_HOSTBASED_SERVICE is a global GSSAPI OID constant
+            // defined in <gssapi/gssapi.h>. It is initialised by the GSSAPI library
+            // at load time and never mutated thereafter. Reading its pointer value
+            // here is safe as it is only used as an input parameter to
+            // gss_import_name inside the krb5_ffi dispatch.
+            Krb5Ffi::GetNtHostbasedService => Krb5FfiResult::Oid(ffi::GSS_C_NT_HOSTBASED_SERVICE),
         }
     }
 }
@@ -608,13 +618,11 @@ impl GssName {
             value: c_name.as_ptr() as *mut libc::c_void,
         };
 
-        // Dispatch gss_import_name through consolidated FFI.
-        // SAFETY: GSS_C_NT_HOSTBASED_SERVICE is a global GSSAPI OID constant
-        // defined in <gssapi/gssapi.h>. It is initialised by the GSSAPI library
-        // at load time and never mutated thereafter. Reading its pointer value
-        // here is safe as it is only used as an input parameter to
-        // gss_import_name inside the krb5_ffi dispatch.
-        let nt_host = unsafe { ffi::GSS_C_NT_HOSTBASED_SERVICE };
+        // Retrieve the GSS_C_NT_HOSTBASED_SERVICE OID via consolidated dispatch.
+        let nt_host = match krb5_ffi(Krb5Ffi::GetNtHostbasedService) {
+            Krb5FfiResult::Oid(oid) => oid,
+            _ => unreachable!(),
+        };
         let maj = match krb5_ffi(Krb5Ffi::GssImportName {
             min: &mut min_stat,
             buf: &mut buf,

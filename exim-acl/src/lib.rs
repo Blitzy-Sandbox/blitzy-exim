@@ -152,7 +152,7 @@ pub use variables::{AclVarError, AclVarScope, AclVarStore, AclVariable};
 pub use engine::{acl_check_wargs, acl_current_verb, acl_read, AclBlock, AclConditionBlock};
 
 // Standard library imports for this module's implementations.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 // Structured logging replacing C DEBUG(D_acl) debug_printf_indent() calls.
@@ -426,6 +426,33 @@ pub struct MessageContext {
     ///
     /// Replaces C global `deliver_domain` set in `acl_check()`.
     pub domain: String,
+
+    /// The envelope sender address (from MAIL FROM).
+    ///
+    /// Set by the SMTP session handler before ACL evaluation for conditions
+    /// such as `senders` and `sender_domains` that must match against the
+    /// envelope sender. Empty string for the null sender (`<>`).
+    ///
+    /// Replaces C global `sender_address`.
+    pub sender_address: String,
+
+    /// Named domain lists from configuration (e.g. `domainlist local_domains = test.ex`).
+    ///
+    /// Keys are list names (without the `+` prefix), values are the raw
+    /// colon-separated list definitions. Used by ACL conditions like
+    /// `domains = +local_domains` to resolve named list references.
+    ///
+    /// Replaces C `domainlist_anchor` global linked list.
+    pub named_domain_lists: HashMap<String, String>,
+
+    /// Named host lists from configuration (e.g. `hostlist relay_hosts = ...`).
+    pub named_host_lists: HashMap<String, String>,
+
+    /// Named address lists from configuration (e.g. `addresslist ...`).
+    pub named_address_lists: HashMap<String, String>,
+
+    /// Named local-part lists from configuration.
+    pub named_local_part_lists: HashMap<String, String>,
 }
 
 // =============================================================================

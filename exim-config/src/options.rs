@@ -1580,23 +1580,37 @@ fn resolve_gid(name: &str) -> Result<u32, ConfigError> {
 /// Parse a colon-separated list of UIDs.
 ///
 /// Each entry is resolved via [`resolve_uid`].
-fn parse_uid_list(input: &str) -> Result<Vec<u32>, ConfigError> {
+fn parse_uid_list(input: &str) -> Result<ExpandableIdList, ConfigError> {
     let s = input.trim();
     if s.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ExpandableIdList::Resolved(Vec::new()));
     }
-    s.split(':').map(|part| resolve_uid(part.trim())).collect()
+    // If the value contains string expansions (${ or $variable), defer
+    // resolution until runtime — the expansion engine will handle it.
+    if s.contains('$') {
+        return Ok(ExpandableIdList::Deferred(s.to_string()));
+    }
+    let uids: Result<Vec<u32>, ConfigError> =
+        s.split(':').map(|part| resolve_uid(part.trim())).collect();
+    Ok(ExpandableIdList::Resolved(uids?))
 }
 
 /// Parse a colon-separated list of GIDs.
 ///
-/// Each entry is resolved via [`resolve_gid`].
-fn parse_gid_list(input: &str) -> Result<Vec<u32>, ConfigError> {
+/// Each entry is resolved via [`resolve_gid`].  If the value contains
+/// string-expansion markers (`$`), the list is deferred for runtime expansion.
+fn parse_gid_list(input: &str) -> Result<ExpandableIdList, ConfigError> {
     let s = input.trim();
     if s.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ExpandableIdList::Resolved(Vec::new()));
     }
-    s.split(':').map(|part| resolve_gid(part.trim())).collect()
+    // Defer if value contains expansion syntax.
+    if s.contains('$') {
+        return Ok(ExpandableIdList::Deferred(s.to_string()));
+    }
+    let gids: Result<Vec<u32>, ConfigError> =
+        s.split(':').map(|part| resolve_gid(part.trim())).collect();
+    Ok(ExpandableIdList::Resolved(gids?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1678,10 +1692,12 @@ pub enum OptionValue {
     Uid(u32),
     /// A resolved GID (from `opt_gid`).
     Gid(u32),
-    /// A list of resolved UIDs (from `opt_uidlist`).
-    UidList(Vec<u32>),
-    /// A list of resolved GIDs (from `opt_gidlist`).
-    GidList(Vec<u32>),
+    /// A list of UIDs (from `opt_uidlist`) — either resolved or deferred for
+    /// later string expansion when the value contains `$` references.
+    UidList(ExpandableIdList),
+    /// A list of GIDs (from `opt_gidlist`) — either resolved or deferred for
+    /// later string expansion when the value contains `$` references.
+    GidList(ExpandableIdList),
     /// An expandable UID — either a resolved UID or a deferred `$`-prefixed
     /// string for later expansion.
     ExpandUid(ExpandableId),
@@ -1710,6 +1726,18 @@ pub enum ExpandableId {
     /// The value was resolved immediately to a numeric ID.
     Resolved(u32),
     /// The value starts with `$` and is stored for later expansion.
+    Deferred(String),
+}
+
+/// Represents a list of UIDs or GIDs that may contain deferred string
+/// expansions (e.g. `${readfile{...}{:}}`).  When the raw value contains
+/// `$`, the entire list is stored as a string for runtime expansion.
+#[derive(Debug, Clone)]
+pub enum ExpandableIdList {
+    /// All entries were resolved immediately to numeric IDs.
+    Resolved(Vec<u32>),
+    /// The value contains `$` expansion syntax and must be expanded at
+    /// runtime before splitting and resolving individual entries.
     Deferred(String),
 }
 
@@ -2043,11 +2071,11 @@ pub fn handle_option(
             }
             let after_eq = require_equals(s, &full_name)?;
             let raw = dequote_string(after_eq.trim())?;
-            let uids = parse_uid_list(&raw)?;
-            trace!(option = %lookup_name, count = uids.len(), "parsed UID list option");
+            let uid_list = parse_uid_list(&raw)?;
+            trace!(option = %lookup_name, "parsed UID list option");
             Ok(Some(HandleOptionResult {
                 name: lookup_name,
-                value: OptionValue::UidList(uids),
+                value: OptionValue::UidList(uid_list),
                 is_secure,
                 is_negated,
             }))
@@ -2063,11 +2091,11 @@ pub fn handle_option(
             }
             let after_eq = require_equals(s, &full_name)?;
             let raw = dequote_string(after_eq.trim())?;
-            let gids = parse_gid_list(&raw)?;
-            trace!(option = %lookup_name, count = gids.len(), "parsed GID list option");
+            let gid_list = parse_gid_list(&raw)?;
+            trace!(option = %lookup_name, "parsed GID list option");
             Ok(Some(HandleOptionResult {
                 name: lookup_name,
-                value: OptionValue::GidList(gids),
+                value: OptionValue::GidList(gid_list),
                 is_secure,
                 is_negated,
             }))

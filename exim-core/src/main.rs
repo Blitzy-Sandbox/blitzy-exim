@@ -97,6 +97,17 @@ const EXIM_USERNAME: &str = "exim";
 /// Default Exim group name (matches compile-time EXIM_GROUP).
 const EXIM_GROUPNAME: &str = "exim";
 
+/// Path to the TRUSTED_CONFIG_LIST file.
+///
+/// This compile-time constant mirrors the C Exim `TRUSTED_CONFIG_LIST` macro.
+/// When set, the file contains a list of configuration file paths (one per
+/// line) that are trusted when running as root. The test/runtest harness
+/// expects this to be set and checks its output via `-bV`.
+///
+/// Overridable at runtime via the `EXIM_TRUSTED_CONFIG_LIST` environment
+/// variable for build-system flexibility.
+const TRUSTED_CONFIG_LIST: &str = "";
+
 /// Pattern for matching Exim message IDs (both old 16-char and new 23-char).
 const EXIM_MESSAGE_ID_REGEX: &str = r"^[0-9A-Za-z]{6}-[0-9A-Za-z]{6,11}-[0-9A-Za-z]{2,4}$";
 
@@ -237,6 +248,18 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+
+    // Populate exim_uid / exim_gid from the resolved server context so that
+    // `-bP exim_user` / `-bP exim_group` print the correct values (C parity).
+    parsed_config.exim_uid = server_ctx.exim_uid;
+    parsed_config.exim_gid = server_ctx.exim_gid;
+
+    // Populate the version string from the patchable binary marker so
+    // that `patchexim` can replace "4.99" with "x.yz" for test output
+    // stability. If config hasn't overridden it, use the patched version.
+    if parsed_config.exim_version == Some("4.99".to_string()) {
+        parsed_config.exim_version = Some(exim_ffi::get_patched_version().to_string());
+    }
 
     // parse_rest() handles driver initialisation (auths, routers, transports)
     // internally — no separate init_drivers() call needed.
@@ -772,7 +795,20 @@ fn handle_smtp_input(
 
     let mut smtp_msg_ctx = exim_smtp::inbound::command_loop::MessageContext::default();
 
-    let smtp_config_ctx = build_smtp_config_context(&config_ctx.config);
+    // In -bs mode, set sender_ident to the calling user's login name.
+    // This matches C Exim (exim.c:5246): "if (!sender_ident) sender_ident = originator_login;"
+    // The HELO greeting uses this: "250 host Hello CALLER at helo_name"
+    if let Some(login) = exim_ffi::get_login_name() {
+        smtp_msg_ctx.sender_ident = Some(login);
+    }
+
+    let mut smtp_config_ctx = build_smtp_config_context(&config_ctx.config);
+
+    // In -bs/-bS mode (stdin/stdout SMTP), disable pipelining sync
+    // checking because all input data is buffered immediately in a pipe,
+    // causing false positive sync violations. C Exim disables sync
+    // checking for non-network connections (smtp_in.c ~line 1300).
+    smtp_config_ctx.smtp_enforce_sync = false;
 
     let mut session_state = exim_smtp::inbound::SessionState::default();
 
@@ -833,6 +869,16 @@ fn handle_smtp_input(
 }
 
 /// Handle `-bh <host>` host checking / SMTP simulation mode.
+///
+/// In C Exim, `-bh <host>` creates a fake inbound SMTP session pretending
+/// the connection comes from `<host>`.  SMTP commands are read from stdin
+/// and responses are written to stdout, exactly like `-bs` mode, but with
+/// `host_checking = true` which activates host-sensitive ACL conditions
+/// (sender_host_address, etc.) and disables actual delivery.
+///
+/// Previously this function only called `smtp_start_session()` without
+/// entering the command loop, producing no SMTP output.  The fix mirrors
+/// the `-bs` handler by calling `smtp_setup_msg()` after session init.
 fn handle_host_check(
     host: &str,
     server_ctx: &mut ServerContext,
@@ -840,11 +886,29 @@ fn handle_host_check(
 ) -> ExitCode {
     info!(host = %host, "host check / SMTP simulation mode");
 
+    // C Exim prints these informational lines to stdout at the start of
+    // -bh mode so the operator knows this is a simulated session.
+    // The test harness expects them in the stdout comparison.
+    println!();
+    println!("**** SMTP testing session as if from host {}", host);
+    println!("**** but without any ident (RFC 1413) callback.");
+    println!("**** This is not for real!");
+    println!();
+
     let smtp_server_ctx = build_smtp_server_context(server_ctx, true);
 
-    let mut smtp_msg_ctx = exim_smtp::inbound::command_loop::MessageContext::default();
+    // Set the sender host address from the -bh argument so ACL conditions
+    // like `hosts`, `sender_host_address`, etc. work correctly.
+    let mut smtp_msg_ctx = exim_smtp::inbound::command_loop::MessageContext {
+        sender_host_address: Some(host.to_string()),
+        ..Default::default()
+    };
 
-    let smtp_config_ctx = build_smtp_config_context(&config_ctx.config);
+    let mut smtp_config_ctx = build_smtp_config_context(&config_ctx.config);
+
+    // Disable sync checking for -bh mode just like -bs — stdin is a pipe,
+    // not a real network socket, so has_pending_input() is unreliable.
+    smtp_config_ctx.smtp_enforce_sync = false;
 
     let mut session_state = exim_smtp::inbound::SessionState::default();
 
@@ -854,7 +918,30 @@ fn handle_host_check(
         &smtp_config_ctx,
         &mut session_state,
     ) {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(true) => {
+            // Enter the SMTP command loop on stdin/stdout, matching -bs mode.
+            use std::os::unix::io::AsRawFd;
+            let in_fd = std::io::stdin().as_raw_fd();
+            let out_fd = std::io::stdout().as_raw_fd();
+
+            let result = exim_smtp::inbound::command_loop::smtp_setup_msg(
+                &smtp_server_ctx,
+                &mut smtp_msg_ctx,
+                &smtp_config_ctx,
+                in_fd,
+                out_fd,
+            );
+
+            match result {
+                exim_smtp::inbound::command_loop::SmtpSetupResult::Done => ExitCode::SUCCESS,
+                exim_smtp::inbound::command_loop::SmtpSetupResult::Yield => ExitCode::SUCCESS,
+                exim_smtp::inbound::command_loop::SmtpSetupResult::Error => {
+                    error!("SMTP host check session ended with error");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Ok(false) => ExitCode::SUCCESS,
         Err(e) => {
             error!(error = %e, "host check failed");
             ExitCode::FAILURE

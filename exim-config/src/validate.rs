@@ -272,6 +272,10 @@ fn resolve_bool_option(name: &str, ctx: &ConfigContext) -> bool {
         "syslog_timestamp" => ctx.syslog_timestamp,
         "tcp_nodelay" => ctx.tcp_nodelay,
         "write_rejectlog" => ctx.write_rejectlog,
+        "debug_store" => ctx.debug_store,
+        "mua_wrapper" => ctx.mua_wrapper,
+        "panic_coredump" => ctx.panic_coredump,
+        "log_ports" => ctx.log_ports,
         _ => {
             trace!(name = %name, "unrecognized boolean option, defaulting to false");
             false
@@ -411,6 +415,26 @@ fn resolve_string_option<'a>(name: &str, ctx: &'a ConfigContext) -> Option<&'a S
         "system_filter_pipe_transport" => ctx.system_filter_pipe_transport.as_ref(),
         "system_filter_reply_transport" => ctx.system_filter_reply_transport.as_ref(),
         "tls_advertise_hosts" => ctx.tls_advertise_hosts.as_ref(),
+        "exim_version" => ctx.exim_version.as_ref(),
+        "exim_path" => ctx.exim_path.as_ref(),
+        "headers_charset" => ctx.headers_charset.as_ref(),
+        "unknown_login" => ctx.unknown_login.as_ref(),
+        "unknown_username" => ctx.unknown_username.as_ref(),
+        "warn_message_file" => ctx.warn_message_file.as_ref(),
+        "timezone" => ctx.timezone.as_ref(),
+        "uucp_from_pattern" => ctx.uucp_from_pattern.as_ref(),
+        "uucp_from_sender" => ctx.uucp_from_sender.as_ref(),
+        "untrusted_set_sender" => ctx.untrusted_set_sender.as_ref(),
+        "process_log_path" => ctx.process_log_path.as_ref(),
+        "message_id_header_domain" => ctx.message_id_header_domain.as_ref(),
+        "message_id_header_text" => ctx.message_id_header_text.as_ref(),
+        "dns_check_names_pattern" | "check_dns_names_pattern" => {
+            ctx.dns_check_names_pattern.as_ref()
+        }
+        "trusted_users" => ctx.trusted_users.as_ref(),
+        "trusted_groups" => ctx.trusted_groups.as_ref(),
+        "never_users" => ctx.never_users.as_ref(),
+        "admin_groups" => ctx.admin_groups.as_ref(),
         _ => {
             trace!(name = %name, "unrecognized string option");
             None
@@ -444,6 +468,22 @@ fn resolve_int_option(name: &str, ctx: &ConfigContext) -> i64 {
         "smtp_connect_backlog" => i64::from(ctx.smtp_connect_backlog),
         "smtp_max_synprot_errors" => i64::from(ctx.smtp_max_synprot_errors),
         "smtp_max_unknown_commands" => i64::from(ctx.smtp_max_unknown_commands),
+        // Identity options — exim_user / exim_group store resolved UID/GID
+        // in ConfigContext, populated at startup by resolve_exim_user().
+        "exim_user" => i64::from(ctx.exim_uid),
+        "exim_group" => i64::from(ctx.exim_gid),
+        "max_username_length" => i64::from(ctx.max_username_length),
+        "finduser_retries" => i64::from(ctx.finduser_retries),
+        "localhost_number" => i64::from(ctx.localhost_number),
+        "slow_lookup_log" => i64::from(ctx.slow_lookup_log),
+        "smtp_backlog_monitor" => i64::from(ctx.smtp_backlog_monitor),
+        "return_size_limit" => i64::from(ctx.return_size_limit),
+        "header_insert_maxlen" => i64::from(ctx.header_insert_maxlen),
+        "rfc1413_port" => i64::from(ctx.rfc1413_port),
+        "dns_dnssec_ok" => i64::from(ctx.dns_dnssec_ok),
+        "dns_use_edns0" => i64::from(ctx.dns_use_edns0),
+        "tls_dh_max_bits" => i64::from(ctx.tls_dh_max_bits),
+
         _ => {
             trace!(name = %name, "unrecognized integer option, defaulting to 0");
             0
@@ -497,10 +537,15 @@ fn resolve_gid_name(gid: u32) -> String {
 fn resolve_time_option(name: &str, ctx: &ConfigContext) -> i32 {
     match name {
         "auto_thaw" => ctx.auto_thaw,
+        "callout_domain_negative_expire" => ctx.callout_cache_domain_negative_expire,
+        "callout_domain_positive_expire" => ctx.callout_cache_domain_positive_expire,
+        "callout_negative_expire" => ctx.callout_cache_negative_expire,
+        "callout_positive_expire" => ctx.callout_cache_positive_expire,
         "daemon_startup_sleep" => ctx.daemon_startup_sleep,
         "dns_retrans" => ctx.dns_retrans,
         "ignore_bounce_errors_after" => ctx.ignore_bounce_errors_after,
         "keep_malformed" => ctx.keep_malformed,
+        "queue_interval" => ctx.queue_interval,
         "receive_timeout" => ctx.receive_timeout,
         "retry_data_expire" => ctx.retry_data_expire,
         "retry_interval_max" => ctx.retry_interval_max,
@@ -667,9 +712,13 @@ pub fn print_option(
 
         OptionType::Bool | OptionType::BoolVerify | OptionType::BoolSet => {
             // C lines 2854–2858: print `name` or `no_name`.
-            let b = resolve_bool_option(name, ctx);
+            // Use the canonical option name from the table entry for resolution,
+            // because the user may have queried `no_accept_8bitmime` while the
+            // table entry name is `accept_8bitmime`.
+            let base_name = entry.name;
+            let b = resolve_bool_option(base_name, ctx);
             let prefix = if b { "" } else { "no_" };
-            writeln!(out, "{prefix}{name}")?;
+            writeln!(out, "{prefix}{base_name}")?;
         }
 
         OptionType::Uid => {
@@ -697,16 +746,37 @@ pub fn print_option(
 
         OptionType::UidList => {
             // C lines 2777–2793: print UID list with name resolution.
+            // Read the stored string from ConfigContext (populated by apply_option_to_ctx).
+            let uid_list_str = match name {
+                "trusted_users" => ctx.trusted_users.as_deref(),
+                "never_users" => ctx.never_users.as_deref(),
+                _ => None,
+            };
             if !no_labels {
                 write!(out, "{name} =")?;
+            }
+            if let Some(s) = uid_list_str {
+                if !s.is_empty() {
+                    write!(out, " {s}")?;
+                }
             }
             writeln!(out)?;
         }
 
         OptionType::GidList => {
             // C lines 2796–2813: print GID list with name resolution.
+            let gid_list_str = match name {
+                "trusted_groups" => ctx.trusted_groups.as_deref(),
+                "admin_groups" => ctx.admin_groups.as_deref(),
+                _ => None,
+            };
             if !no_labels {
                 write!(out, "{name} =")?;
+            }
+            if let Some(s) = gid_list_str {
+                if !s.is_empty() {
+                    write!(out, " {s}")?;
+                }
             }
             writeln!(out)?;
         }
@@ -921,10 +991,32 @@ pub fn print_config_option(
 
         // Default: look up as a main config option.
         // C readconf.c lines 3044–3048.
+        //
+        // Handle `no_*` and `not_*` prefix for boolean options.
+        // C Exim accepts `-bP no_accept_8bitmime` and prints the boolean
+        // option `accept_8bitmime` with appropriate negation prefix in the
+        // output (readconf.c line 2691–2715).
         let options = &*MAIN_CONFIG_OPTIONS;
         if let Some(idx) = find_option(query, options) {
             let entry = &options[idx];
             return print_option(entry, query, ctx, admin, no_labels, out);
+        }
+
+        // If not found directly, try stripping the `no_` or `not_` prefix
+        // and look for a boolean option.
+        let stripped = query
+            .strip_prefix("no_")
+            .or_else(|| query.strip_prefix("not_"));
+        if let Some(base_name) = stripped {
+            if let Some(idx) = find_option(base_name, options) {
+                let entry = &options[idx];
+                // Only valid for boolean options
+                if entry.option_type == OptionType::Bool {
+                    // Print as the negated form — the query itself is the
+                    // correct print name (e.g. "no_accept_8bitmime").
+                    return print_option(entry, query, ctx, admin, no_labels, out);
+                }
+            }
         }
 
         writeln!(out, "{query} is not a known option")?;

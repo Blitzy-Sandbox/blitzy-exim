@@ -44,7 +44,9 @@ use tracing::{debug, error, warn};
 
 use crate::IN_BUFFER_SIZE;
 
-// ─── Feature-gated TLS import ──────────────────────────────────────────────────
+// ─── Feature-gated TLS imports ─────────────────────────────────────────────────
+#[cfg(feature = "tls")]
+use exim_tls::rustls_backend::RustlsBackend;
 #[cfg(feature = "tls")]
 use exim_tls::TlsBuffer;
 
@@ -221,6 +223,13 @@ pub struct SmtpIoState {
     /// [`TlsBuffer::buffered()`] instead of raw `poll()`.
     #[cfg(feature = "tls")]
     tls_buffer: Option<TlsBuffer>,
+
+    /// Active TLS backend providing encrypted read/write after STARTTLS.
+    ///
+    /// When `Some(...)`, all socket I/O must go through the backend's
+    /// `read()` and `write()` methods instead of raw fd operations.
+    #[cfg(feature = "tls")]
+    pub tls_backend: Option<Box<RustlsBackend>>,
 }
 
 impl SmtpIoState {
@@ -270,6 +279,8 @@ impl SmtpIoState {
             had_data_sigint: false,
             #[cfg(feature = "tls")]
             tls_buffer: None,
+            #[cfg(feature = "tls")]
+            tls_backend: None,
         }
     }
 }
@@ -375,8 +386,16 @@ fn smtp_refill(io: &mut SmtpIoState, lim: u32) -> bool {
         alarm::set(io.smtp_receive_timeout);
     }
 
-    // ── Read from socket ───────────────────────────────────────────────
+    // ── Read from socket (or TLS stream when active) ─────────────────
     let read_size = min(IN_BUFFER_SIZE - 1, lim as usize);
+    #[cfg(feature = "tls")]
+    let rc: Result<usize, nix::errno::Errno> = if let Some(ref mut tls) = io.tls_backend {
+        tls.read(&mut io.inbuffer[..read_size])
+            .map_err(|_| nix::errno::Errno::EIO)
+    } else {
+        safe_read(io.in_fd, &mut io.inbuffer[..read_size])
+    };
+    #[cfg(not(feature = "tls"))]
     let rc = safe_read(io.in_fd, &mut io.inbuffer[..read_size]);
 
     // ── Clear alarm ────────────────────────────────────────────────────

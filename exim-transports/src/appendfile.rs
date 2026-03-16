@@ -1706,15 +1706,49 @@ impl TransportDriver for AppendfileTransport {
             "transport_entry called"
         );
 
+        // Check for file/directory from the config private options map.
+        // The config parser stores driver-specific options (like "file" and
+        // "directory") in the private_options_map, keyed by option name.
+        // These override the defaults in the AppendfileOptions struct.
+        let config_file = config.private_options_map.get("file").cloned();
+        let config_dir = config.private_options_map.get("directory").cloned();
+
+        // Resolve effective filename and dirname, preferring config values
+        let effective_filename = config_file.or_else(|| ob.filename.clone());
+        let effective_dirname = config_dir.or_else(|| ob.dirname.clone());
+
         // Determine delivery mode: file vs directory
-        let is_directory_mode = ob.dirname.is_some() && ob.filename.is_none();
+        let is_directory_mode = effective_dirname.is_some() && effective_filename.is_none();
+
+        // Perform simple variable expansion on the path.
+        // This handles ${local_part} which is the most common pattern in
+        // appendfile transport file paths.
+        let expand_path = |path: &str| -> String {
+            // Extract local_part from the address (part before @)
+            let local_part = if let Some(at_pos) = address.find('@') {
+                &address[..at_pos]
+            } else {
+                address
+            };
+            // Extract domain from the address (part after @)
+            let domain = if let Some(at_pos) = address.find('@') {
+                &address[at_pos + 1..]
+            } else {
+                ""
+            };
+            path.replace("${local_part}", local_part)
+                .replace("$local_part", local_part)
+                .replace("${domain}", domain)
+                .replace("$domain", domain)
+        };
 
         // Expand and validate the delivery path with taint tracking
-        let delivery_path = if let Some(ref filename) = ob.filename {
+        let delivery_path = if let Some(ref filename) = effective_filename {
             // File mode: single file delivery
+            let expanded = expand_path(filename);
             // Taint check: validate the expanded file path is absolute.
             // Replaces C taint_check_real_fn() calls in appendfile.c.
-            let tainted_path = Tainted::new(filename.clone());
+            let tainted_path = Tainted::new(expanded);
             let clean_path = tainted_path.sanitize(|p| p.starts_with('/')).map_err(|e| {
                 DriverError::ExecutionFailed(format!(
                     "tainted file path rejected (must be absolute): {}",
@@ -1722,10 +1756,11 @@ impl TransportDriver for AppendfileTransport {
                 ))
             })?;
             PathBuf::from(clean_path.into_inner())
-        } else if let Some(ref dirname) = ob.dirname {
+        } else if let Some(ref dirname) = effective_dirname {
             // Directory mode: one file per message
+            let expanded = expand_path(dirname);
             // Taint check: validate the expanded directory path is absolute.
-            let tainted_dir = Tainted::new(dirname.clone());
+            let tainted_dir = Tainted::new(expanded);
             let clean_dir = tainted_dir.sanitize(|p| p.starts_with('/')).map_err(|e| {
                 DriverError::ExecutionFailed(format!(
                     "tainted directory path rejected (must be absolute): {}",
@@ -2080,21 +2115,15 @@ fn build_message_body(
     config: &TransportInstanceConfig,
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(4096);
+    let line_ending = if ob.use_crlf { "\r\n" } else { "\n" };
 
     // In BSMTP mode, prepend SMTP envelope commands
     if ob.use_bsmtp {
         let sender = config.return_path.as_deref().unwrap_or("<>");
-        let line_ending = if ob.use_crlf { "\r\n" } else { "\n" };
         body.extend_from_slice(format!("MAIL FROM:<{sender}>{line_ending}").as_bytes());
         body.extend_from_slice(format!("RCPT TO:<{address}>{line_ending}").as_bytes());
         body.extend_from_slice(format!("DATA{line_ending}").as_bytes());
     }
-
-    // Construct minimal headers for the delivered message.
-    // The real implementation would use transport_write_message() from
-    // the transport framework which handles all header manipulation, but
-    // we build a representative structure here.
-    let line_ending = if ob.use_crlf { "\r\n" } else { "\n" };
 
     // Add delivery-related headers based on config
     if config.delivery_date_add {
@@ -2109,19 +2138,68 @@ fn build_message_body(
     }
 
     if config.return_path_add {
-        let return_path = config.return_path.as_deref().unwrap_or("<>");
-        body.extend_from_slice(format!("Return-path: <{return_path}>{line_ending}").as_bytes());
+        let sender = config
+            .private_options_map
+            .get("__sender_address")
+            .map(|s| s.as_str())
+            .or(config.return_path.as_deref())
+            .unwrap_or("<>");
+        body.extend_from_slice(format!("Return-path: <{sender}>{line_ending}").as_bytes());
     }
 
-    // End of headers marker
-    body.extend_from_slice(line_ending.as_bytes());
+    // Try to read the actual message data from the spool -D file.
+    // The delivery orchestrator injects __spool_directory and __message_id
+    // into the private_options_map so the transport can access the real
+    // message content.
+    let spool_data = config
+        .private_options_map
+        .get("__spool_directory")
+        .and_then(|spool_dir| {
+            config
+                .private_options_map
+                .get("__message_id")
+                .and_then(|msg_id| {
+                    // Spool -D file path: {spool_dir}/input/{msg_id}-D
+                    let data_file = format!("{spool_dir}/input/{msg_id}-D");
+                    match std::fs::read(&data_file) {
+                        Ok(data) => {
+                            tracing::debug!(
+                                path = %data_file,
+                                size = data.len(),
+                                "read spool data file for delivery"
+                            );
+                            Some(data)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %data_file,
+                                error = %e,
+                                "failed to read spool data file"
+                            );
+                            None
+                        }
+                    }
+                })
+        });
 
-    // Message body content — in the full MTA integration, the actual RFC 2822
-    // message body is read from the spool -D data file and streamed through
-    // transport_write_message(). This representative body serves as the message
-    // content for the transport layer's standalone operation.
-    body.extend_from_slice(b"[Message body delivered by appendfile transport]");
-    body.extend_from_slice(line_ending.as_bytes());
+    if let Some(data) = spool_data {
+        // The Exim spool -D file starts with a header line containing
+        // the message-ID filename (e.g. "1w20nb-00000003rGr-0F7s-D\n").
+        // We must skip that first line so only the RFC 2822 message
+        // (headers + body) is written to the mailbox.
+        let msg_start = data
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        body.extend_from_slice(&data[msg_start..]);
+    } else {
+        // Fallback: generate a minimal message body when spool data is not
+        // available (e.g., during unit testing or standalone operation).
+        body.extend_from_slice(line_ending.as_bytes());
+        body.extend_from_slice(b"[Message body delivered by appendfile transport]");
+        body.extend_from_slice(line_ending.as_bytes());
+    }
 
     // In BSMTP mode, append the termination dot
     if ob.use_bsmtp {
@@ -2174,38 +2252,46 @@ fn write_body_with_escaping(
 
 /// Build the availability string at compile time based on enabled features.
 ///
+/// Build the `avail_string` for the appendfile transport.
+///
 /// Replaces C: `avail_string` in `transport_info appendfile_transport_info`
-/// (appendfile.c line 3357) which uses preprocessor conditionals.
+/// (appendfile.c line 3357) which uses preprocessor string concatenation to
+/// build a display name like `appendfile/maildir/mailstore/mbx`.
+///
+/// The test/runtest harness splits the Transport line by whitespace and then
+/// by `/` to detect sub-features (lines 3962-3975). The format must be
+/// `appendfile/maildir/mailstore/mbx` matching the C output exactly.
 const fn avail_string_for_appendfile() -> Option<&'static str> {
     // Compile-time selection of available sub-format description string.
-    // Exactly one of these 8 exhaustive cfg conditions is active per build.
+    // Each variant includes "appendfile" as the base name, with optional
+    // sub-features appended after a `/` separator.
     #[cfg(all(feature = "maildir", feature = "mailstore", feature = "mbx"))]
     {
-        Some("maildir+mailstore+mbx")
+        Some("appendfile/maildir/mailstore/mbx")
     }
     #[cfg(all(feature = "maildir", feature = "mailstore", not(feature = "mbx")))]
     {
-        Some("maildir+mailstore")
+        Some("appendfile/maildir/mailstore")
     }
     #[cfg(all(feature = "maildir", not(feature = "mailstore"), feature = "mbx"))]
     {
-        Some("maildir+mbx")
+        Some("appendfile/maildir/mbx")
     }
     #[cfg(all(not(feature = "maildir"), feature = "mailstore", feature = "mbx"))]
     {
-        Some("mailstore+mbx")
+        Some("appendfile/mailstore/mbx")
     }
     #[cfg(all(feature = "maildir", not(feature = "mailstore"), not(feature = "mbx")))]
     {
-        Some("maildir")
+        Some("appendfile/maildir")
     }
     #[cfg(all(not(feature = "maildir"), feature = "mailstore", not(feature = "mbx")))]
     {
-        Some("mailstore")
+        Some("appendfile/mailstore")
     }
     #[cfg(all(not(feature = "maildir"), not(feature = "mailstore"), feature = "mbx"))]
     {
-        Some("mbx")
+        Some("appendfile/mbx")
     }
     #[cfg(all(
         not(feature = "maildir"),
@@ -2213,7 +2299,7 @@ const fn avail_string_for_appendfile() -> Option<&'static str> {
         not(feature = "mbx")
     ))]
     {
-        None
+        Some("appendfile")
     }
 }
 
