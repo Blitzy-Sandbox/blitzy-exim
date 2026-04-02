@@ -328,7 +328,13 @@ pub fn atrn_handle_provider<S>(
         &session.acl_session_state(),
     );
     if acl_rc != AclResult::Ok {
-        return Err(session.smtp_handle_acl_fail(AclWhere::Atrn, acl_rc, &user_msg, &log_msg));
+        return Err(session.smtp_handle_acl_fail(
+            AclWhere::Atrn,
+            acl_rc,
+            &user_msg,
+            &log_msg,
+            None,
+        ));
     }
 
     // ── Step 6: Send the 250 OK response ──

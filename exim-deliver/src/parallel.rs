@@ -1685,7 +1685,7 @@ fn invoke_transport_driver(
     driver.closedown(transport_config);
 
     match result {
-        Ok(exim_drivers::transport_driver::TransportResult::Ok) => {
+        Ok(exim_drivers::transport_driver::TransportResult::Ok { .. }) => {
             info!(
                 driver_name = %name,
                 address = %addr.address.as_ref(),
@@ -1867,7 +1867,7 @@ mod tests {
         ) -> Result<exim_drivers::transport_driver::TransportResult, exim_drivers::DriverError>
         {
             if self.should_succeed {
-                Ok(exim_drivers::transport_driver::TransportResult::Ok)
+                Ok(exim_drivers::transport_driver::TransportResult::ok())
             } else {
                 Ok(exim_drivers::transport_driver::TransportResult::Failed {
                     message: Some("mock failure".to_string()),
@@ -1918,6 +1918,9 @@ mod tests {
             unique: address.to_ascii_lowercase(),
             parent_index: -1,
             children: Vec::new(),
+            prefix: None,
+            suffix: None,
+            onetime_parent: None,
         }
     }
 

@@ -18,6 +18,7 @@
 
 use crate::DriverError;
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
 
 // =============================================================================
@@ -529,6 +530,16 @@ pub struct RouterInstanceConfig {
     ///
     /// In C, this was `void *options_block` on `driver_instance`.
     pub options: Box<dyn Any + Send + Sync>,
+
+    /// Driver-specific options as a simple string key-value map.
+    ///
+    /// Populated by the config parser from the raw private option lines.
+    /// Each entry maps an option name (e.g., `"data"`, `"file"`) to its
+    /// string value (everything after the `=` sign, trimmed).
+    /// This provides a type-agnostic way for driver implementations to
+    /// access their private options without needing to downcast the
+    /// `options` field.
+    pub private_options_map: HashMap<String, String>,
 }
 
 impl RouterInstanceConfig {
@@ -605,6 +616,7 @@ impl RouterInstanceConfig {
             gid: 0,
             set: None,
             options: Box::new(()),
+            private_options_map: HashMap::new(),
         }
     }
 

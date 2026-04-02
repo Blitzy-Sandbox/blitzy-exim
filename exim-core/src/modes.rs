@@ -255,7 +255,9 @@ pub fn address_verify_mode(
 ///
 /// # Returns
 ///
-/// `ExitCode::SUCCESS` always (matching C behaviour for `-bt`).
+/// Returns `ExitCode::SUCCESS` if all addresses route successfully,
+/// or exit code 2 if any address is unrouteable (matching C behaviour
+/// for `-bt` mode — see exim.c lines 5341–5386).
 pub fn address_test_mode(
     addresses: &[String],
     ctx: &ServerContext,
@@ -266,13 +268,18 @@ pub fn address_test_mode(
     let config_ctx = build_config_context(config);
     let cfg_server_ctx = build_server_context(ctx);
 
-    let test_one = |raw_address: &str| {
+    // Track worst exit code across all addresses.
+    // C Exim: exit(2) on any FAIL, exit(1) on any DEFER (unless already 2).
+    let mut exit_value: u8 = 0;
+
+    let mut test_one = |raw_address: &str| {
         let address = raw_address.trim();
         if address.is_empty() {
             return;
         }
         if address.len() > EXIM_DISPLAYMAIL_MAX {
             println!("address too long");
+            exit_value = 2;
             return;
         }
 
@@ -280,6 +287,7 @@ pub fn address_test_mode(
         match cleaned {
             None => {
                 println!("syntax error: unable to parse '{address}'");
+                exit_value = 2;
             }
             Some(addr) => {
                 let mut addr_item = exim_deliver::deliver_make_addr(&addr);
@@ -308,9 +316,24 @@ pub fn address_test_mode(
                 ) {
                     Ok(result) => {
                         print_routing_result(address, &result, &addr_item);
+                        // Set exit code based on routing result:
+                        // FAIL or Error → 2, Defer → 1 (unless already 2)
+                        match result {
+                            exim_deliver::RoutingResult::Fail
+                            | exim_deliver::RoutingResult::Error => {
+                                exit_value = 2;
+                            }
+                            exim_deliver::RoutingResult::Defer => {
+                                if exit_value == 0 {
+                                    exit_value = 1;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     Err(e) => {
                         println!("{address} router error: {e}");
+                        exit_value = 2;
                     }
                 }
             }
@@ -334,7 +357,7 @@ pub fn address_test_mode(
         }
     }
 
-    ExitCode::SUCCESS
+    ExitCode::from(exit_value)
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +393,7 @@ pub fn expansion_test_mode(
     ctx: &ServerContext,
     config: &Arc<exim_config::Config>,
     config_file: &str,
+    cli_args: &crate::cli::EximCli,
 ) -> ExitCode {
     tracing::debug!("expansion_test_mode: entering");
 
@@ -453,24 +477,266 @@ pub fn expansion_test_mode(
 
     // Build an expansion context populated with static variable values
     // so that expressions like ${version_number} resolve correctly.
-    let expand_ctx = build_expand_context(ctx, config, config_file);
+    let mut expand_ctx = build_expand_context(ctx, config, config_file);
 
-    // Read expansion strings from stdin, one per line.
-    // Each line is expanded independently and the result is printed.
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let reader = BufReader::new(stdin.lock());
+    // Wire debug selector bits to expansion context flags.
+    // D_EXPAND = bit 8 = 0x100, D_NOUTF8 = bit 18 = 0x40000
+    // (matches C Exim macros.h Di_expand = 8, Di_noutf8 = 18).
+    expand_ctx.debug_expand = (ctx.debug_selector & 0x0000_0100) != 0;
+    expand_ctx.debug_noutf8 = (ctx.debug_selector & 0x0004_0000) != 0;
 
-    for line_result in reader.lines() {
-        match line_result {
-            Ok(line) => {
-                expansion_test_line_ctx(&line, &expand_ctx, &mut stdout);
-            }
-            Err(_) => break,
+    // Populate named lists from config into expansion context.
+    // C Exim: named lists declared via `domainlist`, `hostlist`,
+    // `addresslist`, `localpartlist` are available to the expansion
+    // engine via `${listnamed:name}`, `${listnamed_d:name}`, etc.
+    {
+        let cfg_ctx = build_config_context(config);
+        for (name, nl) in &cfg_ctx.named_lists.domain_lists {
+            expand_ctx
+                .named_lists
+                .insert(name.clone(), nl.value.clone());
+            expand_ctx
+                .named_list_types
+                .insert(name.clone(), "domain".to_string());
+        }
+        for (name, nl) in &cfg_ctx.named_lists.host_lists {
+            expand_ctx
+                .named_lists
+                .insert(name.clone(), nl.value.clone());
+            expand_ctx
+                .named_list_types
+                .insert(name.clone(), "host".to_string());
+        }
+        for (name, nl) in &cfg_ctx.named_lists.address_lists {
+            expand_ctx
+                .named_lists
+                .insert(name.clone(), nl.value.clone());
+            expand_ctx
+                .named_list_types
+                .insert(name.clone(), "address".to_string());
+        }
+        for (name, nl) in &cfg_ctx.named_lists.localpart_lists {
+            expand_ctx
+                .named_lists
+                .insert(name.clone(), nl.value.clone());
+            expand_ctx
+                .named_list_types
+                .insert(name.clone(), "local_part".to_string());
+        }
+
+        // Populate ACL definitions from config so that the `${if acl {...}}`
+        // expansion condition can evaluate named ACLs.
+        for (name, acl_block) in &cfg_ctx.acl_definitions {
+            expand_ctx
+                .acl_definitions
+                .insert(name.clone(), acl_block.raw_definition.clone());
         }
     }
 
+    // Apply CLI override variables (-oM* options).
+    // C Exim: these CLI flags override message context variables for testing.
+    // They must be set before any expansion occurs.
+    {
+        use exim_store::taint::Tainted;
+
+        if let Some(ref addr) = cli_args.sender_host_address {
+            // C Exim host_address_extract_port():
+            // For IPv4 (no colons): skip 3 dots, the 4th dot separates
+            // address from port.  For IPv6 (has colon): first dot is port.
+            let (host, port) = extract_address_port(addr);
+            expand_ctx.sender_host_address = Tainted::new(host);
+            expand_ctx.sender_host_port = port;
+        }
+        if let Some(ref name) = cli_args.sender_host_name {
+            expand_ctx.sender_host_name = Tainted::new(name.clone());
+        }
+        // Note: when -oMa is given without -oMs, C Exim performs a lazy
+        // reverse DNS lookup of the sender_host_address when
+        // $sender_host_name is first accessed (vtype_host_lookup in
+        // expand.c:2014).  We perform this lookup eagerly below, after the
+        // configuration directory is known so that the test-harness
+        // `fakens` utility can be located.
+        if let Some(ref iface) = cli_args.incoming_interface {
+            // C Exim: `-oMi iface.port` same port extraction logic.
+            let (addr, port) = extract_address_port(iface);
+            expand_ctx.interface_address = addr;
+            expand_ctx.interface_port = port;
+        }
+        if let Some(ref proto) = cli_args.received_protocol {
+            expand_ctx.received_protocol = proto.clone();
+        }
+        if let Some(ref ident) = cli_args.sender_ident {
+            expand_ctx.sender_ident = Tainted::new(ident.clone());
+        } else {
+            // C Exim (exim.c:5246): default sender_ident to originator login.
+            expand_ctx.sender_ident = Tainted::new(
+                nix::unistd::User::from_uid(nix::unistd::getuid())
+                    .ok()
+                    .flatten()
+                    .map(|u| u.name)
+                    .unwrap_or_default(),
+            );
+        }
+        if let Some(ref auth) = cli_args.sender_host_authenticated {
+            expand_ctx.sender_host_authenticated = auth.clone();
+        }
+        if let Some(ref id) = cli_args.authenticated_id {
+            expand_ctx.authenticated_id = id.clone();
+        } else {
+            // C Exim (exim.c:5282): default authenticated_id to originator login.
+            expand_ctx.authenticated_id = nix::unistd::User::from_uid(nix::unistd::getuid())
+                .ok()
+                .flatten()
+                .map(|u| u.name)
+                .unwrap_or_default();
+        }
+        if let Some(ref sender) = cli_args.authenticated_sender {
+            expand_ctx.authenticated_sender = sender.clone();
+        } else {
+            // C Exim (exim.c:5280): default authenticated_sender to login@qualify.
+            let login = nix::unistd::User::from_uid(nix::unistd::getuid())
+                .ok()
+                .flatten()
+                .map(|u| u.name)
+                .unwrap_or_default();
+            let qualify = &expand_ctx.qualify_domain;
+            expand_ctx.authenticated_sender = format!("{}@{}", login, qualify.as_str());
+        }
+
+        // -f <addr>: set envelope sender address.
+        // C Exim (exim.c:4925): `-f` sets `sender_address` to the provided
+        // address.  When present, the tainted sender_address variable is set.
+        if let Some(ref addr) = cli_args.sender_address {
+            expand_ctx.sender_address = Tainted::new(addr.clone());
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Reverse DNS lookup for sender_host_name when -oMa given without -oMs
+    // -------------------------------------------------------------------
+    // C Exim (expand.c:2014, vtype_host_lookup): when $sender_host_name
+    // is accessed and the name is not yet set, a reverse DNS (PTR) lookup
+    // of sender_host_address is performed.  We execute this eagerly here,
+    // after config_dir and CLI -oM* variables are set, so that the
+    // test-harness `fakens` utility can be found at `config_dir/bin/fakens`.
+    if expand_ctx.sender_host_name.as_ref().is_empty()
+        && !expand_ctx.sender_host_address.as_ref().is_empty()
+        && expand_ctx.host_lookup_failed == 0
+    {
+        if let Some(name) = host_name_lookup(
+            expand_ctx.sender_host_address.as_ref(),
+            expand_ctx.config_dir.as_ref(),
+        ) {
+            expand_ctx.sender_host_name = exim_store::taint::Tainted::new(name);
+        } else {
+            expand_ctx.host_lookup_failed = 1;
+        }
+    }
+
+    // Read expansion strings from stdin, one per line.
+    //
+    // C Exim's `get_stdinput()` (exim.c lines 1541-1603):
+    // 1. Prints `> ` as a prompt before each input line.
+    // 2. Reads lines, handling backslash continuation.
+    // 3. Strips trailing whitespace.
+    // The prompt appears on stdout and is part of the test expected output.
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+
+    let mut accumulated = String::new();
+    let mut first_line = true;
+
+    // Print initial prompt (C Exim prints `> ` before reading first line).
+    let _ = write!(stdout, "> ");
+    let _ = stdout.flush();
+
+    // Use byte-level reading because test scripts contain raw non-UTF-8 bytes
+    // (e.g. 0xB7, 0xF2 in escape/escape8bit tests).  Rust's BufRead::lines()
+    // returns Err on non-UTF-8 input, which would prematurely terminate the
+    // expansion test.  Instead, read raw bytes and convert with lossy UTF-8.
+    let mut byte_buf: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        byte_buf.clear();
+        let bytes_read = match reader.read_until(b'\n', &mut byte_buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if bytes_read == 0 {
+            break; // EOF
+        }
+
+        // Convert raw bytes to a Rust String using Latin-1 encoding:
+        // each input byte 0x00..0xFF is stored as the Unicode char
+        // U+0000..U+00FF.  This preserves the exact byte values so
+        // that the tokenizer (which reads chars) sees the same values
+        // C Exim's byte-level processing would see, and the output
+        // writer can convert chars back to raw bytes for byte-level
+        // test output parity.
+        //
+        // We MUST NOT use `String::from_utf8_lossy` here because it
+        // replaces invalid UTF-8 sequences (e.g. `\xC0\xFF`) with
+        // U+FFFD, irreversibly losing the original byte values.
+        let raw_line: String = byte_buf.iter().map(|&b| b as char).collect();
+
+        // Strip trailing whitespace including the newline
+        // (C: `while (ss > p && isspace(ss[-1])) ss--;`).
+        let line = raw_line.trim_end();
+
+        if !first_line && !accumulated.is_empty() {
+            // Continuation line: strip leading whitespace
+            // (C: `while (p < ss && isspace(*p)) p++;`).
+            accumulated.push_str(line.trim_start());
+        } else {
+            accumulated.push_str(line);
+        }
+
+        // Check for backslash continuation.
+        if accumulated.ends_with('\\') {
+            accumulated.pop(); // drop the backslash
+            first_line = false;
+            continue;
+        }
+
+        // Complete line ready for expansion.
+        expansion_test_line_ctx(&accumulated, &mut expand_ctx, &mut stdout);
+
+        accumulated.clear();
+        first_line = true;
+
+        // Print prompt for next line.
+        let _ = write!(stdout, "> ");
+        let _ = stdout.flush();
+    }
+
+    // Handle any remaining accumulated text (no trailing newline).
+    if !accumulated.is_empty() {
+        expansion_test_line_ctx(&accumulated, &mut expand_ctx, &mut stdout);
+    }
+
+    // C Exim prints a trailing newline when stdin is exhausted.
+    let _ = writeln!(stdout);
+
     ExitCode::SUCCESS
+}
+
+/// Write a string as raw Latin-1 bytes.
+///
+/// Each char in `s` is truncated to its low byte (`c as u8`) and
+/// written as a single byte.  This matches C Exim's `printf("%s", s)`
+/// behaviour for strings that may contain high bytes 0x80..0xFF.
+///
+/// Characters with codepoints >= 256 (which should not normally
+/// occur in Exim expansion output) are written as `?`.
+fn write_latin1<W: Write>(out: &mut W, s: &str) {
+    for ch in s.chars() {
+        let cp = ch as u32;
+        if cp < 256 {
+            let _ = out.write_all(&[cp as u8]);
+        } else {
+            let _ = out.write_all(b"?");
+        }
+    }
 }
 
 /// Expand a single test line and write the result to the given writer.
@@ -485,13 +751,20 @@ fn expansion_test_line<W: Write>(line: &str, out: &mut W) {
 
     match exim_expand::expand_string(line) {
         Ok(expanded) => {
-            let _ = writeln!(out, "{expanded}");
+            write_latin1(out, &expanded);
+            let _ = out.write_all(b"\n");
         }
         Err(exim_expand::ExpandError::ForcedFail) => {
-            let _ = writeln!(out, "Forced failure");
+            let _ = out.write_all(b"Forced failure\n");
         }
-        Err(exim_expand::ExpandError::Failed { message }) => {
-            let _ = writeln!(out, "Failed: {message}");
+        Err(exim_expand::ExpandError::Failed { message })
+        | Err(exim_expand::ExpandError::FailRequested { message }) => {
+            // Both regular failures and {fail}-keyword failures display
+            // identically in -be mode: "Failed: <message>"
+            // This matches C Exim's `printf("Failed: %s\n", expand_string_message)`.
+            let _ = out.write_all(b"Failed: ");
+            write_latin1(out, &message);
+            let _ = out.write_all(b"\n");
         }
         Err(e) => {
             let _ = writeln!(out, "Failed: {e}");
@@ -504,28 +777,117 @@ fn expansion_test_line<W: Write>(line: &str, out: &mut W) {
 /// This is the context-aware variant used by `-be` mode so that static
 /// variables like `$version_number`, `$primary_hostname`, `$pid`, etc.
 /// resolve to their actual values instead of empty strings.
+///
+/// Matches the C `expansion_test_line()` (exim.c lines 1748-1779):
+/// - Blank/empty lines expand to themselves (empty output line).
+/// - Lines starting with an uppercase letter are treated as macro
+///   assignments (not yet implemented — passed through).
+/// - Lines starting with `set,t ` or `set ` are ACL set-variable
+///   standalone assignments (not yet implemented — passed through).
+/// - All other lines are expanded via `expand_string()`.
 fn expansion_test_line_ctx<W: Write>(
     line: &str,
-    ctx: &exim_expand::variables::ExpandContext,
+    ctx: &mut exim_expand::variables::ExpandContext,
     out: &mut W,
 ) {
-    // Skip blank lines (matching C behaviour).
-    if line.trim().is_empty() {
+    // Blank lines: C Exim passes them to expand_string which returns
+    // the empty input unchanged.  Output an empty line.
+    if line.is_empty() {
+        let _ = writeln!(out);
         return;
+    }
+
+    // C Exim resets capture variables ($0..$9) between expansion lines.
+    // expand_nmax = -1 means no active captures.
+    ctx.expand_nmax = -1;
+    ctx.expand_nstring = vec![String::new(); 10];
+
+    // ── Handle `set,t VAR = VALUE` and `set VAR = VALUE` commands ──
+    // C Exim's `acl_standalone_setvar()` from acl.c: sets an ACL variable
+    // (acl_c* or acl_m*) and prints `variable <short_name> set`.
+    {
+        let (is_set, _tainted, rest) = if let Some(r) = line.strip_prefix("set,t ") {
+            (true, true, r)
+        } else if let Some(r) = line.strip_prefix("set ") {
+            (true, false, r)
+        } else {
+            (false, false, "")
+        };
+
+        if is_set {
+            if let Some(eq_pos) = rest.find('=') {
+                let var_name = rest[..eq_pos].trim();
+                let raw_val = rest[eq_pos + 1..].trim();
+
+                // Expand the value through the expansion engine.
+                let expanded_val = match exim_expand::expand_string_with_context(raw_val, ctx) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = writeln!(out, "Failed: {e}");
+                        return;
+                    }
+                };
+
+                // Store the value and produce the short display name.
+                // acl_c* and acl_m* variables use key = name[4..] (e.g. `_m0`).
+                if (var_name.starts_with("acl_c") || var_name.starts_with("acl_m"))
+                    && var_name.len() > 5
+                {
+                    let key = var_name[4..].to_string();
+                    let short_name = &var_name[4..]; // e.g. "_m0"
+                                                     // In C Exim, the display name skips the leading underscore.
+                    let display = short_name.strip_prefix('_').unwrap_or(short_name);
+
+                    // In C Exim taint status affects store pool; in Rust we use
+                    // the same String type regardless — taint tracking is via
+                    // Tainted<T>/Clean<T> newtypes at the API boundary.
+                    let store_val = expanded_val;
+
+                    if var_name.starts_with("acl_c") {
+                        ctx.acl_var_c.insert(key, store_val);
+                    } else {
+                        ctx.acl_var_m.insert(key, store_val);
+                    }
+
+                    let _ = writeln!(out, "variable {} set", display);
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "invalid variable name after \"set\" in ACL modifier \"set {}\"",
+                        var_name
+                    );
+                }
+            } else {
+                let _ = writeln!(out, "Failed: missing '=' in set command");
+            }
+            return;
+        }
     }
 
     match exim_expand::expand_string_with_context(line, ctx) {
         Ok(expanded) => {
-            let _ = writeln!(out, "{expanded}");
+            // Write as raw Latin-1 bytes to match C Exim's byte-level
+            // output.  This ensures high bytes (0x80..0xFF) stored as
+            // Latin-1 chars in the Rust String are output as single
+            // bytes, not as their UTF-8 multi-byte encodings.
+            write_latin1(out, &expanded);
+            let _ = out.write_all(b"\n");
         }
         Err(exim_expand::ExpandError::ForcedFail) => {
-            let _ = writeln!(out, "Forced failure");
+            let _ = out.write_all(b"Forced failure\n");
         }
-        Err(exim_expand::ExpandError::Failed { message }) => {
-            let _ = writeln!(out, "Failed: {message}");
+        Err(exim_expand::ExpandError::Failed { message })
+        | Err(exim_expand::ExpandError::FailRequested { message }) => {
+            // Both regular failures and {fail}-keyword failures display
+            // as "Failed: <message>" in -be mode.
+            let _ = out.write_all(b"Failed: ");
+            write_latin1(out, &message);
+            let _ = out.write_all(b"\n");
         }
         Err(e) => {
-            let _ = writeln!(out, "Failed: {e}");
+            let _ = out.write_all(b"Failed: ");
+            write_latin1(out, &format!("{e}"));
+            let _ = out.write_all(b"\n");
         }
     }
 }
@@ -536,6 +898,51 @@ fn expansion_test_line_ctx<W: Write>(
 /// `$pid`, `$tod_epoch`, etc. from the server context and configuration.
 /// This is required for `-be` expansion testing mode where these
 /// variables must resolve to their actual values.
+/// Extract port from an address string using C Exim's
+/// `host_address_extract_port()` algorithm (host_address.c lines 36–77).
+///
+/// - Bracketed format `[addr]:port` → strips brackets, extracts port.
+/// - IPv4 (no colons): skip 3 dots, 4th dot separates address from port.
+/// - IPv6 (has colons): first dot separates address from port.
+/// - Returns `(address, port)`.
+fn extract_address_port(address: &str) -> (String, i32) {
+    // Bracketed format: [addr]:port
+    if address.starts_with('[') {
+        if let Some(rb) = address.find(']') {
+            let host = address[1..rb].to_string();
+            if address.len() > rb + 1 && address.as_bytes()[rb + 1] == b':' {
+                let port = address[rb + 2..].parse::<i32>().unwrap_or(0);
+                return (host, port);
+            }
+            return (host, 0);
+        }
+        return (address.to_string(), 0);
+    }
+
+    // Determine if IPv6 (contains colon) or IPv4 (no colons)
+    let has_colon = address.contains(':');
+    let skip_dots = if has_colon { 0 } else { 3 }; // skip 3 dots for IPv4
+
+    let mut dot_count = 0;
+    for (i, ch) in address.char_indices() {
+        if ch == ':' {
+            // Reset to 0 dots to skip for IPv6
+            continue;
+        }
+        if ch == '.' {
+            if dot_count >= skip_dots {
+                // This dot separates address from port
+                let host = address[..i].to_string();
+                let port = address[i + 1..].parse::<i32>().unwrap_or(0);
+                return (host, port);
+            }
+            dot_count += 1;
+        }
+    }
+
+    (address.to_string(), 0)
+}
+
 fn build_expand_context(
     ctx: &ServerContext,
     config: &Arc<exim_config::Config>,
@@ -565,11 +972,289 @@ fn build_expand_context(
 
     // Configuration file path (Issue #7: $config_file variable).
     // Per AAP §0.7.1: must match C Exim behavior where $config_file
-    // returns the path of the loaded configuration file.
-    expand_ctx.config_file = Clean::new(config_file.to_string());
+    // returns the absolute path of the loaded configuration file.
+    // C Exim stores the fully resolved absolute path in config_main_filename.
+    {
+        use std::path::Path;
+        let abs_config = std::fs::canonicalize(config_file)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| {
+                // Fallback: make relative path absolute using cwd
+                let p = Path::new(config_file);
+                if p.is_absolute() {
+                    config_file.to_string()
+                } else {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(p).to_string_lossy().to_string())
+                        .unwrap_or_else(|_| config_file.to_string())
+                }
+            });
+        expand_ctx.config_file = Clean::new(abs_config.clone());
+
+        // Configuration directory — the directory portion of the config file
+        // path, matching C Exim's $config_dir variable (set in readconf.c).
+        let dir = Path::new(&abs_config)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        expand_ctx.config_dir = Clean::new(dir);
+    }
+
+    // Exim binary path — $exim_path variable.  C Exim sets this from
+    // argv[0] or the compiled-in EXIM_PATH.  We use std::env to discover
+    // the path of the currently running binary.
+    {
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        expand_ctx.exim_path = Clean::new(exe);
+    }
+
+    // Config-derived integer settings that are exposed as expansion
+    // variables.  C Exim resolves these directly from global variables
+    // which are set when the configuration is parsed.
+    expand_ctx.bounce_return_size_limit = config.bounce_return_size_limit;
+
+    // Headers charset — used by ${rfc2047:...} for encoding.
+    // C Exim reads this from the config option `headers_charset`, defaulting
+    // to "UTF-8" when internationalization is compiled in.
+    if let Some(ref hc) = config.headers_charset {
+        expand_ctx.headers_charset = hc.clone();
+    }
+    expand_ctx.print_topbitchars = config.print_topbitchars;
 
     expand_ctx
 }
+
+// ---------------------------------------------------------------------------
+// Reverse DNS Lookup via fakens or system resolver
+// ---------------------------------------------------------------------------
+
+/// Constructs the reverse DNS (PTR) domain name for an IPv4 address.
+///
+/// Given `"224.0.0.1"`, returns `"1.0.0.224.in-addr.arpa"`.
+/// For IPv6 (containing `:`), returns the nibble-reversed `.ip6.arpa` form.
+fn dns_build_reverse(address: &str) -> String {
+    if address.contains(':') {
+        // IPv6 — expand to full 32 nibbles then reverse
+        // Parse the IPv6 address, expand abbreviations
+        let addr: std::net::Ipv6Addr = match address.parse() {
+            Ok(a) => a,
+            Err(_) => return String::new(),
+        };
+        let segments = addr.segments();
+        let mut nibbles = Vec::with_capacity(32);
+        for seg in &segments {
+            nibbles.push((seg >> 12) & 0xf);
+            nibbles.push((seg >> 8) & 0xf);
+            nibbles.push((seg >> 4) & 0xf);
+            nibbles.push(seg & 0xf);
+        }
+        nibbles.reverse();
+        let mut result = String::with_capacity(72);
+        for (i, nib) in nibbles.iter().enumerate() {
+            result.push_str(&format!("{:x}", nib));
+            if i < nibbles.len() - 1 {
+                result.push('.');
+            }
+        }
+        result.push_str(".ip6.arpa");
+        result
+    } else {
+        // IPv4 — reverse the octets
+        let parts: Vec<&str> = address.split('.').collect();
+        if parts.len() != 4 {
+            return String::new();
+        }
+        format!(
+            "{}.{}.{}.{}.in-addr.arpa",
+            parts[3], parts[2], parts[1], parts[0]
+        )
+    }
+}
+
+/// Performs a reverse DNS (PTR) lookup of `address`, returning the first
+/// hostname found, or `None` on failure.
+///
+/// When running under the Exim test harness the `fakens` utility is used
+/// (found at `config_dir/bin/fakens`).  If `fakens` is not present, falls
+/// back to the `exim-dns` crate resolver, or system `getaddrinfo`.
+///
+/// Mirrors C Exim `host_name_lookup()` in host.c (line 1582) which calls
+/// `dns_build_reverse()` then `dns_lookup()` → `fakens_search()`.
+fn host_name_lookup(address: &str, config_dir: &str) -> Option<String> {
+    let reverse_domain = dns_build_reverse(address);
+    if reverse_domain.is_empty() {
+        return None;
+    }
+
+    // Try fakens first (test-harness DNS)
+    let fakens_path = if config_dir.is_empty() {
+        String::new()
+    } else {
+        format!("{}/bin/fakens", config_dir)
+    };
+
+    if !fakens_path.is_empty() && std::path::Path::new(&fakens_path).exists() {
+        // Call: fakens <config_dir> <reverse_domain> PTR
+        let output = std::process::Command::new(&fakens_path)
+            .arg(config_dir)
+            .arg(&reverse_domain)
+            .arg("PTR")
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                // fakens returns raw DNS wire-format data on success.
+                // Parse the output to extract the PTR hostname.
+                return parse_fakens_ptr_response(&out.stdout, &reverse_domain);
+            }
+            // Exit code 1 = HOST_NOT_FOUND, 5 = PASS_ON (try system)
+            let code = out.status.code().unwrap_or(3);
+            if code != 5 {
+                return None; // definitive failure
+            }
+            // code == 5: fall through to system resolver
+        }
+    }
+
+    // System resolver fallback — use exim-ffi safe wrapper for getnameinfo
+    exim_ffi::reverse_lookup(address)
+}
+
+/// Parses the binary DNS wire-format response from `fakens` to extract PTR
+/// record hostnames.
+///
+/// `fakens` returns a raw DNS answer section.  The format is a standard DNS
+/// message (header + question + answer).  We look for PTR RRs in the answer
+/// section and extract the first domain name.
+fn parse_fakens_ptr_response(data: &[u8], _query: &str) -> Option<String> {
+    // fakens output is a raw DNS response packet.  The structure is:
+    //   12-byte header, then question section, then answer RRs.
+    // We use a simple parser to skip through and find PTR records.
+    if data.len() < 12 {
+        return None;
+    }
+
+    // Parse header
+    let _id = u16::from_be_bytes([data[0], data[1]]);
+    let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
+
+    if ancount == 0 {
+        return None;
+    }
+
+    // Skip question section
+    let mut pos = 12;
+    for _ in 0..qdcount {
+        // Skip QNAME
+        pos = skip_dns_name(data, pos)?;
+        // Skip QTYPE (2) + QCLASS (2)
+        pos = pos.checked_add(4)?;
+        if pos > data.len() {
+            return None;
+        }
+    }
+
+    // Parse answer RRs
+    for _ in 0..ancount {
+        // NAME
+        let name_end = skip_dns_name(data, pos)?;
+        // TYPE (2), CLASS (2), TTL (4), RDLENGTH (2)
+        if name_end + 10 > data.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([data[name_end], data[name_end + 1]]);
+        let rdlength = u16::from_be_bytes([data[name_end + 8], data[name_end + 9]]) as usize;
+        let rdata_start = name_end + 10;
+        let rdata_end = rdata_start + rdlength;
+
+        if rdata_end > data.len() {
+            return None;
+        }
+
+        // PTR = type 12
+        if rtype == 12 {
+            // RDATA is a domain name
+            if let Some(name) = decode_dns_name(data, rdata_start) {
+                // Remove trailing dot if present, convert to lowercase
+                let name = name.trim_end_matches('.').to_lowercase();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+
+        pos = rdata_end;
+    }
+
+    None
+}
+
+/// Skips a DNS name (sequence of labels or pointer) in `data` starting at
+/// `pos`, returning the position just past the name encoding.
+fn skip_dns_name(data: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        if pos >= data.len() {
+            return None;
+        }
+        let label_len = data[pos] as usize;
+        if label_len == 0 {
+            // Root label — end of name
+            return Some(pos + 1);
+        }
+        if label_len & 0xC0 == 0xC0 {
+            // Pointer — 2 bytes total
+            return Some(pos + 2);
+        }
+        pos += 1 + label_len;
+    }
+}
+
+/// Decodes a DNS domain name from wire format, following compression
+/// pointers.
+fn decode_dns_name(data: &[u8], mut pos: usize) -> Option<String> {
+    let mut name = String::new();
+    let mut jumps = 0;
+    loop {
+        if pos >= data.len() || jumps > 10 {
+            return None;
+        }
+        let label_len = data[pos] as usize;
+        if label_len == 0 {
+            break;
+        }
+        if label_len & 0xC0 == 0xC0 {
+            // Compression pointer
+            if pos + 1 >= data.len() {
+                return None;
+            }
+            let offset = ((label_len & 0x3F) << 8) | (data[pos + 1] as usize);
+            pos = offset;
+            jumps += 1;
+            continue;
+        }
+        if pos + 1 + label_len > data.len() {
+            return None;
+        }
+        if !name.is_empty() {
+            name.push('.');
+        }
+        for &b in &data[pos + 1..pos + 1 + label_len] {
+            name.push(b as char);
+        }
+        pos += 1 + label_len;
+    }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+// System reverse DNS is handled by exim_ffi::reverse_lookup() which
+// wraps libc getnameinfo — the only crate permitted to contain unsafe.
 
 // ---------------------------------------------------------------------------
 // Filter Testing Mode (-bf / -bF)
@@ -738,20 +1423,20 @@ pub fn config_check_mode(
     options: &[String],
     list_config: bool,
     config: &Arc<exim_config::Config>,
+    server_ctx: &ServerContext,
 ) -> ExitCode {
-    tracing::debug!(
-        option_count = options.len(),
-        list_config = list_config,
-        "config_check_mode: entering"
-    );
-
     // When debug is enabled (-d flag), the C Exim binary prints startup
     // diagnostic information that the test/runtest harness parses. The
     // harness merges stdout and stderr (via 2>&1) and scans for patterns
     // such as `TRUSTED_CONFIG_LIST: "..."` and `Configure owner: uid:gid`.
     // We emit these lines to stderr to match the C Exim debug channel
     // and ensure the harness can extract them.
-    if tracing::enabled!(tracing::Level::DEBUG) {
+    //
+    // We check `server_ctx.debug_selector != 0` instead of using the
+    // `tracing::enabled!()` macro because the tracing subscriber is
+    // intentionally set to "off" (the C Exim debug format is custom,
+    // not structured tracing output).
+    if server_ctx.debug_selector != 0 {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
         eprintln!("Configure owner: {uid}:{gid}");

@@ -432,16 +432,24 @@ impl AclVerb {
 
     /// Whether this verb terminates ACL evaluation when conditions pass.
     ///
-    /// All verbs except `Warn` terminate ACL evaluation when their conditions
-    /// are satisfied. `Warn` is unique: it executes side effects (logging,
-    /// header addition) and then always continues to the next verb.
+    /// Most verbs terminate ACL evaluation when their conditions are
+    /// satisfied:
+    /// - `Accept` → returns OK (accept the message)
+    /// - `Deny` → returns FAIL (deny the message)
+    /// - `Defer` → returns DEFER (temporary failure)
+    /// - `Discard` → returns DISCARD (silently discard)
+    /// - `Drop` → returns FAIL_DROP (deny + drop connection)
     ///
-    /// Note: `Require` also continues (break in C) on condition success, but
-    /// is listed as terminating here because a successful require chain followed
-    /// by no further verbs results in the implicit DENY at end of ACL. The
-    /// engine handles require's pass-through semantics separately.
+    /// Two verbs do **not** terminate on success:
+    /// - `Warn` → executes side effects (logging, header addition) and
+    ///   continues to the next verb.
+    /// - `Require` → a passing `require` is a gate: the condition was
+    ///   satisfied, so continue evaluating subsequent verbs.  Only condition
+    ///   **failure** terminates a `require` (with FAIL).  This matches C
+    ///   Exim's `ACL_REQUIRE` case which just does `break` from the switch
+    ///   on success (acl.c ~line 4719).
     pub const fn terminates_on_pass(&self) -> bool {
-        !matches!(self, Self::Warn)
+        !matches!(self, Self::Warn | Self::Require)
     }
 
     /// Whether this verb terminates ACL evaluation when conditions fail
@@ -876,7 +884,9 @@ mod tests {
         assert!(AclVerb::Deny.terminates_on_pass());
         assert!(AclVerb::Discard.terminates_on_pass());
         assert!(AclVerb::Drop.terminates_on_pass());
-        assert!(AclVerb::Require.terminates_on_pass());
+        // Require does NOT terminate on pass — it continues to the
+        // next statement (C Exim: require only terminates on FAIL).
+        assert!(!AclVerb::Require.terminates_on_pass());
         assert!(!AclVerb::Warn.terminates_on_pass());
     }
 

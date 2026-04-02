@@ -1178,7 +1178,7 @@ impl TransportDriver for LmtpTransport {
                 driver = driver_name_str.as_str(),
                 "lmtp transport yields OK"
             );
-            TransportResult::Ok
+            TransportResult::ok()
         } else if any_failed && !any_deferred {
             let msg = recipients
                 .iter()

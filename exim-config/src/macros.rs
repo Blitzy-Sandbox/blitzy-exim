@@ -87,8 +87,22 @@ pub struct MacroItem {
 pub struct MacroStore {
     /// Ordered list of macro definitions.  Command-line macros appear first.
     macros: Vec<MacroItem>,
-    /// Index of the first non-command-line macro, matching C's `macros_user`.
+    /// Index of the first non-built-in (runtime-created) macro, matching
+    /// C's `macros_user` pointer.  In C Exim, built-in macros (like
+    /// `_HAVE_IPV6`) are part of a static linked list that precedes any
+    /// runtime-created macros.  The `macros_user` pointer targets the
+    /// first *runtime* macro — which **includes** command-line (`-D`)
+    /// macros, not just config-file-defined macros.
+    ///
+    /// Since we have no built-in macros in the store (they are handled
+    /// separately), this is effectively the index of the very first macro
+    /// ever pushed into the store.
     user_start_index: Option<usize>,
+    /// When `true`, print `macro 'NAME' -> 'VALUE'` to stdout for each
+    /// macro expansion performed during config parsing — matching the
+    /// C Exim `readconf.c:984` behaviour when both `D_any` debug mode
+    /// and `f.expansion_test` (i.e. `-be` mode) are active.
+    pub expansion_test_debug: bool,
 }
 
 impl MacroStore {
@@ -97,6 +111,7 @@ impl MacroStore {
         Self {
             macros: Vec::new(),
             user_start_index: None,
+            expansion_test_debug: false,
         }
     }
 
@@ -120,9 +135,14 @@ impl MacroStore {
         };
         self.macros.push(item);
 
-        // Track the index of the first user-defined (non-command-line) macro,
-        // matching C's `macros_user` pointer.
-        if !command_line && self.user_start_index.is_none() {
+        // Track the index of the first runtime-created macro, matching C's
+        // `macros_user` pointer.  In C Exim, `macros_user` is set to the
+        // first macro pushed onto the runtime list — which **includes**
+        // command-line (`-D`) macros.  The `_` prefix check in
+        // `expand_macros()` only affects built-in macros (which live before
+        // `macros_user` in C's linked list).  Since our store has no
+        // built-in macros, `user_start_index` simply points to index 0.
+        if self.user_start_index.is_none() {
             self.user_start_index = Some(self.macros.len() - 1);
         }
     }
@@ -325,6 +345,12 @@ impl MacroStore {
                             position = match_start,
                             "expanding macro occurrence"
                         );
+
+                        // C Exim readconf.c:984: when debug+expansion_test,
+                        // print macro expansion to stdout.
+                        if self.expansion_test_debug {
+                            println!("macro '{}' -> '{}'", name, replacement);
+                        }
 
                         line.replace_range(match_start..match_end, replacement);
                         found = true;

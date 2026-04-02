@@ -386,6 +386,13 @@ pub enum SmtpProtocol {
     LocalEssmtp,
     /// `"local-essmtpa"` — local + Extended + TLS-on-connect + authenticated
     LocalEssmtpa,
+
+    /// `"local-bsmtp"` — batch SMTP input (`-bS` mode)
+    ///
+    /// C Exim sets this protocol string when processing batched SMTP
+    /// input where no HELO/EHLO exchange occurs and commands are read
+    /// from stdin without interactive responses.
+    LocalBsmtp,
 }
 
 impl fmt::Display for SmtpProtocol {
@@ -409,6 +416,7 @@ impl fmt::Display for SmtpProtocol {
             Self::LocalSsmtp => "local-ssmtp",
             Self::LocalEssmtp => "local-essmtp",
             Self::LocalEssmtpa => "local-essmtpa",
+            Self::LocalBsmtp => "local-bsmtp",
         };
         f.write_str(s)
     }

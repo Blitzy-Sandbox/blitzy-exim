@@ -150,7 +150,7 @@ nix = { workspace = true, optional = true }
 
 # Default features — match the default C build configuration
 # SUPPORT_CRYPTEQ is enabled by default in C (expand.c lines 28-31)
-default = ["crypteq"]
+default = ["crypteq", "run"]
 
 # ── Core expansion features (from agent prompt Phase 3) ─────────────────────
 

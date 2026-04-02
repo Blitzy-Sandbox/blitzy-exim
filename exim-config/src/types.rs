@@ -340,6 +340,11 @@ pub struct AclBlock {
     /// The raw ACL definition text exactly as it appears in the config file.
     /// This is preserved verbatim for `-bP` printing and lazy evaluation.
     pub raw_definition: String,
+    /// Config file path where the ACL was defined (for HDEBUG source references).
+    pub source_file: String,
+    /// Line number of the first body line in the config file.
+    /// Verb line numbers in `acl_read()` are offset from this value.
+    pub start_line: i32,
 }
 
 /// TLS connection state snapshot used in [`MessageContext`] to record

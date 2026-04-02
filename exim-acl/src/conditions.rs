@@ -28,7 +28,7 @@ use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
 use exim_dns::{DnsRecordData, DnsRecordType, DnsResolver, DnsResult, DnsblCache};
-use exim_expand::{expand_check_condition, expand_string, ExpandError};
+use exim_expand::{expand_check_condition, ExpandError};
 
 use crate::phases::BIT_ATRN;
 #[cfg(feature = "prdr")]
@@ -1576,6 +1576,11 @@ fn acl_verify_csa_address(resolver: &DnsResolver, target: &str, client_ip: &str)
 /// - verify = csa
 /// - verify = header_sender [/callout[=opts]]
 /// - verify = arc (feature-gated)
+// Justification: acl_verify() mirrors the C `acl_verify()` signature
+// which inherently requires many context parameters (resolver, message
+// context, expand context, verify callback, user/log message outputs,
+// and sender verify failure tracking).
+#[allow(clippy::too_many_arguments)]
 pub fn acl_verify(
     verify_arg: &str,
     resolver: &DnsResolver,
@@ -1584,6 +1589,11 @@ pub fn acl_verify(
     csa_cache: &mut BTreeMap<String, CsaResult>,
     client_ip: &str,
     sender_helo_name: &str,
+    verify_recipient_cb: Option<&crate::engine::VerifyRecipientCallback>,
+    expand_ctx: &mut exim_expand::variables::ExpandContext,
+    user_msg: &mut Option<String>,
+    log_msg: &mut Option<String>,
+    sender_verify_failure: &mut Option<(String, String)>,
 ) -> Result<AclResult, AclConditionError> {
     // Parse the verify type from the argument (before any '/' options)
     let (verify_type_str, options) = match verify_arg.find('/') {
@@ -1596,17 +1606,32 @@ pub fn acl_verify(
 
     match verify_type_str {
         "sender" => {
-            // Verify the envelope sender address
+            // Verify the envelope sender address by routing it through
+            // the router chain — identical to verify=recipient but for
+            // the sender address.  In C Exim, both go through
+            // verify_address() which calls route_address().
             debug!("acl_verify: verifying sender");
-            let callout = options.map(|o| o.to_string());
-            acl_verify_sender(ctx, callout.as_deref())
+            let no_details = options.is_some_and(|o| o.contains("no_details"));
+            acl_verify_sender_via_cb(
+                ctx,
+                verify_recipient_cb,
+                expand_ctx,
+                user_msg,
+                log_msg,
+                no_details,
+                sender_verify_failure,
+            )
         }
 
         "recipient" => {
-            // Verify the envelope recipient address
+            // Verify the envelope recipient address by running it through
+            // the router chain.  In C Exim (verify.c / deliver.c), this
+            // calls `verify_address()` → `route_address()` which walks the
+            // router chain and sets the global `address_data`.  In Rust the
+            // routing lives in exim-deliver (unreachable from exim-acl), so
+            // the SMTP layer provides a callback via `eval_ctx.verify_recipient_cb`.
             debug!("acl_verify: verifying recipient");
-            let callout = options.map(|o| o.to_string());
-            acl_verify_recipient(ctx, callout.as_deref())
+            acl_verify_recipient_via_cb(ctx, verify_recipient_cb, expand_ctx, user_msg, log_msg)
         }
 
         "helo" => {
@@ -1691,31 +1716,166 @@ pub fn acl_verify(
 // Internal verification sub-functions
 
 /// Verify envelope sender address.
-fn acl_verify_sender(
+/// Verify the envelope sender address by routing it through the router
+/// chain using the same callback as `verify = recipient`.  In C Exim,
+/// both sender and recipient verification call `verify_address()` which
+/// invokes `route_address()`.
+///
+/// A null sender (`<>`) is always valid — this matches C Exim behaviour
+/// where bounce addresses bypass verification.
+///
+/// When `no_details` is true the multi-line "Verification failed for <addr>
+/// / reason" prefix is suppressed and only the ACL message= text (or
+/// "Sender verify failed") is returned, matching the C `/no_details`
+/// option.
+fn acl_verify_sender_via_cb(
     ctx: &MessageContext,
-    _callout_opts: Option<&str>,
+    verify_recipient_cb: Option<&crate::engine::VerifyRecipientCallback>,
+    expand_ctx: &mut exim_expand::variables::ExpandContext,
+    user_msg: &mut Option<String>,
+    log_msg: &mut Option<String>,
+    no_details: bool,
+    sender_verify_failure: &mut Option<(String, String)>,
 ) -> Result<AclResult, AclConditionError> {
-    // Sender verification: check that the sender domain exists
-    // and optionally perform a callout to the sender's MX
-    trace!("acl_verify_sender: verifying envelope sender");
+    let sender = &ctx.sender_address;
+    trace!(sender = %sender, "acl_verify_sender_via_cb: verifying envelope sender");
 
-    // A null sender (<>) is always valid (bounce address)
-    if ctx.host_and_ident.is_empty() {
+    // A null sender (<>) is always valid (bounce / DSN address).
+    if sender.is_empty() {
         return Ok(AclResult::Ok);
     }
 
-    // Basic verification: sender has a domain part
-    Ok(AclResult::Ok)
+    match verify_recipient_cb {
+        Some(cb) => {
+            // Route the sender through the same router chain used for
+            // recipients.  The second argument is the envelope-sender
+            // which, for sender verification, is the address itself.
+            let result = cb(sender, sender);
+
+            // Propagate sender_address_data if available (C Exim sets
+            // sender_vfy_failure_addr->prop.address_data).
+            if let Some(ref ad) = result.address_data {
+                expand_ctx.sender_address_data = ad.clone();
+            }
+
+            if result.routed {
+                Ok(AclResult::Ok)
+            } else {
+                // Sender verification failed — build the response
+                // matching C Exim's format:
+                //   550-Verification failed for <addr>
+                //   550-<router fail message>
+                //   550 <acl message= text | "Sender verify failed">
+                let detail = result
+                    .fail_message
+                    .unwrap_or_else(|| "Unrouteable address".to_string());
+                trace!(sender = %sender, reason = %detail, "sender verification failed");
+
+                // Record the sender verification failure.  The SMTP
+                // layer uses this in `smtp_handle_acl_fail()` to emit
+                // the multi-line "Verification failed for <addr>\n<reason>"
+                // prefix before the final ACL message (matching C Exim's
+                // `sender_verified_failed` handling in smtp_in.c ~3191).
+                if no_details {
+                    // /no_details: suppress the multi-line prefix,
+                    // just set log_msg for the ACL engine.  Do NOT
+                    // set sender_verify_failure so the SMTP layer
+                    // won't emit "Verification failed for ..." lines.
+                    *log_msg = Some(detail);
+                } else {
+                    *sender_verify_failure = Some((sender.clone(), detail.clone()));
+                    *log_msg = Some(detail);
+                }
+                // Set the default user_msg to "Sender verify failed" matching
+                // C Exim's behavior (acl.c: when sender verification fails, the
+                // user_msg defaults to "Sender verify failed" unless overridden
+                // by a `message = ...` modifier on the ACL verb).
+                *user_msg = Some("Sender verify failed".to_string());
+                // Store the verify failure message so that if the ACL
+                // has `message = ...` after `verify = sender`, the
+                // expansion engine can access `$acl_verify_message`.
+                expand_ctx.acl_verify_message = log_msg.clone().unwrap_or_default();
+                Ok(AclResult::Fail)
+            }
+        }
+        None => {
+            // No callback registered — accept (best-effort).
+            trace!("acl_verify_sender_via_cb: no callback, accepting");
+            Ok(AclResult::Ok)
+        }
+    }
 }
 
-/// Verify envelope recipient address.
-fn acl_verify_recipient(
-    _ctx: &MessageContext,
-    _callout_opts: Option<&str>,
+/// Verify envelope recipient address via the callback provided by the SMTP
+/// layer.  If no callback is registered, the address is accepted (matching
+/// C Exim's behaviour when `verify = recipient` is not explicitly called
+/// or when address verification succeeds trivially).
+fn acl_verify_recipient_via_cb(
+    ctx: &MessageContext,
+    verify_recipient_cb: Option<&crate::engine::VerifyRecipientCallback>,
+    expand_ctx: &mut exim_expand::variables::ExpandContext,
+    cond_user_msg: &mut Option<String>,
+    cond_log_msg: &mut Option<String>,
 ) -> Result<AclResult, AclConditionError> {
-    trace!("acl_verify_recipient: verifying envelope recipient");
-    // Recipient verification: check routing and optionally callout
-    Ok(AclResult::Ok)
+    // Determine the recipient address to verify.  For the RCPT ACL,
+    // `ctx.host_and_ident` carries the recipient from the SMTP RCPT TO
+    // command; we also check `expand_ctx.local_part` + `expand_ctx.domain`
+    // which the SMTP layer populates before ACL evaluation.
+    let recipient = if !expand_ctx.local_part.is_empty() && !expand_ctx.domain.is_empty() {
+        format!("{}@{}", expand_ctx.local_part, expand_ctx.domain)
+    } else if !ctx.host_and_ident.is_empty() {
+        ctx.host_and_ident.clone()
+    } else {
+        // No recipient available — accept
+        return Ok(AclResult::Ok);
+    };
+    let sender = &ctx.sender_address;
+
+    trace!(recipient = %recipient, "acl_verify_recipient_via_cb: verifying");
+
+    match verify_recipient_cb {
+        Some(cb) => {
+            let result = cb(&recipient, sender);
+
+            // ALWAYS populate address_data regardless of routing outcome.
+            // C Exim's copy_error() in verify.c unconditionally copies
+            // addr->prop.address_data back to the verification address,
+            // so $address_data is available even when verify fails.
+            if let Some(ref ad) = result.address_data {
+                expand_ctx.address_data = ad.clone();
+            } else {
+                expand_ctx.address_data.clear();
+            }
+            if let Some(ref sad) = result.sender_address_data {
+                expand_ctx.sender_address_data = sad.clone();
+            }
+
+            if result.routed {
+                Ok(AclResult::Ok)
+            } else {
+                // The router chain could not route the address.
+                // In C Exim (acl.c ~2291–2293):
+                //   *log_msgptr = addr2.message;
+                //   *user_msgptr = addr2.user_message ? addr2.user_message : addr2.message;
+                let fail_msg = result
+                    .fail_message
+                    .unwrap_or_else(|| "Unrouteable address".to_string());
+                trace!(
+                    recipient = %recipient,
+                    reason = %fail_msg,
+                    "acl_verify_recipient_via_cb: verification failed"
+                );
+                *cond_log_msg = Some(fail_msg.clone());
+                *cond_user_msg = Some(fail_msg);
+                Ok(AclResult::Fail)
+            }
+        }
+        None => {
+            // No callback registered — accept the address (best-effort).
+            trace!("acl_verify_recipient_via_cb: no callback, accepting");
+            Ok(AclResult::Ok)
+        }
+    }
 }
 
 /// Verify message header syntax — check for malformed headers.
@@ -2319,123 +2479,79 @@ fn split_list(list: &str) -> Vec<String> {
     items
 }
 
-/// Match a single pattern item against a value.
-///
-/// `caseless` controls whether comparison is case-insensitive (used for
-/// domains and hostnames). Returns `Some(true)` for match, `Some(false)` for
-/// explicit non-match (negation), `None` if the item doesn't match.
-fn match_single_item(
-    pattern: &str,
-    value: &str,
-    caseless: bool,
-    named_lists: &HashMap<String, String>,
-) -> Option<bool> {
-    let (negated, pat) = if let Some(rest) = pattern.strip_prefix('!') {
-        (true, rest.trim())
-    } else {
-        (false, pattern.trim())
-    };
+// =========================================================================
+// Pattern Matching — Pure logic, no HDEBUG output
+// =========================================================================
 
+/// Match a single pattern against a value, returning `true` on match.
+///
+/// Handles: exact, wildcard (*), regex (^), @domain, lsearch, and empty.
+/// Does NOT handle named list references (+name) — those are expanded by the
+/// caller in `match_list_hdebug`.
+///
+/// Returns `(matched: bool, lookup_data: Option<String>)`.
+/// `lookup_data` is populated when the match comes from a lookup operation
+/// (e.g., lsearch) and contains the data portion of the matched entry.
+/// This data is used to populate `$domain_data`, `$local_part_data`, or
+/// `$sender_data` depending on the condition type (C Exim: match.c).
+fn match_direct_pattern(pat: &str, value: &str, caseless: bool) -> (bool, Option<String>) {
     // Empty pattern matches empty value
     if pat.is_empty() {
-        let matched = value.is_empty();
-        return if matched { Some(!negated) } else { None };
+        return (value.is_empty(), None);
     }
 
-    // Named list reference: +listname
-    if let Some(list_name) = pat.strip_prefix('+') {
-        let list_name = list_name.trim();
-        if let Some(list_body) = named_lists.get(list_name) {
-            let sub_result = match_list(list_body, value, caseless, named_lists);
-            return if negated {
-                Some(!sub_result)
-            } else {
-                Some(sub_result)
-            };
-        }
-        // Named list not found — treat as no match
-        trace!(list_name = list_name, "named list not found");
-        return None;
-    }
-
-    // Regex match: ^pattern or ^\\Dpattern (\\D = case-sensitive flag in Exim)
+    // Regex match: ^pattern or ^\\Dpattern
     if let Some(regex_body) = pat.strip_prefix('^') {
         let (regex_pat, case_flag) = if let Some(inner) = regex_body.strip_prefix("\\D") {
-            (inner, false) // \\D means case-sensitive
+            (inner, false)
         } else {
             (regex_body, caseless)
         };
-        match regex::RegexBuilder::new(regex_pat)
+        let matched = regex::RegexBuilder::new(regex_pat)
             .case_insensitive(case_flag)
             .build()
-        {
-            Ok(re) => {
-                let matched = re.is_match(value);
-                return if negated {
-                    Some(!matched)
-                } else if matched {
-                    Some(true)
-                } else {
-                    None
-                };
-            }
-            Err(e) => {
-                warn!(pattern = regex_pat, error = %e, "invalid regex in ACL list");
-                return None;
-            }
-        }
+            .map(|re| re.is_match(value))
+            .unwrap_or(false);
+        return (matched, None);
     }
 
-    // Address-pattern matching for senders: user@domain or @domain
-    // Handle `lsearch*@;file` (lookup by domain, match local part with wildcard)
-    // and `@@lsearch*;file` (lookup by domain from sender)
+    // CIDR/subnet matching for IP addresses (host lists).
+    // Patterns like "192.168.0.0/24" or "2001:db8::/32".
+    if pat.contains('/') {
+        if let Some(matched) = match_cidr(pat, value) {
+            return (matched, None);
+        }
+        // Not a valid CIDR pattern — fall through to other matching
+    }
+
+    // Lookup-pattern matching (lsearch;file, lsearch*;file, etc.)
     if pat.contains(';') {
-        // Lookup-based matching — complex, requires file I/O
-        // For now, handle lsearch;file patterns
         if let Some(file_part) = pat
             .strip_prefix("lsearch;")
             .or_else(|| pat.strip_prefix("lsearch*;"))
             .or_else(|| pat.strip_prefix("lsearch*@;"))
         {
-            let matched = lsearch_match(file_part.trim(), value, caseless);
-            return if negated {
-                Some(!matched)
-            } else if matched {
-                Some(true)
-            } else {
-                None
+            return match lsearch_match(file_part.trim(), value, caseless) {
+                Some(data) => (true, Some(data)),
+                None => (false, None),
             };
         }
         if let Some(file_part) = pat.strip_prefix("@@lsearch*;") {
-            // @@lsearch: look up by the domain part of the value
             let domain = value.rsplit('@').next().unwrap_or("");
-            let matched = lsearch_match(file_part.trim(), domain, caseless);
-            return if negated {
-                Some(!matched)
-            } else if matched {
-                Some(true)
-            } else {
-                None
+            return match lsearch_match(file_part.trim(), domain, caseless) {
+                Some(data) => (true, Some(data)),
+                None => (false, None),
             };
         }
-        // Other lookup types — skip for now
-        trace!(pattern = pat, "unhandled lookup pattern in ACL list");
-        return None;
+        return (false, None);
     }
 
     // Wildcard matching
     if pat.contains('*') {
-        let matched = wildcard_match(pat, value, caseless);
-        return if negated {
-            Some(!matched)
-        } else if matched {
-            Some(true)
-        } else {
-            None
-        };
+        return (wildcard_match(pat, value, caseless), None);
     }
 
-    // @domain match for address lists (match any local_part at domain)
+    // @domain match for address lists
     if let Some(domain_pat) = pat.strip_prefix('@') {
         if !domain_pat.is_empty() {
             let value_domain = value.rsplit('@').next().unwrap_or("");
@@ -2444,40 +2560,83 @@ fn match_single_item(
             } else {
                 domain_pat == value_domain
             };
-            return if negated {
-                Some(!matched)
-            } else if matched {
-                Some(true)
-            } else {
-                None
-            };
+            return (matched, None);
         }
     }
 
-    // Exact match (case-insensitive for domains)
+    // Exact match (case-insensitive when caseless=true)
     let matched = if caseless {
         pat.eq_ignore_ascii_case(value)
     } else {
         pat == value
     };
-    if negated {
-        Some(!matched)
-    } else if matched {
-        Some(true)
-    } else {
-        None
+    (matched, None)
+}
+
+/// Match an IP address against a CIDR network pattern.
+/// Returns `Some(true/false)` if the pattern is a valid CIDR, `None` otherwise.
+fn match_cidr(pat: &str, value: &str) -> Option<bool> {
+    let parts: Vec<&str> = pat.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return None;
     }
+    let network_str = parts[0];
+    let prefix_len: u32 = parts[1].parse().ok()?;
+
+    // Try IPv4 first
+    if let (Ok(net_ip), Ok(val_ip)) = (
+        network_str.parse::<std::net::Ipv4Addr>(),
+        value.parse::<std::net::Ipv4Addr>(),
+    ) {
+        if prefix_len > 32 {
+            return None;
+        }
+        if prefix_len == 0 {
+            return Some(true);
+        }
+        let mask = u32::MAX.checked_shl(32 - prefix_len).unwrap_or(0);
+        let net_bits = u32::from(net_ip) & mask;
+        let val_bits = u32::from(val_ip) & mask;
+        return Some(net_bits == val_bits);
+    }
+
+    // Try IPv6
+    if let (Ok(net_ip), Ok(val_ip)) = (
+        network_str.parse::<std::net::Ipv6Addr>(),
+        value.parse::<std::net::Ipv6Addr>(),
+    ) {
+        if prefix_len > 128 {
+            return None;
+        }
+        if prefix_len == 0 {
+            return Some(true);
+        }
+        let mask = u128::MAX.checked_shl(128 - prefix_len).unwrap_or(0);
+        let net_bits = u128::from(net_ip) & mask;
+        let val_bits = u128::from(val_ip) & mask;
+        return Some(net_bits == val_bits);
+    }
+
+    // Not a valid IP CIDR pattern
+    None
 }
 
 /// Perform a line-search file lookup.
 /// Opens the file and checks each line for a match.
 /// Lines starting with `#` are comments. Each line has format `key: data`.
-fn lsearch_match(filename: &str, value: &str, caseless: bool) -> bool {
+///
+/// Returns `Some(data)` where `data` is the value portion after the key
+/// separator (`:`).  If the line has no separator, returns `Some("")`.
+/// Returns `None` if the key is not found.
+///
+/// In C Exim, the lookup data is propagated to `$domain_data`,
+/// `$local_part_data`, or `$sender_data` depending on the condition type.
+fn lsearch_match(filename: &str, value: &str, caseless: bool) -> Option<String> {
     let content = match std::fs::read_to_string(filename) {
         Ok(c) => c,
         Err(e) => {
             trace!(file = filename, error = %e, "lsearch: cannot open file");
-            return false;
+            return None;
         }
     };
     for line in content.lines() {
@@ -2497,10 +2656,16 @@ fn lsearch_match(filename: &str, value: &str, caseless: bool) -> bool {
             key == value
         };
         if matched {
-            return true;
+            // Extract data portion after the key
+            let data = if let Some(colon_pos) = line.find(':') {
+                line[colon_pos + 1..].trim().to_string()
+            } else {
+                String::new()
+            };
+            return Some(data);
         }
     }
-    false
+    None
 }
 
 /// Wildcard pattern matching. Supports `*` as a glob wildcard.
@@ -2538,42 +2703,211 @@ fn wildcard_match(pattern: &str, value: &str, caseless: bool) -> bool {
     pat == val
 }
 
-/// Match a value against a colon-separated Exim list.
+// =========================================================================
+// List Matching — with HDEBUG output matching C Exim's match.c
+// =========================================================================
+
+/// Match a value against a colon-separated Exim list (no HDEBUG output).
 ///
 /// Returns `true` if the value matches any item in the list (respecting
-/// negation semantics). The matching follows Exim's list processing rules:
-///
-/// 1. Items are processed left to right.
-/// 2. First match wins (either positive or negative via `!`).
-/// 3. If no item matches, the result is `false` (no match).
+/// negation semantics).
 fn match_list(
     list: &str,
     value: &str,
     caseless: bool,
     named_lists: &HashMap<String, String>,
 ) -> bool {
-    let items = split_list(list);
-    for item in &items {
-        if let Some(result) = match_single_item(item, value, caseless, named_lists) {
-            return result;
-        }
-    }
-    false
+    let (matched, _, _) = match_list_hdebug(list, value, caseless, named_lists, false, 0, list);
+    matched
 }
 
-/// Match a host (IP address) against an Exim host list.
+/// Core list matching with HDEBUG output replicating C Exim's `match_check_list()`
+/// (match.c lines ~530–1013).
 ///
-/// In Exim, `hosts = :` means the list contains a single empty element,
-/// which matches only when the sender host address is empty (local/pipe
-/// connections). For `-bh` mode, `sender_host_address` is set to the
-/// argument IP, so the empty element does NOT match.
-fn match_host_list(
+/// Manages `expand_level` for correct indentation depth.  The `depth` parameter
+/// corresponds to C's `acl_level + expand_level` at function entry.
+///
+/// Returns `(matched: bool, matched_pattern: Option<String>, lookup_data: Option<String>)`.
+/// - `matched_pattern` is the pattern text that caused the match — used by the
+///   caller to populate the cache value in the `data from lookup saved` HDEBUG line.
+/// - `lookup_data` is populated when the match comes from a lookup (e.g., lsearch).
+///   In C Exim, this is `expand_nstring[0]` which populates `$domain_data`,
+///   `$local_part_data`, or `$sender_data`.
+fn match_list_hdebug(
+    list: &str,
+    value: &str,
+    caseless: bool,
+    named_lists: &HashMap<String, String>,
+    host_checking: bool,
+    depth: usize,
+    display_list: &str,
+) -> (bool, Option<String>, Option<String>) {
+    // HDEBUG: "value in \"display_list\"?"  at depth E  (match.c line 566)
+    crate::engine::hdebug_indent(
+        host_checking,
+        depth,
+        &format!("{} in \"{}\"?", value, display_list),
+    );
+
+    // expand_level++  (match.c line 567)
+    let item_depth = depth + 1;
+
+    let items = split_list(list);
+
+    // Track whether any negated item was seen. In C Exim's match_check_list(),
+    // if the end of the list is reached without a positive or negated match:
+    //   - If any item was negated: return OK (default accept — match.c ~line 989)
+    //   - If no item was negated: return FAIL (nothing matched)
+    let mut seen_negated = false;
+
+    for item_raw in &items {
+        let trimmed = item_raw.trim();
+        let (negated, pat) = if let Some(rest) = trimmed.strip_prefix('!') {
+            (true, rest.trim())
+        } else {
+            (false, trimmed)
+        };
+
+        if negated {
+            seen_negated = true;
+        }
+
+        // HDEBUG: "list element: pattern"  at item_depth  (match.c line 577)
+        crate::engine::hdebug_indent(host_checking, item_depth, &format!("list element: {}", pat));
+
+        // ---- Named list reference: +listname ----
+        if let Some(list_name) = pat.strip_prefix('+') {
+            let list_name = list_name.trim();
+            if let Some(list_body) = named_lists.get(list_name) {
+                // HDEBUG: " start sublist name" at item_depth (leading space in C format)
+                // then expand_level += 2   (match.c line 805)
+                crate::engine::hdebug_indent(
+                    host_checking,
+                    item_depth,
+                    &format!(" start sublist {}", list_name),
+                );
+
+                // Recursive call at item_depth + 2
+                let (sub_matched, sub_pattern, sub_lookup_data) = match_list_hdebug(
+                    list_body,
+                    value,
+                    caseless,
+                    named_lists,
+                    host_checking,
+                    item_depth + 2,
+                    list_body,
+                );
+
+                // HDEBUG: expand_level -= 2 then " end sublist name" (match.c line 843)
+                crate::engine::hdebug_indent(
+                    host_checking,
+                    item_depth,
+                    &format!(" end sublist {}", list_name),
+                );
+
+                if sub_matched {
+                    // Cache data + match result at item_depth (match.c lines 882, 921)
+                    let cache_val = sub_pattern.as_deref().unwrap_or("");
+                    crate::engine::hdebug_indent(
+                        host_checking,
+                        item_depth,
+                        &format!(
+                            "data from lookup saved for cache for +{}: key '{}' value '{}'",
+                            list_name, value, cache_val
+                        ),
+                    );
+                    // "value in display? yes (matched \"+listname\")"
+                    crate::engine::hdebug_indent(
+                        host_checking,
+                        item_depth,
+                        &format!(
+                            "{} in \"{}\"? yes (matched \"+{}\")",
+                            value, display_list, list_name
+                        ),
+                    );
+                    // expand_level-- at YIELD_RETURN (match.c line 1013)
+                    if negated {
+                        return (false, None, None);
+                    }
+                    return (true, Some(format!("+{}", list_name)), sub_lookup_data);
+                }
+                // Sub-list didn't match — continue to next item
+                // (C Exim: cached "no match" result, match.c line ~880)
+                crate::engine::hdebug_indent(
+                    host_checking,
+                    item_depth,
+                    &format!(" cached no match for +{}", list_name),
+                );
+                continue;
+            }
+            // Named list not found — skip
+            continue;
+        }
+
+        // ---- Direct pattern matching ----
+        let (matched, lookup_data) = match_direct_pattern(pat, value, caseless);
+        if matched {
+            if negated {
+                // Negated pattern that matched → deny
+                // HDEBUG: show the match result
+                crate::engine::hdebug_indent(
+                    host_checking,
+                    item_depth,
+                    &format!(
+                        "{} in \"{}\"? yes (matched \"{}\")",
+                        value, display_list, pat
+                    ),
+                );
+                return (false, None, None);
+            }
+            // HDEBUG: "value in display? yes (matched \"pattern\")" at item_depth
+            crate::engine::hdebug_indent(
+                host_checking,
+                item_depth,
+                &format!(
+                    "{} in \"{}\"? yes (matched \"{}\")",
+                    value, display_list, pat
+                ),
+            );
+            // expand_level-- at YIELD_RETURN (match.c line 1013)
+            return (true, Some(pat.to_string()), lookup_data);
+        }
+        // Pattern didn't match — continue to next item
+    }
+
+    // End of list without match (match.c ~line 989).
+    // C Exim semantics: if ANY item in the list was negated, the default
+    // action at end-of-list is MATCH (OK). This implements the "deny
+    // specific items, allow everything else" list semantics. If no items
+    // were negated, end-of-list means nothing matched → FAIL.
+    if seen_negated {
+        crate::engine::hdebug_indent(
+            host_checking,
+            depth,
+            &format!("{} in \"{}\"? yes (end of list)", value, display_list),
+        );
+        return (true, None, None);
+    }
+
+    crate::engine::hdebug_indent(
+        host_checking,
+        depth,
+        &format!("{} in \"{}\"? no (end of list)", value, display_list),
+    );
+    (false, None, None)
+}
+
+/// Match a host against an Exim host list with HDEBUG output for `-bh` mode.
+fn match_host_list_hdebug(
     list: &str,
     client_ip: &str,
     _sender_helo_name: &str,
     named_lists: &HashMap<String, String>,
+    host_checking: bool,
 ) -> bool {
-    match_list(list, client_ip, false, named_lists)
+    let (matched, _, _) =
+        match_list_hdebug(list, client_ip, false, named_lists, host_checking, 0, list);
+    matched
 }
 
 /// Match a sender address against an Exim sender list.
@@ -2581,17 +2915,148 @@ fn match_host_list(
 /// Exim's sender matching is case-insensitive on the domain part.
 /// The list can contain full addresses, `@domain` patterns, wildcards,
 /// regex patterns, and lookup references.
+/// Match a sender address against a sender list.
+/// Returns `(matched, lookup_data)` — lookup_data populates `$sender_data`.
+/// Match a sender address against an address list (C Exim: match_address_list).
+///
+/// Address list matching is more complex than simple string matching:
+/// - Patterns containing `@` (e.g. `user@domain`) are split and matched
+///   against the local_part and domain separately
+/// - Patterns WITHOUT `@` (bare domain, e.g. `domain2`) are matched against
+///   ONLY the domain part of the address
+/// - Patterns `*@domain` match any local part at that domain
+/// - Named list references (`+listname`) are expanded and matched recursively
+/// - Lookup patterns (`lsearch;file`) match the full address
+/// - Negated patterns (`!pattern`) invert the result
+// Justification: host_checking is propagated unchanged through recursive calls
+// to maintain consistent behaviour when called from the host-checking code path.
+#[allow(clippy::only_used_in_recursion)]
 fn match_sender_list(
     list: &str,
     sender_address: &str,
     named_lists: &HashMap<String, String>,
-) -> bool {
-    // Senders matching in Exim is caseless on the domain part
-    // but caseful on the local part by default.
-    // For simplicity, we use the full matching with case-insensitive
-    // comparison on the whole address (matching C Exim's default behavior
-    // where senders uses caseless matching by default).
-    match_list(list, sender_address, true, named_lists)
+    host_checking: bool,
+) -> (bool, Option<String>) {
+    // Split sender address into local_part and domain
+    let (sender_local, sender_domain) = if let Some(at_pos) = sender_address.rfind('@') {
+        (&sender_address[..at_pos], &sender_address[at_pos + 1..])
+    } else {
+        // No @ in sender — entire string is local part, empty domain
+        (sender_address, "")
+    };
+
+    // Empty sender (bounce) matching: an empty string item in the list
+    // matches an empty sender address.
+
+    let items = split_list(list);
+    let mut seen_negated = false;
+
+    for raw_item in &items {
+        let item = raw_item.trim();
+        if item.is_empty() {
+            // Empty item matches empty sender (bounce)
+            if sender_address.is_empty() {
+                return (true, None);
+            }
+            continue;
+        }
+
+        // Handle negation
+        let (negated, pattern) = if let Some(stripped) = item.strip_prefix('!') {
+            (true, stripped.trim())
+        } else {
+            (false, item)
+        };
+
+        if negated {
+            seen_negated = true;
+        }
+
+        // Handle named list references
+        if let Some(list_name) = pattern.strip_prefix('+') {
+            if let Some(sublist) = named_lists.get(list_name) {
+                let (sub_matched, sub_data) =
+                    match_sender_list(sublist, sender_address, named_lists, host_checking);
+                if sub_matched {
+                    return if negated {
+                        (false, None)
+                    } else {
+                        (true, sub_data)
+                    };
+                }
+                continue;
+            }
+            // Unknown named list — skip
+            continue;
+        }
+
+        // Handle lookup patterns (lsearch;file, etc.)
+        if pattern.contains(';')
+            && (pattern.starts_with("lsearch")
+                || pattern.starts_with("dbm")
+                || pattern.starts_with("cdb")
+                || pattern.starts_with("dsearch")
+                || pattern.starts_with("nis"))
+        {
+            let lookup_data = lsearch_match(pattern, sender_address, true);
+            if lookup_data.is_some() {
+                return if negated {
+                    (false, None)
+                } else {
+                    (true, lookup_data)
+                };
+            }
+            continue;
+        }
+
+        // Standard pattern matching
+        if pattern.contains('@') {
+            // Pattern has @ — split and match local_part and domain separately
+            if let Some(pat_at) = pattern.rfind('@') {
+                let pat_local = &pattern[..pat_at];
+                let pat_domain = &pattern[pat_at + 1..];
+
+                let local_match = if pat_local == "*" {
+                    true
+                } else if pat_local.contains('*') || pat_local.contains('?') {
+                    wildcard_match(pat_local, sender_local, false) // caseful local part
+                } else {
+                    sender_local == pat_local
+                };
+
+                let domain_match = if pat_domain == "*" {
+                    true
+                } else {
+                    sender_domain.eq_ignore_ascii_case(pat_domain)
+                };
+
+                if local_match && domain_match {
+                    return if negated { (false, None) } else { (true, None) };
+                }
+            }
+        } else {
+            // Bare domain pattern (no @) — match against domain part only.
+            // In C Exim, a bare word in a sender list is matched against
+            // the domain of the sender address (case-insensitive).
+            if sender_domain.eq_ignore_ascii_case(pattern) {
+                return if negated { (false, None) } else { (true, None) };
+            }
+            // Also try wildcard domain match (e.g., *.example.com)
+            if (pattern.contains('*') || pattern.contains('?'))
+                && wildcard_match(pattern, sender_domain, true)
+            {
+                return if negated { (false, None) } else { (true, None) };
+            }
+        }
+    }
+
+    // End-of-list: if we saw any negated items, implicit match
+    // (same semantics as other list types)
+    if seen_negated {
+        (true, None)
+    } else {
+        (false, None)
+    }
 }
 
 /// - `csa_cache`: CSA verification result cache
@@ -2625,6 +3090,12 @@ pub fn acl_check_condition(
     sender_rate_period: &mut f64,
     client_ip: &str,
     sender_helo_name: &str,
+    host_checking: bool,
+    verify_recipient_cb: Option<&crate::engine::VerifyRecipientCallback>,
+    expand_ctx: &mut exim_expand::variables::ExpandContext,
+    cond_user_msg: &mut Option<String>,
+    cond_log_msg: &mut Option<String>,
+    sender_verify_failure: &mut Option<(String, String)>,
 ) -> Result<AclResult, AclConditionError> {
     debug!(
         condition = %condition.name(),
@@ -2647,15 +3118,28 @@ pub fn acl_check_condition(
         });
     }
 
-    // Expand the argument string if ACD_EXP is set
+    // Expand the argument string if ACD_EXP is set.
+    // CRITICAL: We use expand_string_with_context() so that variables set
+    // by previous conditions in the same ACL statement (e.g. $domain_data
+    // from a `domains = lsearch;file` condition) are visible during
+    // expansion of subsequent conditions (e.g. `local_parts = $domain_data`).
+    // The plain expand_string() reads from a separate thread-local context
+    // and would miss these per-statement variable updates.
     let expanded_arg = if def.flags.needs_expansion() && !arg.is_empty() {
         trace!(arg = %arg, "acl_check_condition: expanding argument");
-        match expand_string(arg) {
+        match exim_expand::expand_string_with_context(arg, expand_ctx) {
             Ok(expanded) => {
                 trace!(expanded = %expanded, "acl_check_condition: expansion result");
                 expanded
             }
-            Err(ExpandError::ForcedFail) => {
+            Err(ExpandError::ForcedFail) | Err(ExpandError::FailRequested { .. }) => {
+                // Both ForcedFail and FailRequested represent C Exim's
+                // `expand_string_forcedfail` — they differ only in whether
+                // the failure carries a descriptive message (FailRequested
+                // from `${if ...fail}`) or not (ForcedFail from direct
+                // `${fail}`).  In both cases the condition evaluates to
+                // FALSE (or TRUE when negated), matching C acl.c behaviour
+                // where forced-failure expansion skips the condition.
                 debug!("acl_check_condition: forced expansion failure");
                 return Ok(if negate {
                     AclResult::Ok
@@ -2797,20 +3281,28 @@ pub fn acl_check_condition(
 
         AclCondition::Domains => {
             // Match current recipient domain against domain list.
-            // ctx.domain is set by acl_check() when splitting the recipient
-            // address during RCPT/VRFY/PRDR phases.
+            // In C Exim, a successful lookup (e.g., `lsearch;file`) sets
+            // `$domain_data` to the lookup data portion (match.c + acl.c).
             let domain = &ctx.domain;
             trace!(pattern = %expanded_arg, domain = %domain, "checking domains");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                let matched = match_list(
+                // match_list_hdebug emits its own HDEBUG header
+                let (matched, _matched_pattern, lookup_data) = match_list_hdebug(
                     &expanded_arg,
                     domain,
-                    true, // domains are matched case-insensitively
+                    true,
                     &ctx.named_domain_lists,
+                    host_checking,
+                    0,
+                    &expanded_arg,
                 );
                 if matched {
+                    // Set $domain_data from lookup result
+                    if let Some(data) = lookup_data {
+                        expand_ctx.domain_data = data;
+                    }
                     Ok(AclResult::Ok)
                 } else {
                     Ok(AclResult::Fail)
@@ -2836,19 +3328,18 @@ pub fn acl_check_condition(
 
         AclCondition::Hosts => {
             // Match client host/IP against host list.
-            // In C Exim, this calls verify_check_this_host() which uses
-            // match_check_list() against sender_host_address.
-            // Empty list element matches only when sender_host_address is empty
-            // (local/pipe connection, not -bh simulated connections).
             trace!(pattern = %expanded_arg, client = %client_ip, "checking hosts");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                let matched = match_host_list(
+                // HDEBUG: "host in <list>?"
+                // match_host_list_hdebug → match_list_hdebug emits its own header
+                let matched = match_host_list_hdebug(
                     &expanded_arg,
                     client_ip,
                     sender_helo_name,
                     &ctx.named_host_lists,
+                    host_checking,
                 );
                 if matched {
                     Ok(AclResult::Ok)
@@ -2860,18 +3351,25 @@ pub fn acl_check_condition(
 
         AclCondition::LocalParts => {
             // Match current recipient local part against local-part list.
+            // In C Exim, a successful lookup sets `$local_part_data`.
             let local = &ctx.local_part;
             trace!(pattern = %expanded_arg, local_part = %local, "checking local_parts");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                let matched = match_list(
+                let (matched, _pat, lookup_data) = match_list_hdebug(
                     &expanded_arg,
                     local,
                     false, // local parts are case-sensitive by default
                     &ctx.named_local_part_lists,
+                    host_checking,
+                    0,
+                    &expanded_arg,
                 );
                 if matched {
+                    if let Some(data) = lookup_data {
+                        expand_ctx.local_part_data = data;
+                    }
                     Ok(AclResult::Ok)
                 } else {
                     Ok(AclResult::Fail)
@@ -2880,8 +3378,11 @@ pub fn acl_check_condition(
         }
 
         AclCondition::LogMessage => {
-            // Set custom log rejection message (modifier)
+            // Set custom log rejection message (modifier).
+            // In C Exim (acl.c ~line 4314), this sets `log_message`
+            // used for the log line on rejection.
             debug!(message = %expanded_arg, "acl_check_condition: setting log_message");
+            *cond_log_msg = Some(expanded_arg.clone());
             Ok(AclResult::Ok)
         }
 
@@ -2907,8 +3408,12 @@ pub fn acl_check_condition(
         }
 
         AclCondition::Message => {
-            // Set custom SMTP error message (modifier)
+            // Set custom SMTP error message (modifier).
+            // In C Exim (acl.c ~line 4310), this sets `user_message`
+            // which is then used by the SMTP layer for the rejection
+            // response when the verb evaluates to DENY/FAIL.
             debug!(message = %expanded_arg, "acl_check_condition: setting message");
+            *cond_user_msg = Some(expanded_arg.clone());
             Ok(AclResult::Ok)
         }
 
@@ -2978,19 +3483,26 @@ pub fn acl_check_condition(
 
         AclCondition::SenderDomains => {
             // Match sender domain part against domain list.
+            // In C Exim, a successful lookup sets `$sender_data`.
             let sender = &ctx.sender_address;
             let sender_domain = sender.rsplit('@').next().unwrap_or("");
             trace!(pattern = %expanded_arg, sender_domain = %sender_domain, "checking sender_domains");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                let matched = match_list(
+                let (matched, _pat, lookup_data) = match_list_hdebug(
                     &expanded_arg,
                     sender_domain,
                     true, // domains are case-insensitive
                     &ctx.named_domain_lists,
+                    host_checking,
+                    0,
+                    &expanded_arg,
                 );
                 if matched {
+                    if let Some(data) = lookup_data {
+                        expand_ctx.sender_data = data;
+                    }
                     Ok(AclResult::Ok)
                 } else {
                     Ok(AclResult::Fail)
@@ -3000,15 +3512,22 @@ pub fn acl_check_condition(
 
         AclCondition::Senders => {
             // Match envelope sender address against sender list.
-            // Uses ctx.sender_address populated from the SMTP session's
-            // MAIL FROM command.
+            // In C Exim, a successful lookup sets `$sender_data`.
             let sender = &ctx.sender_address;
             trace!(pattern = %expanded_arg, sender = %sender, "checking senders");
             if expanded_arg.is_empty() {
                 Ok(AclResult::Fail)
             } else {
-                let matched = match_sender_list(&expanded_arg, sender, &ctx.named_address_lists);
+                let (matched, lookup_data) = match_sender_list(
+                    &expanded_arg,
+                    sender,
+                    &ctx.named_address_lists,
+                    host_checking,
+                );
                 if matched {
+                    if let Some(data) = lookup_data {
+                        expand_ctx.sender_data = data;
+                    }
                     Ok(AclResult::Ok)
                 } else {
                     Ok(AclResult::Fail)
@@ -3068,6 +3587,11 @@ pub fn acl_check_condition(
                 csa_cache,
                 client_ip,
                 sender_helo_name,
+                verify_recipient_cb,
+                expand_ctx,
+                cond_user_msg,
+                cond_log_msg,
+                sender_verify_failure,
             )
         }
 

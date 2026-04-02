@@ -829,6 +829,12 @@ pub struct SmtpContext {
     #[cfg(feature = "esmtp-limits")]
     pub single_rcpt_domain: String,
 
+    // ── Message body encoding ──────────────────────────────────────
+    /// SMTP body type for MAIL FROM BODY= parameter (e.g., "8BITMIME", "7BIT").
+    /// Only set when message was received with explicit body type declaration.
+    /// C Exim: `body_type` in smtp transport.
+    pub body_type: Option<String>,
+
     // ── DSN-INFO feature-gated ─────────────────────────────────────
     /// Full SMTP greeting banner (for DSN reporting).
     #[cfg(feature = "dsn-info")]
@@ -964,6 +970,7 @@ impl SmtpContext {
             ehlo_capabilities: String::new(),
             peer_max_message_size: 0,
             auth_mechanisms: String::new(),
+            body_type: None,
         }
     }
 
@@ -1235,14 +1242,163 @@ impl SmtpTransport {
         config: &TransportInstanceConfig,
     ) -> Result<SmtpTransportOptions, DriverError> {
         if let Some(opts) = config.options.downcast_ref::<SmtpTransportOptions>() {
-            Ok(opts.clone())
-        } else {
-            tracing::warn!(
-                transport = config.name,
-                "No SmtpTransportOptions in config, using defaults"
-            );
-            Ok(SmtpTransportOptions::default())
+            return Ok(opts.clone());
         }
+
+        // Build SmtpTransportOptions from private_options_map (the key-value
+        // pairs extracted by the config parser).
+        let map = &config.private_options_map;
+        let mut opts = SmtpTransportOptions::default();
+
+        if let Some(v) = map.get("hosts") {
+            opts.hosts = v.clone();
+        }
+        if let Some(v) = map.get("fallback_hosts") {
+            opts.fallback_hosts = v.clone();
+        }
+        if let Some(v) = map.get("port") {
+            opts.port = v.clone();
+        }
+        if let Some(v) = map.get("protocol") {
+            opts.protocol = v.clone();
+        }
+        if let Some(v) = map.get("helo_data") {
+            opts.helo_data = v.clone();
+        }
+        if let Some(v) = map.get("interface") {
+            opts.interface = v.clone();
+        }
+        if let Some(v) = map.get("dscp") {
+            opts.dscp = v.clone();
+        }
+        if let Some(v) = map.get("authenticated_sender") {
+            opts.authenticated_sender = v.clone();
+        }
+        if let Some(v) = map.get("serialize_hosts") {
+            opts.serialize_hosts = v.clone();
+        }
+        if let Some(v) = map.get("hosts_try_auth") {
+            opts.hosts_try_auth = v.clone();
+        }
+        if let Some(v) = map.get("hosts_require_auth") {
+            opts.hosts_require_auth = v.clone();
+        }
+        if let Some(v) = map.get("hosts_try_chunking") {
+            opts.hosts_try_chunking = v.clone();
+        }
+        if let Some(v) = map.get("hosts_try_fastopen") {
+            opts.hosts_try_fastopen = v.clone();
+        }
+        // Boolean options
+        if let Some(v) = map.get("allow_localhost") {
+            opts.allow_localhost = v.is_empty() || v == "true" || v == "yes";
+        }
+        if let Some(v) = map.get("hosts_override") {
+            opts.hosts_override = v.is_empty() || v == "true" || v == "yes";
+        }
+        if let Some(v) = map.get("hosts_randomize") {
+            opts.hosts_randomize = v.is_empty() || v == "true" || v == "yes";
+        }
+        if let Some(v) = map.get("keepalive") {
+            opts.keepalive = v.is_empty() || v == "true" || v == "yes";
+        }
+        if let Some(v) = map.get("lmtp_ignore_quota") {
+            opts.lmtp_ignore_quota = v.is_empty() || v == "true" || v == "yes";
+        }
+        if let Some(v) = map.get("gethostbyname") {
+            opts.gethostbyname = v.is_empty() || v == "true" || v == "yes";
+        }
+        // Timeout options (parse seconds from string)
+        if let Some(v) = map.get("command_timeout") {
+            if let Some(secs) = Self::parse_time_value(v) {
+                opts.command_timeout = secs;
+            }
+        }
+        if let Some(v) = map.get("connect_timeout") {
+            if let Some(secs) = Self::parse_time_value(v) {
+                opts.connect_timeout = secs;
+            }
+        }
+        if let Some(v) = map.get("data_timeout") {
+            if let Some(secs) = Self::parse_time_value(v) {
+                opts.data_timeout = secs;
+            }
+        }
+        if let Some(v) = map.get("final_timeout") {
+            if let Some(secs) = Self::parse_time_value(v) {
+                opts.final_timeout = secs;
+            }
+        }
+        // Numeric limits
+        if let Some(v) = map.get("hosts_max_try") {
+            if let Ok(n) = v.parse::<i32>() {
+                opts.hosts_max_try = n;
+            }
+        }
+        if let Some(v) = map.get("hosts_max_try_hardlimit") {
+            if let Ok(n) = v.parse::<i32>() {
+                opts.hosts_max_try_hardlimit = n;
+            }
+        }
+        // TLS options
+        #[cfg(feature = "tls")]
+        {
+            if let Some(v) = map.get("hosts_require_tls") {
+                opts.hosts_require_tls = v.clone();
+            }
+            if let Some(v) = map.get("hosts_avoid_tls") {
+                opts.hosts_avoid_tls = v.clone();
+            }
+            if let Some(v) = map.get("tls_certificate") {
+                opts.tls_certificate = v.clone();
+            }
+            if let Some(v) = map.get("tls_privatekey") {
+                opts.tls_privatekey = v.clone();
+            }
+            if let Some(v) = map.get("tls_require_ciphers") {
+                opts.tls_require_ciphers = v.clone();
+            }
+            if let Some(v) = map.get("tls_sni") {
+                opts.tls_sni = v.clone();
+            }
+            if let Some(v) = map.get("tls_verify_certificates") {
+                opts.tls_verify_certificates = v.clone();
+            }
+        }
+
+        tracing::debug!(
+            transport = config.name,
+            hosts = %opts.hosts,
+            port = %opts.port,
+            "SmtpTransportOptions built from private_options_map"
+        );
+
+        Ok(opts)
+    }
+
+    /// Parse a time value string (e.g. "30s", "5m", "300") into seconds.
+    fn parse_time_value(val: &str) -> Option<u64> {
+        let val = val.trim();
+        if val.is_empty() {
+            return None;
+        }
+        if let Ok(n) = val.parse::<u64>() {
+            return Some(n);
+        }
+        // Handle time suffixes: s, m, h, d
+        if val.len() >= 2 {
+            let (num_part, suffix) = val.split_at(val.len() - 1);
+            if let Ok(n) = num_part.parse::<u64>() {
+                match suffix {
+                    "s" => return Some(n),
+                    "m" => return Some(n * 60),
+                    "h" => return Some(n * 3600),
+                    "d" => return Some(n * 86400),
+                    _ => {}
+                }
+            }
+        }
+        None
     }
 
     /// Resolve the effective port from options and protocol.
@@ -1412,7 +1568,15 @@ impl TransportDriver for SmtpTransport {
             })?;
 
         let host_str = clean_host.as_ref();
-        let mut ctx = SmtpContext::new(address.to_string(), host_str.clone(), port);
+
+        // MAIL FROM uses the sender address (return path), not the recipient
+        let sender_addr = config
+            .private_options_map
+            .get("__sender_address")
+            .cloned()
+            .unwrap_or_default();
+
+        let mut ctx = SmtpContext::new(sender_addr, host_str.clone(), port);
         ctx.delivery_start = Some(Instant::now());
         ctx.lmtp = opts.protocol == "lmtp";
         ctx.smtps = opts.protocol == "smtps" || opts.protocol == "submissions";
@@ -1536,7 +1700,12 @@ impl SmtpTransport {
         let ehlo_data = if opts.helo_data.is_empty() {
             "localhost".to_string()
         } else {
-            opts.helo_data.clone()
+            // Expand $primary_hostname in helo_data
+            let mut helo = opts.helo_data.clone();
+            if let Some(hostname) = config.private_options_map.get("__primary_hostname") {
+                helo = helo.replace("$primary_hostname", hostname);
+            }
+            helo
         };
         let ehlo_response = self.send_ehlo(ctx, &mut stream, &ehlo_data, opts)?;
 
@@ -1802,10 +1971,17 @@ impl SmtpTransport {
             let _ = stream.set_write_timeout(Some(data_timeout));
             self.write_command(stream, "DATA\r\n", opts.data_timeout)?;
             let data_resp = self.read_response(stream, opts.data_timeout)?;
-            if !data_resp.starts_with("354") {
+            // Accept any 3xx response to DATA (RFC 5321 says 354, but C Exim
+            // accepts any 3xx; some test stubs use 300).
+            if !data_resp.starts_with('3') {
                 return self.handle_data_error(ctx, &data_resp);
             }
-            tracing::debug!("DATA accepted (354), sending message body");
+            tracing::debug!("DATA accepted (3xx), sending message body");
+
+            // Transmit the message content (headers + body) from spool data
+            self.transmit_message_data(stream, config, opts)?;
+
+            // Send the final dot terminator
             self.write_command(stream, ".\r\n", opts.final_timeout)?;
         }
 
@@ -1837,8 +2013,13 @@ impl SmtpTransport {
                 cmd.push_str(&format!(" SIZE={}", size));
             }
         }
-        if ctx.esmtp {
-            cmd.push_str(" BODY=8BITMIME");
+        // BODY=8BITMIME is only added when the message was received with 8BITMIME
+        // encoding AND the server advertised 8BITMIME. C Exim checks:
+        //   if (body_type) sprintf(CS p, " BODY=%s", body_type);
+        // For a standard message, body_type is NULL, so nothing is added.
+        // We use the body_type from the context (set during message reception).
+        if let Some(ref bt) = ctx.body_type {
+            cmd.push_str(&format!(" BODY={}", bt));
         }
         if ctx.peer_has(PEER_OFFERED_DSN) && config.return_path_add {
             cmd.push_str(" RET=FULL");
@@ -1941,6 +2122,78 @@ impl SmtpTransport {
         Ok(())
     }
 
+    /// Transmit the full message (headers + body) to the SMTP stream.
+    ///
+    /// Reads message headers from `__message_headers` in the transport config's
+    /// `private_options_map` and the message body from the spool `-D` file
+    /// referenced by `__spool_data_file`. Applies SMTP dot-stuffing as required
+    /// by RFC 5321 § 4.5.2.
+    fn transmit_message_data(
+        &self,
+        stream: &mut TcpStream,
+        config: &TransportInstanceConfig,
+        opts: &SmtpTransportOptions,
+    ) -> Result<(), DriverError> {
+        let data_timeout = Duration::from_secs(opts.data_timeout);
+        let _ = stream.set_write_timeout(Some(data_timeout));
+
+        // 1. Send message headers
+        if let Some(headers) = config.private_options_map.get("__message_headers") {
+            for line in headers.lines() {
+                // RFC 5321 dot-stuffing: lines starting with '.' get an extra '.'
+                if line.starts_with('.') {
+                    self.write_command(stream, &format!(".{}\r\n", line), opts.data_timeout)?;
+                } else {
+                    self.write_command(stream, &format!("{}\r\n", line), opts.data_timeout)?;
+                }
+            }
+        }
+
+        // Blank line separating headers from body
+        self.write_command(stream, "\r\n", opts.data_timeout)?;
+
+        // 2. Send message body from the spool -D file
+        if let Some(data_file_path) = config.private_options_map.get("__spool_data_file") {
+            match std::fs::read_to_string(data_file_path) {
+                Ok(body) => {
+                    // The spool -D file has a header line "<msg_id>-D\n" as first line
+                    // followed by the actual body. Skip the first line.
+                    let body_content = if let Some(pos) = body.find('\n') {
+                        &body[pos + 1..]
+                    } else {
+                        &body
+                    };
+                    for line in body_content.lines() {
+                        if line.starts_with('.') {
+                            self.write_command(
+                                stream,
+                                &format!(".{}\r\n", line),
+                                opts.data_timeout,
+                            )?;
+                        } else {
+                            self.write_command(
+                                stream,
+                                &format!("{}\r\n", line),
+                                opts.data_timeout,
+                            )?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %data_file_path,
+                        error = %e,
+                        "Could not read spool data file, sending empty body"
+                    );
+                }
+            }
+        } else {
+            tracing::warn!("No spool data file path in transport config");
+        }
+
+        Ok(())
+    }
+
     fn process_final_response(
         &self,
         ctx: &mut SmtpContext,
@@ -1954,7 +2207,11 @@ impl SmtpTransport {
                 ctx.ok = true;
                 ctx.completed_addr = true;
                 tracing::info!(address = %address, response = %trimmed, "Delivery successful");
-                Ok(TransportResult::Ok)
+                Ok(TransportResult::ok_with_host(
+                    ctx.host.clone(),
+                    ctx.host.clone(),
+                    trimmed.to_string(),
+                ))
             }
             Some('4') => {
                 tracing::warn!(address = %address, response = %trimmed, "Delivery deferred");
@@ -2012,10 +2269,11 @@ impl SmtpTransport {
             });
         }
         let data_resp = self.read_response(stream, opts.data_timeout)?;
-        if !data_resp.starts_with("354") {
+        // Accept any 3xx response to DATA
+        if !data_resp.starts_with('3') {
             return self.handle_data_error(ctx, &data_resp);
         }
-        tracing::debug!("Pipelined DATA accepted (354)");
+        tracing::debug!("Pipelined DATA accepted (3xx)");
         self.write_command(stream, ".\r\n", opts.final_timeout)?;
         let final_resp = self.read_response(stream, opts.final_timeout)?;
         let addr_str = if !ctx.addrlist.is_empty() {

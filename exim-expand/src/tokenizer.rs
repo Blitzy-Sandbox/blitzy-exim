@@ -95,7 +95,12 @@ const ITEM_KEYWORDS: &[&str] = &[
 /// classifying identifiers inside `${…}`.
 const OP_UNDERSCORE_KEYWORDS: &[&str] = &[
     "from_utf8",
+    "listnamed_a",
+    "listnamed_d",
+    "listnamed_h",
+    "listnamed_l",
     "local_part",
+    "mask_n",
     "quote_local_part",
     "reverse_ip",
     "time_eval",
@@ -314,7 +319,7 @@ pub enum Token {
     /// - `nhash_N` or `nhash_N_M` — numeric hash
     ///
     /// Fields: (operator_base_name, param1, optional_param2)
-    ParametricOperator(String, u64, Option<u64>),
+    ParametricOperator(String, i64, Option<i64>),
 
     /// A recognised condition keyword (e.g. `match`, `eq`, `exists`).
     ConditionKeyword(String),
@@ -454,6 +459,11 @@ pub struct Tokenizer<'a> {
     /// Internal scan context determining how the next characters are
     /// interpreted.
     context: ScanContext,
+    /// Set when a header variable name consumed characters that look
+    /// like expression syntax (e.g. `}`, `{`), indicating the header
+    /// name was probably not terminated by a colon.  Mirrors C Exim's
+    /// `malformed_header` flag (expand.c line 868).
+    pub malformed_header: bool,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -474,6 +484,7 @@ impl<'a> Tokenizer<'a> {
             position: 0,
             brace_depth: 0,
             context: ScanContext::Normal,
+            malformed_header: false,
         }
     }
 
@@ -598,12 +609,72 @@ impl<'a> Tokenizer<'a> {
                 if ch.is_ascii_alphabetic() || ch == '_' {
                     // Bare $variable — read identifier as variable name
                     let start = self.position;
-                    let name = self.read_identifier();
+                    let mut name = self.read_identifier();
+
+                    // In C Exim, bare header references use a colon as
+                    // the name terminator: $h_subject: — the colon is
+                    // consumed and NOT echoed.  Detect header prefixes
+                    // and silently eat the trailing colon.
+                    //
+                    // CRITICAL: C Exim's read_header_name() (expand.c
+                    // line 1156) uses `mac_isgraph(*s) && *s != ':'` to
+                    // continue reading, which means graphic characters
+                    // like `}`, `{`, `=`, etc. are consumed into the
+                    // header name when the colon is missing.  This is
+                    // how C Exim detects `$h_foo}` as a likely mistake:
+                    // the `}` is eaten, causing a downstream "missing }"
+                    // error with the hint "could be header name not
+                    // terminated by colon".
+                    let lc = name.to_ascii_lowercase();
+                    let is_header_prefix = lc.starts_with("h_")
+                        || lc.starts_with("header_")
+                        || lc.starts_with("rh_")
+                        || lc.starts_with("rheader_")
+                        || lc.starts_with("bh_")
+                        || lc.starts_with("bheader_")
+                        || lc.starts_with("lh_")
+                        || lc.starts_with("lheader_");
+                    if is_header_prefix {
+                        if self.peek() == Some(':') {
+                            self.advance(); // consume the colon
+                        } else {
+                            // No colon after header prefix — match C
+                            // Exim's read_header_name() which continues
+                            // reading graphic (printable, non-space)
+                            // characters.  This intentionally consumes
+                            // braces etc., triggering parse errors
+                            // downstream.
+                            while let Some(c) = self.peek() {
+                                if c == ':' || c.is_ascii_whitespace() || !c.is_ascii_graphic() {
+                                    break;
+                                }
+                                if c == '}' || c == '{' {
+                                    // C Exim (expand.c line 2710/4927):
+                                    // if name contains '}', set
+                                    // malformed_header = TRUE
+                                    self.malformed_header = true;
+                                }
+                                name.push(c);
+                                self.advance();
+                            }
+                            // C also consumes the colon if eventually
+                            // found, and always appends ':' to the name.
+                            if self.peek() == Some(':') {
+                                self.advance();
+                            }
+                        }
+                    }
+
                     return Ok(self.make_spanned(Token::Identifier(name), start));
                 }
                 if ch.is_ascii_digit() {
-                    // Numeric variable reference $1..$9
-                    // (expand.c lines 4973-4984)
+                    // Numeric variable reference $<digits>.
+                    //
+                    // C Exim (expand.c line 4976) calls read_cnumber()
+                    // which reads ALL consecutive digits.  $11111 reads
+                    // all five digits, producing the number 11111.  Only
+                    // values 0..expand_nmax yield a non-empty result;
+                    // out-of-range values silently resolve to empty.
                     let start = self.position;
                     let digits = self.read_digits();
                     return Ok(self.make_spanned(Token::Identifier(digits), start));
@@ -630,7 +701,8 @@ impl<'a> Tokenizer<'a> {
                     let start = self.position;
                     let name = self.read_identifier_extended();
                     let token =
-                        Self::classify_identifier(&name, IdentifierContext::BraceExpression);
+                        Self::classify_identifier(&name, IdentifierContext::BraceExpression)
+                            .map_err(|msg| ExpandError::Failed { message: msg })?;
                     return Ok(self.make_spanned(token, start));
                 }
                 if ch.is_ascii_digit() {
@@ -693,6 +765,7 @@ impl<'a> Tokenizer<'a> {
             position: self.position,
             brace_depth: self.brace_depth,
             context: self.context,
+            malformed_header: self.malformed_header,
         };
         Ok(clone.next_token()?.token)
     }
@@ -711,10 +784,17 @@ impl<'a> Tokenizer<'a> {
     /// The identifier string.  Returns an empty string if the current
     /// position does not contain identifier characters.
     pub fn read_identifier(&mut self) -> String {
+        // C Exim uses a fixed 256-byte buffer for `read_name()` (expand.c
+        // line 1115-1127).  Variable/operator names longer than 255
+        // characters are silently truncated.  We match this limit to
+        // produce identical error messages for very long names.
+        const NAME_MAX: usize = 255;
         let mut ident = String::new();
         while let Some(ch) = self.peek() {
             if ch.is_ascii_alphanumeric() || ch == '_' {
-                ident.push(ch);
+                if ident.len() < NAME_MAX {
+                    ident.push(ch);
+                }
                 self.advance();
             } else {
                 break;
@@ -730,10 +810,13 @@ impl<'a> Tokenizer<'a> {
     /// potential future keywords and allow identifiers like
     /// compound names in extensions.
     fn read_identifier_extended(&mut self) -> String {
+        const NAME_MAX: usize = 255;
         let mut ident = String::new();
         while let Some(ch) = self.peek() {
             if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ident.push(ch);
+                if ident.len() < NAME_MAX {
+                    ident.push(ch);
+                }
                 self.advance();
             } else {
                 break;
@@ -786,20 +869,31 @@ impl<'a> Tokenizer<'a> {
     /// # Returns
     ///
     /// The appropriate [`Token`] variant for the classified identifier.
-    pub fn classify_identifier(name: &str, context: IdentifierContext) -> Token {
+    pub fn classify_identifier(name: &str, context: IdentifierContext) -> Result<Token, String> {
         match context {
             IdentifierContext::BraceExpression => {
                 // Search item table first (expand.c line 5026)
                 if keyword_lookup(name, ITEM_KEYWORDS) {
-                    return Token::ItemKeyword(name.to_owned());
+                    return Ok(Token::ItemKeyword(name.to_owned()));
                 }
                 // Then underscore-containing operators (expand.c line 7274)
                 if keyword_lookup(name, OP_UNDERSCORE_KEYWORDS) {
-                    return Token::OperatorKeyword(name.to_owned());
+                    return Ok(Token::OperatorKeyword(name.to_owned()));
                 }
                 // Then main operator table (expand.c line 7288)
                 if keyword_lookup(name, OP_MAIN_KEYWORDS) {
-                    return Token::OperatorKeyword(name.to_owned());
+                    return Ok(Token::OperatorKeyword(name.to_owned()));
+                }
+                // Check for quote_TYPE pattern — lookup-type-specific quoting.
+                // In C Exim the `quote` operator checks for a `_<type>` suffix
+                // at parse time.  Our parser handles this via
+                // `operator_name_to_kind`, but the tokenizer must first
+                // classify `quote_<type>` as an OperatorKeyword so that the
+                // parser path is reached.  `quote_local_part` is already
+                // covered by OP_UNDERSCORE_KEYWORDS; this catches any other
+                // `quote_*` form (e.g. `quote_lsearch`, `quote_dbm`).
+                if name.starts_with("quote_") {
+                    return Ok(Token::OperatorKeyword(name.to_owned()));
                 }
                 // Check for parametric operator forms with embedded numeric
                 // arguments (C Exim's underscore syntax).
@@ -816,22 +910,27 @@ impl<'a> Tokenizer<'a> {
                 // and then scanning for _N or _N_M suffixes. We replicate
                 // this by checking if the identifier starts with a known
                 // parametric operator base name followed by _<digits>.
-                if let Some(token) = try_parametric_operator(name) {
-                    return token;
+                match try_parametric_operator(name) {
+                    Ok(Some(token)) => return Ok(token),
+                    Err(msg) => {
+                        // C Exim: "non-digit after underscore in ..."
+                        return Err(msg);
+                    }
+                    Ok(None) => {}
                 }
                 // Not a keyword — treat as a variable name in braced form
-                Token::Identifier(name.to_owned())
+                Ok(Token::Identifier(name.to_owned()))
             }
             IdentifierContext::Condition => {
                 if keyword_lookup(name, COND_KEYWORDS) {
-                    Token::ConditionKeyword(name.to_owned())
+                    Ok(Token::ConditionKeyword(name.to_owned()))
                 } else {
-                    Token::Identifier(name.to_owned())
+                    Ok(Token::Identifier(name.to_owned()))
                 }
             }
             IdentifierContext::Variable => {
                 // Bare $variable — no keyword classification
-                Token::Identifier(name.to_owned())
+                Ok(Token::Identifier(name.to_owned()))
             }
         }
     }
@@ -1094,28 +1193,36 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Peek at the current character without consuming it.
+    ///
+    /// Reads a *char* from the input string at the current byte
+    /// position.  This is char-aware so that Latin-1-encoded high
+    /// bytes (each byte 0x80..0xFF stored as U+0080..U+00FF in the
+    /// Rust String) are returned as a single char whose value equals
+    /// the original byte value — matching C Exim's byte-level
+    /// `*s` dereference.
     #[inline]
     fn peek(&self) -> Option<char> {
-        self.input.as_bytes().get(self.position).map(|&b| b as char)
+        self.input[self.position..].chars().next()
     }
 
     /// Peek at a character at the given offset from the current position.
+    ///
+    /// `offset` is measured in *characters*, not bytes.
     #[inline]
     fn peek_at(&self, offset: usize) -> Option<char> {
-        self.input
-            .as_bytes()
-            .get(self.position + offset)
-            .map(|&b| b as char)
+        self.input[self.position..].chars().nth(offset)
     }
 
     /// Consume the current character and advance the position.
     ///
     /// Returns the consumed character, or `None` if at end of input.
+    /// The position is advanced by the character's UTF-8 byte length
+    /// so that it always sits on a char boundary.
     #[inline]
     fn advance(&mut self) -> Option<char> {
-        if self.position < self.input.len() {
-            let ch = self.input.as_bytes()[self.position] as char;
-            self.position += 1;
+        let mut iter = self.input[self.position..].chars();
+        if let Some(ch) = iter.next() {
+            self.position += ch.len_utf8();
             Some(ch)
         } else {
             None
@@ -1177,7 +1284,19 @@ fn keyword_lookup(name: &str, table: &[&str]) -> bool {
 /// - `length` — first N characters
 /// - `nhash` — numeric hash to N (or N_M)
 /// - `substr` — substring from position N, length M
-const PARAMETRIC_OPERATOR_BASES: &[&str] = &["hash", "length", "nhash", "substr"];
+const PARAMETRIC_OPERATOR_BASES: &[&str] = &[
+    "hash",
+    "headerwrap",
+    "length",
+    "mask",
+    "nhash",
+    "substr",
+    // Short aliases (C Exim op_table_underscore single-char entries)
+    "h",
+    "l",
+    "nh",
+    "s",
+];
 
 /// Try to parse an identifier as a parametric operator with embedded
 /// numeric arguments.
@@ -1197,31 +1316,37 @@ const PARAMETRIC_OPERATOR_BASES: &[&str] = &["hash", "length", "nhash", "substr"
 /// "length_abc"  → None (non-numeric suffix)
 /// "foo_5"       → None (unknown base)
 /// ```
-fn try_parametric_operator(name: &str) -> Option<Token> {
+fn try_parametric_operator(name: &str) -> Result<Option<Token>, String> {
     for &base in PARAMETRIC_OPERATOR_BASES {
         if let Some(suffix) = name.strip_prefix(base) {
-            // Suffix must start with '_' followed by digits.
+            // Suffix must start with '_' followed by optional '-' and digits.
             if let Some(rest) = suffix.strip_prefix('_') {
                 if rest.is_empty() {
-                    continue; // e.g. "length_" with nothing after
+                    // e.g. "length_" — non-digit after underscore
+                    return Err(format!("non-digit after underscore in \"{}\"", name));
                 }
-                // Split on the next underscore for two-param form.
-                if let Some(underscore_pos) = rest.find('_') {
+                // Try to find the second underscore for two-param form.
+                let search_start = if rest.starts_with('-') { 1 } else { 0 };
+                if let Some(rel_pos) = rest[search_start..].find('_') {
+                    let underscore_pos = search_start + rel_pos;
                     let first_part = &rest[..underscore_pos];
                     let second_part = &rest[underscore_pos + 1..];
-                    if let (Ok(n), Ok(m)) = (first_part.parse::<u64>(), second_part.parse::<u64>())
+                    if let (Ok(n), Ok(m)) = (first_part.parse::<i64>(), second_part.parse::<i64>())
                     {
-                        return Some(Token::ParametricOperator(base.to_owned(), n, Some(m)));
+                        return Ok(Some(Token::ParametricOperator(base.to_owned(), n, Some(m))));
                     }
-                    // If second part isn't numeric, fall through.
-                } else if let Ok(n) = rest.parse::<u64>() {
+                    // Non-digit after underscore in parametric form
+                    return Err(format!("non-digit after underscore in \"{}\"", name));
+                } else if let Ok(n) = rest.parse::<i64>() {
                     // Single-param form: base_N
-                    return Some(Token::ParametricOperator(base.to_owned(), n, None));
+                    return Ok(Some(Token::ParametricOperator(base.to_owned(), n, None)));
                 }
+                // Non-digit after underscore
+                return Err(format!("non-digit after underscore in \"{}\"", name));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Convert a hex digit character to its numeric value (0-15).
@@ -1473,38 +1598,43 @@ mod tests {
 
     #[test]
     fn test_classify_item_keyword() {
-        let token = Tokenizer::classify_identifier("lookup", IdentifierContext::BraceExpression);
+        let token =
+            Tokenizer::classify_identifier("lookup", IdentifierContext::BraceExpression).unwrap();
         assert_eq!(token, Token::ItemKeyword("lookup".into()));
     }
 
     #[test]
     fn test_classify_operator_keyword() {
-        let token = Tokenizer::classify_identifier("md5", IdentifierContext::BraceExpression);
+        let token =
+            Tokenizer::classify_identifier("md5", IdentifierContext::BraceExpression).unwrap();
         assert_eq!(token, Token::OperatorKeyword("md5".into()));
     }
 
     #[test]
     fn test_classify_underscore_operator() {
         let token =
-            Tokenizer::classify_identifier("local_part", IdentifierContext::BraceExpression);
+            Tokenizer::classify_identifier("local_part", IdentifierContext::BraceExpression)
+                .unwrap();
         assert_eq!(token, Token::OperatorKeyword("local_part".into()));
     }
 
     #[test]
     fn test_classify_condition_keyword() {
-        let token = Tokenizer::classify_identifier("eq", IdentifierContext::Condition);
+        let token = Tokenizer::classify_identifier("eq", IdentifierContext::Condition).unwrap();
         assert_eq!(token, Token::ConditionKeyword("eq".into()));
     }
 
     #[test]
     fn test_classify_variable() {
-        let token = Tokenizer::classify_identifier("sender_address", IdentifierContext::Variable);
+        let token =
+            Tokenizer::classify_identifier("sender_address", IdentifierContext::Variable).unwrap();
         assert_eq!(token, Token::Identifier("sender_address".into()));
     }
 
     #[test]
     fn test_classify_unknown_in_brace() {
-        let token = Tokenizer::classify_identifier("myvar", IdentifierContext::BraceExpression);
+        let token =
+            Tokenizer::classify_identifier("myvar", IdentifierContext::BraceExpression).unwrap();
         assert_eq!(token, Token::Identifier("myvar".into()));
     }
 
@@ -1571,7 +1701,7 @@ mod tests {
     #[test]
     fn test_all_condition_keywords_recognised() {
         for &kw in COND_KEYWORDS {
-            let token = Tokenizer::classify_identifier(kw, IdentifierContext::Condition);
+            let token = Tokenizer::classify_identifier(kw, IdentifierContext::Condition).unwrap();
             assert_eq!(
                 token,
                 Token::ConditionKeyword(kw.to_owned()),
@@ -1585,7 +1715,8 @@ mod tests {
     #[test]
     fn test_all_item_keywords_recognised() {
         for &kw in ITEM_KEYWORDS {
-            let token = Tokenizer::classify_identifier(kw, IdentifierContext::BraceExpression);
+            let token =
+                Tokenizer::classify_identifier(kw, IdentifierContext::BraceExpression).unwrap();
             assert_eq!(
                 token,
                 Token::ItemKeyword(kw.to_owned()),

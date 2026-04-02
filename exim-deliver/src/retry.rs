@@ -2002,6 +2002,9 @@ mod tests {
             unique: "test@example.com".to_string(),
             parent_index: -1,
             children: vec![],
+            prefix: None,
+            suffix: None,
+            onetime_parent: None,
         }
     }
 

@@ -47,7 +47,7 @@ mod signal;
 // Imports — Sibling modules
 // =============================================================================
 
-use context::{ConfigContext, MessageContext, RecipientItem, ServerContext};
+use context::{ConfigContext, ServerContext};
 
 use cli::{DeliveryMode, EximMode, QueueRunConfig};
 
@@ -106,7 +106,7 @@ const EXIM_GROUPNAME: &str = "exim";
 ///
 /// Overridable at runtime via the `EXIM_TRUSTED_CONFIG_LIST` environment
 /// variable for build-system flexibility.
-const TRUSTED_CONFIG_LIST: &str = "";
+const TRUSTED_CONFIG_LIST: &str = "/etc/exim/trusted_configs";
 
 /// Pattern for matching Exim message IDs (both old 16-char and new 23-char).
 const EXIM_MESSAGE_ID_REGEX: &str = r"^[0-9A-Za-z]{6}-[0-9A-Za-z]{6,11}-[0-9A-Za-z]{2,4}$";
@@ -153,25 +153,19 @@ fn main() -> ExitCode {
     }
 
     // Step 2: Initialise tracing subscriber.
-    // - Output goes to stderr (never stdout) to avoid polluting parseable
-    //   output from -bV, -bP, -be, -bp, -bs, and the test harness.
-    // - Only enabled when -d debug flag is specified, matching C Exim's
-    //   behaviour where debug output is suppressed unless explicitly
-    //   requested.
-    // - ANSI colour codes are disabled for clean machine-parseable output.
-    if cli_args.debug_selector.is_some() {
-        use tracing_subscriber::fmt;
-        use tracing_subscriber::EnvFilter;
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-        fmt::fmt()
-            .with_writer(std::io::stderr)
-            .with_ansi(false)
-            .with_env_filter(filter)
-            .init();
-    } else {
-        // No -d flag: install a minimal subscriber that discards all
-        // tracing events.  This prevents any tracing output from
-        // reaching stdout or stderr in normal operation.
+    //
+    // The tracing subscriber is ALWAYS set to "off".  C Exim's debug
+    // output (-d flag) uses direct debug_printf() calls that write to
+    // stderr in a specific format expected by the test harness.  The
+    // Rust port replicates that behaviour via explicit eprint!()/
+    // eprintln!() calls in the expansion engine, ACL evaluator, etc.
+    //
+    // The tracing framework's structured output (timestamps, level
+    // labels, spans) is NOT compatible with the expected debug format
+    // and would cause test harness comparison failures.  We install a
+    // no-op subscriber to satisfy any tracing::debug!() etc. calls
+    // elsewhere in the codebase without producing output.
+    {
         use tracing_subscriber::fmt;
         use tracing_subscriber::EnvFilter;
         let filter = EnvFilter::new("off");
@@ -180,6 +174,17 @@ fn main() -> ExitCode {
             .with_ansi(false)
             .with_env_filter(filter)
             .init();
+    }
+
+    // Set umask to zero so that files Exim creates via open() have
+    // exactly the permissions specified in the mode parameter.
+    // C Exim does this at exim.c line 2096; without it, the process
+    // umask (typically 022) would strip group/other write bits from
+    // log files, preventing the setuid exim binary from appending to
+    // mainlog files originally created by the root process.
+    #[cfg(unix)]
+    {
+        nix::sys::stat::umask(nix::sys::stat::Mode::empty());
     }
 
     // Step 3 (moved up): symlink invocation already detected above.
@@ -214,14 +219,12 @@ fn main() -> ExitCode {
     exim_drivers::DriverRegistry::init();
 
     // Step 10: Handle early-exit modes that don't need configuration.
-    match &mode {
-        EximMode::Version => {
-            return modes::version_mode();
-        }
-        EximMode::Info { info_type } => {
-            return modes::info_mode(*info_type);
-        }
-        _ => {}
+    // NOTE: EximMode::Version is NOT handled here — in C Exim, `-bV` parses
+    // the configuration first (and can fail with a config error), then prints
+    // the version info.  We replicate that by letting Version fall through to
+    // config parsing below.
+    if let EximMode::Info { info_type } = &mode {
+        return modes::info_mode(*info_type);
     }
 
     // Step 11: Determine the configuration file path.
@@ -239,15 +242,25 @@ fn main() -> ExitCode {
     //   b) parse_rest() → Arc<Config> for ACLs, drivers, etc.
     let macro_defs: &[(String, String)] = &cli_args.macro_defs;
 
-    let (mut parsed_config, mut parser_state) =
-        match exim_config::parse_main_config(&config_file_path, None, macro_defs) {
-            Ok(result) => result,
-            Err(e) => {
-                error!(error = %e, "failed to parse main configuration");
-                eprintln!("Exim configuration error: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    // C Exim readconf.c:984 — when both debug mode (D_any) and expansion
+    // test mode (-be) are active, macro expansions print
+    // `macro 'NAME' -> 'VALUE'` to stdout during config parsing.
+    let expansion_test_debug =
+        matches!(mode, EximMode::ExpansionTest { .. }) && cli_args.debug_selector.is_some();
+
+    let (mut parsed_config, mut parser_state) = match exim_config::parse_main_config_with_debug(
+        &config_file_path,
+        None,
+        macro_defs,
+        expansion_test_debug,
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            error!(error = %e, "failed to parse main configuration");
+            print_config_error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Populate exim_uid / exim_gid from the resolved server context so that
     // `-bP exim_user` / `-bP exim_group` print the correct values (C parity).
@@ -267,7 +280,7 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(e) => {
             error!(error = %e, "failed to parse configuration sections");
-            eprintln!("Exim configuration error in begin sections: {e}");
+            print_config_error(&e);
             return ExitCode::FAILURE;
         }
     };
@@ -420,6 +433,7 @@ fn dispatch_mode(
             server_ctx,
             frozen_config,
             &config_ctx.config_filename.to_string_lossy(),
+            cli_args,
         ),
 
         // ── Filter Testing ──────────────────────────────────────────────
@@ -431,7 +445,7 @@ fn dispatch_mode(
         EximMode::ConfigCheck {
             options,
             show_config,
-        } => modes::config_check_mode(&options, show_config, frozen_config),
+        } => modes::config_check_mode(&options, show_config, frozen_config, server_ctx),
 
         // ── Version Display ─────────────────────────────────────────────
         // (Also handled as early exit, included for completeness.)
@@ -448,7 +462,9 @@ fn dispatch_mode(
         EximMode::RewriteTest { args } => modes::test_rewrite_mode(&args, frozen_config),
 
         // ── SMTP Input ──────────────────────────────────────────────────
-        EximMode::SmtpInput { batched } => handle_smtp_input(batched, server_ctx, config_ctx),
+        EximMode::SmtpInput { batched } => {
+            handle_smtp_input(batched, server_ctx, config_ctx, cli_args)
+        }
 
         // ── Host Check ──────────────────────────────────────────────────
         EximMode::HostCheck { host } => handle_host_check(&host, server_ctx, config_ctx),
@@ -573,6 +589,7 @@ fn dispatch_message_action(
                     server_ctx,
                     frozen_config,
                     &config_ctx.config_filename.to_string_lossy(),
+                    cli_args,
                 )
             } else {
                 ExitCode::FAILURE
@@ -771,6 +788,150 @@ fn deliver_messages(
 }
 
 // =============================================================================
+// Verify Recipient Callback Factory
+// =============================================================================
+
+/// Create a `verify = recipient` callback that runs the router chain to
+/// determine if a recipient address is routable.  This callback is injected
+/// into the SMTP session's `MessageContext` so the ACL engine can call it
+/// without `exim-smtp` depending on `exim-deliver`.
+///
+/// The callback captures router instances (initialised from config) and
+/// the config context.  When invoked with `(recipient, sender)`, it:
+/// 1. Parses recipient into local_part@domain
+/// 2. Creates an `AddressItem`
+/// 3. Runs `route_address()` with `VerifyMode::Recipient`
+/// 4. Returns `Ok(VerifyRecipientResult)` with address_data on success
+/// 5. Returns `Err(message)` on routing failure
+#[allow(clippy::type_complexity)] // Callback type mirrors C Exim's function pointer pattern
+fn make_verify_recipient_callback(
+    config: &Arc<Config>,
+) -> Option<
+    std::sync::Arc<dyn Fn(&str, &str) -> exim_acl::engine::VerifyRecipientResult + Send + Sync>,
+> {
+    use exim_acl::engine::VerifyRecipientResult;
+    use exim_deliver::orchestrator::AddressItem;
+    use exim_deliver::routing::{route_address, route_init, RoutingResult, VerifyMode};
+
+    // Dereference Arc<Config> → &ConfigContext for route_init.
+    let cfg: &exim_config::types::ConfigContext = config;
+
+    // Initialise the router chain from config.  If this fails (e.g. unknown
+    // driver), return None — verify=recipient will be a no-op and the ACL
+    // will treat it as a soft failure.
+    let routers = match route_init(cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to initialise routers for verify=recipient");
+            return None;
+        }
+    };
+
+    // Wrap in Arc so they can be cheaply cloned into the closure.
+    let routers = std::sync::Arc::new(routers);
+    let shared_cfg = Arc::clone(config);
+
+    Some(std::sync::Arc::new(move |recipient: &str, sender: &str| {
+        let mut addr = AddressItem::new_from_string(recipient);
+
+        let mut addr_local = Vec::new();
+        let mut addr_remote = Vec::new();
+        let mut addr_new = Vec::new();
+        let mut addr_succeed = Vec::new();
+
+        // Build minimal contexts for routing.  Verification mode avoids
+        // side-effects like delivery and skips transport checks.
+        let server_ctx = exim_config::types::ServerContext::default();
+        let msg_ctx = exim_config::types::MessageContext::default();
+        let mut delivery_ctx = exim_config::types::DeliveryContext::default();
+
+        // Dereference the Arc<Config> → &ConfigContext for route_address.
+        let cfg_ref: &exim_config::types::ConfigContext = &shared_cfg;
+
+        let result = route_address(
+            &mut addr,
+            &mut addr_local,
+            &mut addr_remote,
+            &mut addr_new,
+            &mut addr_succeed,
+            &routers,
+            VerifyMode::Recipient,
+            false,
+            Some(sender),
+            &server_ctx,
+            &msg_ctx,
+            &mut delivery_ctx,
+            cfg_ref,
+        );
+
+        // ALWAYS extract address_data regardless of routing outcome.
+        // C Exim's copy_error() in verify.c unconditionally propagates
+        // addr->prop.address_data, so $address_data is available even
+        // when the routing failed (e.g. redirect with empty data).
+        let address_data = addr.prop.address_data.clone();
+
+        match result {
+            Ok(RoutingResult::Ok) => VerifyRecipientResult {
+                address_data,
+                sender_address_data: None,
+                is_local: !addr_local.is_empty() || addr.transport.is_some(),
+                routed: true,
+                fail_message: None,
+            },
+            Ok(RoutingResult::Fail) | Ok(RoutingResult::Error) => {
+                let msg = addr
+                    .message
+                    .unwrap_or_else(|| "Unrouteable address".to_string());
+                VerifyRecipientResult {
+                    address_data,
+                    sender_address_data: None,
+                    is_local: false,
+                    routed: false,
+                    fail_message: Some(msg),
+                }
+            }
+            Ok(RoutingResult::Defer) => VerifyRecipientResult {
+                address_data,
+                sender_address_data: None,
+                is_local: false,
+                routed: false,
+                fail_message: Some("Address lookup deferred".to_string()),
+            },
+            Ok(RoutingResult::Discard) => {
+                // Discarded addresses are treated as routable for
+                // verify=recipient purposes.
+                VerifyRecipientResult {
+                    address_data,
+                    sender_address_data: None,
+                    is_local: true,
+                    routed: true,
+                    fail_message: None,
+                }
+            }
+            Ok(RoutingResult::Rerouted) | Ok(RoutingResult::Skip) => {
+                let msg = addr
+                    .message
+                    .unwrap_or_else(|| "Unrouteable address".to_string());
+                VerifyRecipientResult {
+                    address_data,
+                    sender_address_data: None,
+                    is_local: false,
+                    routed: false,
+                    fail_message: Some(msg),
+                }
+            }
+            Err(e) => VerifyRecipientResult {
+                address_data,
+                sender_address_data: None,
+                is_local: false,
+                routed: false,
+                fail_message: Some(format!("Routing error: {}", e)),
+            },
+        }
+    }))
+}
+
+// =============================================================================
 // SMTP Input Handling
 // =============================================================================
 
@@ -782,6 +943,7 @@ fn handle_smtp_input(
     batched: bool,
     server_ctx: &mut ServerContext,
     config_ctx: &ConfigContext,
+    cli_args: &cli::EximCli,
 ) -> ExitCode {
     info!(batched, "SMTP input mode");
 
@@ -791,7 +953,10 @@ fn handle_smtp_input(
     // Create the SMTP-specific context types (from command_loop module).
     // These types are different from exim_core::context types and
     // exim_config::types — they are SMTP-session-specific.
-    let smtp_server_ctx = build_smtp_server_context(server_ctx, false);
+    let mut smtp_server_ctx = build_smtp_server_context(server_ctx, false);
+    // -bs/-bS mode: local submission, not a network connection
+    smtp_server_ctx.is_local_session = true;
+    smtp_server_ctx.smtp_batched_input = batched;
 
     let mut smtp_msg_ctx = exim_smtp::inbound::command_loop::MessageContext::default();
 
@@ -799,10 +964,13 @@ fn handle_smtp_input(
     // This matches C Exim (exim.c:5246): "if (!sender_ident) sender_ident = originator_login;"
     // The HELO greeting uses this: "250 host Hello CALLER at helo_name"
     if let Some(login) = exim_ffi::get_login_name() {
-        smtp_msg_ctx.sender_ident = Some(login);
+        smtp_msg_ctx.sender_ident = Some(login.clone());
     }
 
     let mut smtp_config_ctx = build_smtp_config_context(&config_ctx.config);
+
+    // spool_directory is propagated from frozen_config into smtp_config_ctx
+    // by build_smtp_config_context() — no debug trace needed in production.
 
     // In -bs/-bS mode (stdin/stdout SMTP), disable pipelining sync
     // checking because all input data is buffered immediately in a pipe,
@@ -810,10 +978,19 @@ fn handle_smtp_input(
     // checking for non-network connections (smtp_in.c ~line 1300).
     smtp_config_ctx.smtp_enforce_sync = false;
 
+    // Set originator login and credentials for log entries (U= field) and
+    // spool file originator metadata.
+    if let Some(login) = exim_ffi::get_login_name() {
+        smtp_config_ctx.originator_login = login;
+    }
+    smtp_config_ctx.originator_uid = unistd::getuid().as_raw();
+    smtp_config_ctx.originator_gid = unistd::getgid().as_raw();
+
     let mut session_state = exim_smtp::inbound::SessionState::default();
 
     if batched {
         debug!("batched SMTP mode (-bS)");
+        session_state.smtp_batched_input = true;
     }
 
     match exim_smtp::inbound::smtp_start_session(
@@ -833,6 +1010,35 @@ fn handle_smtp_input(
             use std::os::unix::io::AsRawFd;
             let in_fd = std::io::stdin().as_raw_fd();
             let out_fd = std::io::stdout().as_raw_fd();
+
+            // Determine whether delivery should happen inline (after each
+            // DATA command) or be deferred until the session ends.  In
+            // C Exim, `-bs` / `-bS` mode delivers each message immediately
+            // after the 250 OK response, so mainlog entries for each message
+            // appear in receive-then-deliver order, not all-receives first.
+            let should_deliver = match cli_args.delivery_mode {
+                Some(cli::DeliveryMode::QueueOnly) | Some(cli::DeliveryMode::QueueSmtp) => false,
+                _ if cli_args.queue_only => false,
+                _ if cli_args.dont_deliver => false,
+                _ => true,
+            };
+
+            // Install a per-message delivery callback so that the SMTP
+            // session code can trigger delivery inline after each DATA.
+            // We capture cheap owned/cloned data to avoid lifetime issues.
+            if should_deliver {
+                let test_harness = server_ctx.running_in_test_harness;
+                let shared_cfg = config_ctx.shared_config();
+                smtp_msg_ctx.post_message_callback = Some(Box::new(move |msg_id: &str| {
+                    deliver_smtp_message_inline(msg_id, test_harness, &shared_cfg);
+                }));
+            }
+
+            // Install verify=recipient callback so the ACL engine can route
+            // recipient addresses through the router chain during RCPT TO
+            // ACL evaluation. This bridges exim-smtp → exim-deliver without
+            // a direct dependency.
+            smtp_msg_ctx.verify_recipient_cb = make_verify_recipient_callback(&config_ctx.config);
 
             let result = exim_smtp::inbound::command_loop::smtp_setup_msg(
                 &smtp_server_ctx,
@@ -904,6 +1110,10 @@ fn handle_host_check(
         ..Default::default()
     };
 
+    // Wire the verify=recipient routing callback so ACL conditions like
+    // `verify = recipient` can actually route addresses during -bh mode.
+    smtp_msg_ctx.verify_recipient_cb = make_verify_recipient_callback(&config_ctx.config);
+
     let mut smtp_config_ctx = build_smtp_config_context(&config_ctx.config);
 
     // Disable sync checking for -bh mode just like -bs — stdin is a pipe,
@@ -924,20 +1134,35 @@ fn handle_host_check(
             let in_fd = std::io::stdin().as_raw_fd();
             let out_fd = std::io::stdout().as_raw_fd();
 
-            let result = exim_smtp::inbound::command_loop::smtp_setup_msg(
-                &smtp_server_ctx,
-                &mut smtp_msg_ctx,
-                &smtp_config_ctx,
-                in_fd,
-                out_fd,
-            );
+            // Enter the SMTP command loop.  When the session reaches the
+            // DATA command, smtp_setup_msg returns Yield so the caller can
+            // read the message body, run the DATA ACL, and send the final
+            // response.  We then loop back to smtp_setup_msg for the next
+            // transaction (RSET, MAIL FROM, QUIT).
+            loop {
+                let result = exim_smtp::inbound::command_loop::smtp_setup_msg(
+                    &smtp_server_ctx,
+                    &mut smtp_msg_ctx,
+                    &smtp_config_ctx,
+                    in_fd,
+                    out_fd,
+                );
 
-            match result {
-                exim_smtp::inbound::command_loop::SmtpSetupResult::Done => ExitCode::SUCCESS,
-                exim_smtp::inbound::command_loop::SmtpSetupResult::Yield => ExitCode::SUCCESS,
-                exim_smtp::inbound::command_loop::SmtpSetupResult::Error => {
-                    error!("SMTP host check session ended with error");
-                    ExitCode::FAILURE
+                match result {
+                    exim_smtp::inbound::command_loop::SmtpSetupResult::Done => {
+                        break ExitCode::SUCCESS;
+                    }
+                    exim_smtp::inbound::command_loop::SmtpSetupResult::Error => {
+                        error!("SMTP host check session ended with error");
+                        break ExitCode::FAILURE;
+                    }
+                    exim_smtp::inbound::command_loop::SmtpSetupResult::Yield => {
+                        // DATA is now handled inline by the command loop
+                        // (read_message_body + DATA ACL + response).
+                        // Yield should not normally be reached, but if it
+                        // is, continue the loop so smtp_setup_msg handles
+                        // the next command.
+                    }
                 }
             }
         }
@@ -971,19 +1196,86 @@ fn build_smtp_server_context(
         atrn_mode: false,
         interface_address: None,
         interface_port: 0,
+        is_local_session: false,
+        smtp_batched_input: false,
     }
 }
 
-/// Build a `command_loop::ConfigContext` from the parsed configuration.
+/// Deliver a single message received via SMTP (-bs mode).
 ///
-/// Populates the SMTP command loop's `ConfigContext` with ALL ACL definitions,
-/// SMTP limits, banner, host lists, and session policy from the frozen
-/// `Arc<Config>`.  Uses the `from_config()` bridge method to transfer all
-/// relevant fields from `exim_config::types::ConfigContext` to the SMTP
-/// crate's own `ConfigContext` type.
+/// Reads the spool header, runs routers + transports, writes mainlog
+/// delivery entries (`=>` and `Completed`).
 ///
-/// Previously set all 11 ACL fields to `None`, disabling all policy
-/// enforcement and creating an open relay for `-bs`/`-bS`/`-bh` modes.
+/// C reference: `deliver_message()` in `deliver.c` (~4000 lines).
+fn deliver_smtp_message(msg_id: &str, server_ctx: &ServerContext, config_ctx: &ConfigContext) {
+    info!(message_id = %msg_id, "delivering message from SMTP session");
+
+    // Build exim_config::types context structs for the delivery subsystem.
+    let mut cfg_msg_ctx = exim_config::types::MessageContext::default();
+    let mut cfg_delivery_ctx = exim_config::types::DeliveryContext::default();
+    let cfg_server_ctx = exim_config::types::ServerContext {
+        running_in_test_harness: server_ctx.running_in_test_harness,
+        ..Default::default()
+    };
+    let cfg_config_ctx = config_ctx.get_config();
+
+    // In -bs mode we deliver synchronously (matching C -odi semantics):
+    // call deliver_message() directly in-process rather than forking a
+    // child.  This keeps the log and spool operations in-sequence and
+    // avoids spool-not-found races in the test harness.
+    let result = exim_deliver::deliver_message(
+        msg_id,
+        false,
+        false,
+        &cfg_server_ctx,
+        &mut cfg_msg_ctx,
+        &mut cfg_delivery_ctx,
+        cfg_config_ctx,
+    );
+    match result {
+        Ok(_) => info!(message_id = %msg_id, "delivery completed"),
+        Err(e) => {
+            error!(error = %e, message_id = %msg_id, "delivery failed");
+        }
+    }
+}
+
+/// Inline delivery variant used by the per-message callback.
+///
+/// Identical to [`deliver_smtp_message`] but takes cheap cloned / owned
+/// values so the closure can be `'static`.
+fn deliver_smtp_message_inline(
+    msg_id: &str,
+    running_in_test_harness: bool,
+    shared_cfg: &Arc<Config>,
+) {
+    info!(message_id = %msg_id, "delivering message (inline callback)");
+
+    let mut cfg_msg_ctx = exim_config::types::MessageContext::default();
+    let mut cfg_delivery_ctx = exim_config::types::DeliveryContext::default();
+    let cfg_server_ctx = exim_config::types::ServerContext {
+        running_in_test_harness,
+        ..Default::default()
+    };
+    let cfg_config_ctx = shared_cfg.get();
+
+    let result = exim_deliver::deliver_message(
+        msg_id,
+        false,
+        false,
+        &cfg_server_ctx,
+        &mut cfg_msg_ctx,
+        &mut cfg_delivery_ctx,
+        cfg_config_ctx,
+    );
+    match result {
+        Ok(_) => info!(message_id = %msg_id, "delivery completed"),
+        Err(e) => {
+            error!(error = %e, message_id = %msg_id, "delivery failed");
+        }
+    }
+}
+
 fn build_smtp_config_context(
     frozen_config: &Arc<exim_config::Config>,
 ) -> exim_smtp::inbound::command_loop::ConfigContext {
@@ -1004,6 +1296,14 @@ fn build_smtp_config_context(
 /// When Exim is invoked without a specific `-b*` mode (or with `-bm`),
 /// it accepts a message from stdin (with optional recipient extraction
 /// via `-t`), spools it, and optionally triggers immediate delivery.
+///
+/// The complete flow (matching C Exim `receive_msg()` in `receive.c`):
+/// 1. Read the entire message from stdin (headers + body)
+/// 2. Parse headers; auto-generate From:, Date:, Message-Id: if absent
+/// 3. Build Received: header
+/// 4. Write -H (header) and -D (data) spool files
+/// 5. Write mainlog reception line (`<=`)
+/// 6. Optionally fork a child for immediate delivery (`-odi`/`-odf`)
 fn receive_message(
     cli_args: &cli::EximCli,
     server_ctx: &mut ServerContext,
@@ -1013,50 +1313,405 @@ fn receive_message(
     info!("message reception mode (default)");
     process::set_process_info("accepting message from stdin");
 
-    let mut msg_ctx = MessageContext::new();
+    // ---- Step 0: Determine sender address and originator identity ----
+    let originator_login = exim_ffi::get_login_name().unwrap_or_else(|| "unknown".to_string());
+    let originator_uid = unistd::getuid().as_raw();
+    let originator_gid = unistd::getgid().as_raw();
 
-    // Set sender address from -f flag if provided.
-    if let Some(ref sender) = cli_args.sender_address {
-        msg_ctx.sender_address = Some(sender.clone());
-        debug!(sender = %sender, "sender address set from -f flag");
+    let sender_address = if let Some(ref sender) = cli_args.sender_address {
+        sender.clone()
+    } else {
+        let qualify = &config_ctx.get_config().qualify_domain_sender;
+        if qualify.is_empty() {
+            format!(
+                "{}@{}",
+                originator_login,
+                config_ctx.get_config().primary_hostname
+            )
+        } else {
+            format!("{}@{}", originator_login, qualify)
+        }
+    };
+
+    // ---- Step 0a: Extract -oM* overrides from CLI ----
+    // These flags allow trusted callers to override sender host info
+    // for testing and for injecting messages received via other channels.
+    let opt_host_address = cli_args.sender_host_address.as_deref();
+    let opt_host_name = cli_args.sender_host_name.as_deref();
+    let opt_ident = cli_args.sender_ident.as_deref();
+    let opt_protocol = cli_args.received_protocol.as_deref();
+    let opt_interface = cli_args.incoming_interface.as_deref();
+    let opt_msg_ref = cli_args.message_reference.as_deref();
+    let is_network_submission = opt_host_address.is_some();
+
+    // The effective protocol: -oMr overrides, else "local" for stdin
+    let effective_protocol = opt_protocol.unwrap_or("local");
+
+    // The effective sender_ident: -oMt overrides, else originator_login
+    let effective_ident = opt_ident.unwrap_or(&originator_login);
+
+    // -F flag overrides the From: display name (originator_name in C Exim)
+    let sender_fullname = cli_args.sender_fullname.as_deref();
+
+    // ---- Step 0b: Collect recipients ----
+    let mut recipients: Vec<String> = Vec::new();
+    if !cli_args.extract_recipients {
+        if cli_args.recipients.is_empty() {
+            error!("no recipients specified and -t not given");
+            eprintln!("exim: no recipients");
+            return ExitCode::FAILURE;
+        }
+        for rcpt in &cli_args.recipients {
+            recipients.push(rcpt.clone());
+        }
     }
 
-    // Determine if recipients come from headers (-t flag) or arguments.
+    // ---- Step 1: Read entire message from stdin ----
+    let mut raw_input = Vec::new();
+    {
+        use std::io::Read;
+        if let Err(e) = std::io::stdin().read_to_end(&mut raw_input) {
+            error!(error = %e, "failed to read message from stdin");
+            eprintln!("exim: error reading stdin: {}", e);
+            return ExitCode::FAILURE;
+        }
+    }
+    let input_str = String::from_utf8_lossy(&raw_input);
+
+    // ---- Step 2: Split headers and body ----
+    let (header_block, body_block) = split_headers_body(&input_str);
+    let raw_header_lines = parse_header_lines(&header_block);
+
+    // If -t flag is set, extract recipients from To:/Cc:/Bcc: headers.
     if cli_args.extract_recipients {
-        debug!("extracting recipients from message headers (-t mode)");
-    } else if cli_args.recipients.is_empty() {
-        error!("no recipients specified and -t not given");
-        eprintln!("exim: no recipients");
+        for hdr_line in &raw_header_lines {
+            let lower = hdr_line.to_lowercase();
+            if lower.starts_with("to:") || lower.starts_with("cc:") || lower.starts_with("bcc:") {
+                let colon_pos = hdr_line.find(':').unwrap_or(0);
+                let addrs_part = &hdr_line[colon_pos + 1..];
+                for addr in extract_addresses(addrs_part) {
+                    if !recipients.contains(&addr) {
+                        recipients.push(addr);
+                    }
+                }
+            }
+        }
+        if recipients.is_empty() {
+            error!("no recipients found in headers with -t flag");
+            eprintln!("exim: no recipients");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // ---- Step 2b: Qualify unqualified recipient addresses ----
+    // C Exim qualifies addresses during reception (receive.c) so that the
+    // spool, Received: header, and all logging contain fully-qualified
+    // addresses.  We replicate that here using qualify_domain_recipient,
+    // falling back to qualify_domain_sender, then primary_hostname.
+    {
+        let cfg = config_ctx.get_config();
+        let qualify = if !cfg.qualify_domain_recipient.is_empty() {
+            &cfg.qualify_domain_recipient
+        } else if !cfg.qualify_domain_sender.is_empty() {
+            &cfg.qualify_domain_sender
+        } else {
+            &cfg.primary_hostname
+        };
+        if !qualify.is_empty() {
+            for rcpt in &mut recipients {
+                if !rcpt.contains('@') {
+                    *rcpt = format!("{}@{}", rcpt, qualify);
+                }
+            }
+        }
+    }
+
+    // ---- Step 3: Generate message ID and timestamps ----
+    let now_dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let tv_sec = now_dur.as_secs() as u32;
+    let tv_usec = now_dur.subsec_micros();
+    let pid = std::process::id() as u64;
+    let msg_id = exim_spool::generate_message_id(tv_sec, pid, tv_usec, None, 1);
+    info!(message_id = %msg_id, "message ID generated");
+
+    let now_epoch = now_dur.as_secs();
+    let timestamp = format_rfc2822_ts(now_epoch);
+    let hostname = &config_ctx.get_config().primary_hostname;
+    let version = exim_ffi::get_patched_version();
+
+    // ---- Step 4: Build Received: header ----
+    // C Exim builds the Received: header differently for local vs network:
+    //   Network (-oMa set): "from HOSTNAME ([IP] ident=IDENT)"
+    //   Local (no -oMa):    "from IDENT" (or originator_login if no -oMt)
+    let for_clause = if recipients.len() == 1 {
+        format!("\n\tfor {}", &recipients[0])
+    } else {
+        String::new()
+    };
+
+    let received_header = if is_network_submission {
+        // Network-style Received: header — line break between "from" and "by"
+        // Format: "from HOSTNAME ([IP] ident=IDENT)\n\tby HOST with PROTO ..."
+        let h_name = opt_host_name.unwrap_or("unknown");
+        let h_addr = opt_host_address.unwrap_or("unknown");
+        let from_clause = if !effective_ident.is_empty() {
+            format!("{} ([{}] ident={})", h_name, h_addr, effective_ident)
+        } else {
+            format!("{} ([{}])", h_name, h_addr)
+        };
+        format!(
+            "Received: from {}\n\tby {} with {} (Exim {})\n\t(envelope-from <{}>)\n\tid {}{};\n\t{}\n",
+            from_clause, hostname, effective_protocol, version, sender_address,
+            msg_id, for_clause, timestamp,
+        )
+    } else {
+        // Local-style Received: header — "from" and "by" on SAME line
+        // Format: "from IDENT by HOST with PROTO (Exim VER)\n\t..."
+        format!(
+            "Received: from {} by {} with {} (Exim {})\n\t(envelope-from <{}>)\n\tid {}{};\n\t{}\n",
+            effective_ident,
+            hostname,
+            effective_protocol,
+            version,
+            sender_address,
+            msg_id,
+            for_clause,
+            timestamp,
+        )
+    };
+
+    // ---- Step 5: Build spool headers list ----
+    let mut spool_headers: Vec<exim_spool::header_file::SpoolHeader> = Vec::new();
+
+    // Received: header first (type '*')
+    spool_headers.push(exim_spool::header_file::SpoolHeader {
+        text: received_header.clone(),
+        slen: received_header.len(),
+        header_type: '*',
+    });
+
+    // Determine which auto-headers need to be generated
+    let mut has_message_id = false;
+    let mut has_from = false;
+    let mut has_date = false;
+    for hdr_line in &raw_header_lines {
+        let lower = hdr_line.to_lowercase();
+        if lower.starts_with("message-id:") {
+            has_message_id = true;
+        }
+        if lower.starts_with("from:") {
+            has_from = true;
+        }
+        if lower.starts_with("date:") {
+            has_date = true;
+        }
+    }
+
+    // Add original message headers (type ' ')
+    for raw_hdr in &raw_header_lines {
+        let mut text = raw_hdr.clone();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let slen = text.len();
+        spool_headers.push(exim_spool::header_file::SpoolHeader {
+            slen,
+            text,
+            header_type: ' ',
+        });
+    }
+
+    // Auto-generate missing headers ONLY for local submissions (C Exim receive.c).
+    // Network-style messages (with -oMa) do not get auto-generated headers.
+    if !is_network_submission {
+        if !has_message_id {
+            let mid_hdr = format!("Message-Id: <E{}@{}>\n", msg_id, hostname);
+            let mid_len = mid_hdr.len();
+            spool_headers.push(exim_spool::header_file::SpoolHeader {
+                text: mid_hdr,
+                slen: mid_len,
+                header_type: ' ',
+            });
+        }
+        if !has_from {
+            // C Exim: From: originator_name <sender_address>
+            // Priority: 1) -F flag, 2) config gecos_name, 3) GECOS from passwd.
+            // C Exim respects the main config `gecos_name` option; the test harness
+            // sets `gecos_name = CALLER_NAME` to produce predictable output.
+            let from_name = if let Some(name) = sender_fullname {
+                name.to_string()
+            } else if let Some(ref gn) = config_ctx.get_config().gecos_name {
+                gn.clone()
+            } else {
+                exim_ffi::get_real_name().unwrap_or_default()
+            };
+            let from_hdr = if from_name.is_empty() {
+                format!("From: {}\n", sender_address)
+            } else {
+                format!("From: {} <{}>\n", from_name, sender_address)
+            };
+            let from_len = from_hdr.len();
+            spool_headers.push(exim_spool::header_file::SpoolHeader {
+                text: from_hdr,
+                slen: from_len,
+                header_type: ' ',
+            });
+        }
+        if !has_date {
+            let date_hdr = format!("Date: {}\n", timestamp);
+            let date_len = date_hdr.len();
+            spool_headers.push(exim_spool::header_file::SpoolHeader {
+                text: date_hdr,
+                slen: date_len,
+                header_type: ' ',
+            });
+        }
+    }
+
+    // ---- Step 5b: Body metrics ----
+    let body_bytes = body_block.as_bytes();
+    let body_linecount = body_bytes.iter().filter(|&&b| b == b'\n').count() as i64;
+    let body_zerocount = body_bytes.iter().filter(|&&b| b == 0).count() as i64;
+    let max_line_len = body_block.lines().map(|l| l.len()).max().unwrap_or(0) as i64;
+    let max_hdr_line_len = raw_header_lines
+        .iter()
+        .map(|h| h.lines().map(|l| l.len()).max().unwrap_or(0))
+        .max()
+        .unwrap_or(0) as i64;
+    let max_received_linelength = std::cmp::max(max_line_len, max_hdr_line_len);
+
+    // ---- Step 6: Write spool files ----
+    let spool_dir = &config_ctx.get_config().spool_directory;
+    let input_dir = format!("{}/input", spool_dir);
+    let _ = std::fs::create_dir_all(&input_dir);
+
+    // Write -D (data) file: "{msg_id}-D\n{body}"
+    let data_path = format!("{}/{}-D", input_dir, msg_id);
+    let data_header_line = format!("{}-D\n", msg_id);
+    let data_header_len = data_header_line.len();
+    let mut data_content: Vec<u8> = data_header_line.into_bytes();
+    data_content.extend_from_slice(body_bytes);
+    if let Err(e) = std::fs::write(&data_path, &data_content) {
+        error!(path = %data_path, error = %e, "failed to write -D file");
         return ExitCode::FAILURE;
     }
 
-    // Store explicit recipients from the command line.
-    for rcpt in &cli_args.recipients {
-        msg_ctx.recipients.push(RecipientItem {
-            address: rcpt.clone(),
+    // Build recipient list for spool file
+    let spool_recipients: Vec<exim_spool::header_file::Recipient> = recipients
+        .iter()
+        .map(|r| exim_spool::header_file::Recipient {
+            address: r.clone(),
+            pno: -1,
             errors_to: None,
-            orcpt: None,
-            dsn_flags: 0,
-            pno: None,
-        });
-        debug!(recipient = %rcpt, "recipient added from command line");
+            dsn: exim_spool::header_file::DsnInfo::default(),
+        })
+        .collect();
+
+    // Message size: body + headers in spool form
+    let message_size: i64 = data_content.len() as i64 - data_header_len as i64
+        + spool_headers.iter().map(|h| h.slen as i64).sum::<i64>();
+
+    let mut spool_file = exim_spool::header_file::SpoolHeaderFile {
+        message_id: msg_id.clone(),
+        originator_login: originator_login.clone(),
+        originator_uid: originator_uid as i64,
+        originator_gid: originator_gid as i64,
+        sender_address: sender_address.clone(),
+        received_time_sec: now_epoch as i64,
+        received_time_usec: tv_usec,
+        received_time_complete_sec: now_epoch as i64,
+        received_time_complete_usec: tv_usec,
+        received_protocol: Some(effective_protocol.to_string()),
+        sender_ident: Some(effective_ident.to_string()),
+        headers: spool_headers,
+        recipients: spool_recipients,
+        body_linecount,
+        body_zerocount,
+        max_received_linelength,
+        message_size,
+        ..Default::default()
+    };
+
+    // Populate -oM* override fields in the spool file so the delivery
+    // process can use them for variable expansion ($interface_address etc.)
+    if let Some(addr) = opt_host_address {
+        spool_file.host_address = Some(addr.to_string());
+    }
+    if let Some(name) = opt_host_name {
+        spool_file.host_name = Some(name.to_string());
+    }
+    if let Some(iface) = opt_interface {
+        spool_file.interface_address = Some(iface.to_string());
     }
 
-    // Generate a message ID for the new message.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    let msg_id = exim_spool::generate_message_id(
-        now.as_secs() as u32,
-        std::process::id() as u64,
-        now.subsec_micros(),
-        None,
-        2, // resolution: microsecond fractions for uniqueness
-    );
-    msg_ctx.message_id = msg_id.clone();
-    info!(message_id = %msg_id, "message ID generated");
+    // sender_local is false when a host address is provided (network-style)
+    spool_file.flags.sender_local = !is_network_submission;
+    spool_file.flags.deliver_firsttime = true;
+    if cli_args.dont_deliver {
+        spool_file.flags.dont_deliver = true;
+    }
 
-    // Determine delivery mode.
+    // Write -H (header) file
+    let header_path = format!("{}/{}-H", input_dir, msg_id);
+    match std::fs::File::create(&header_path) {
+        Ok(file) => {
+            if let Err(e) = spool_file.write_to(file) {
+                error!(path = %header_path, error = %e, "failed to write -H file");
+                return ExitCode::FAILURE;
+            }
+        }
+        Err(e) => {
+            error!(path = %header_path, error = %e, "failed to create -H file");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // ---- Step 7: Write mainlog reception line ----
+    // C Exim format: "TIMESTAMP MSGID <= sender [R=ref] [H=host [ip]] U=ident P=proto S=size [for rcpt]"
+    let log_ts = format_log_ts(now_epoch);
+
+    // Build the log line matching C Exim's add_host_info_for_log()
+    let mut log_parts: Vec<String> = Vec::new();
+    log_parts.push(format!("{} {} <= {}", log_ts, msg_id, sender_address));
+
+    // R= message reference (from -oMm)
+    if let Some(msg_ref) = opt_msg_ref {
+        log_parts.push(format!(" R={}", msg_ref));
+    }
+
+    // H= sender host info (from -oMa/-oMs)
+    if is_network_submission {
+        let h_name = opt_host_name.unwrap_or("unknown");
+        let h_addr = opt_host_address.unwrap_or("unknown");
+        log_parts.push(format!(" H={} [{}]", h_name, h_addr));
+    }
+
+    // U= sender ident
+    log_parts.push(format!(" U={}", effective_ident));
+
+    // P= protocol
+    log_parts.push(format!(" P={}", effective_protocol));
+
+    // S= message size
+    log_parts.push(format!(" S={}", message_size));
+
+    // "for recipients" (only when +received_recipients log selector is set)
+    let log_received_recipients = config_ctx
+        .get_config()
+        .log_selector_string
+        .as_deref()
+        .is_some_and(|s| s.contains("received_recipients"));
+    if log_received_recipients {
+        let rcpt_list: Vec<&str> = recipients.iter().map(|r| r.as_str()).collect();
+        log_parts.push(format!(" for {}", rcpt_list.join(" ")));
+    }
+
+    let log_line = log_parts.concat();
+    write_mainlog_entry(config_ctx.get_config(), &log_line);
+
+    // ---- Step 8: Trigger delivery based on delivery mode ----
     let should_deliver_immediately = match cli_args.delivery_mode {
         Some(DeliveryMode::QueueOnly) | Some(DeliveryMode::QueueSmtp) => false,
         _ if cli_args.queue_only => false,
@@ -1069,16 +1724,12 @@ fn receive_message(
 
         match process::exim_fork("post-reception delivery") {
             Ok(ForkResult::Child) => {
-                // Child: deliver using exim_config::types context objects.
                 let mut cfg_msg_ctx = exim_config::types::MessageContext::default();
                 let mut cfg_delivery_ctx = exim_config::types::DeliveryContext::default();
                 let cfg_server_ctx = exim_config::types::ServerContext {
                     running_in_test_harness: server_ctx.running_in_test_harness,
                     ..Default::default()
                 };
-                // Build ConfigContext from the actual parsed configuration,
-                // preserving all ACLs, rewrite rules, retry configs, and
-                // driver definitions for the delivery child.
                 let cfg_config_ctx = config_ctx.get_config().clone();
 
                 let result = exim_deliver::deliver_message(
@@ -1127,6 +1778,198 @@ fn receive_message(
     }
 
     ExitCode::SUCCESS
+}
+
+/// Split raw message input into headers and body sections.
+/// Headers end at the first blank line (a line containing only "\n" or "\r\n").
+fn split_headers_body(input: &str) -> (String, String) {
+    // Look for "\n\n" (Unix) or "\r\n\r\n" (CRLF) as the header/body separator.
+    if let Some(pos) = input.find("\n\n") {
+        let headers = &input[..pos + 1]; // include the trailing \n
+        let body = &input[pos + 2..]; // skip the blank line
+        return (headers.to_string(), body.to_string());
+    }
+    if let Some(pos) = input.find("\r\n\r\n") {
+        let headers = &input[..pos + 2];
+        let body = &input[pos + 4..];
+        return (headers.to_string(), body.to_string());
+    }
+    // No blank line found: if input starts with a header-like line, treat
+    // the entire input as body (C Exim: a message with no headers).
+    // If there are "Name: value" lines, they are headers. Otherwise body only.
+    if input.contains(':') && !input.starts_with(' ') && !input.starts_with('\t') {
+        // Likely all headers, no body
+        (input.to_string(), String::new())
+    } else {
+        // No headers, all body
+        (String::new(), input.to_string())
+    }
+}
+
+/// Parse raw header block into individual header lines.
+/// Continuation lines (starting with space or tab) are folded into
+/// the preceding header.
+fn parse_header_lines(header_block: &str) -> Vec<String> {
+    let mut headers: Vec<String> = Vec::new();
+    for line in header_block.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            // Continuation line: append to previous header
+            if let Some(last) = headers.last_mut() {
+                last.push('\n');
+                last.push_str(line);
+            }
+        } else if !line.is_empty() {
+            headers.push(line.to_string());
+        }
+    }
+    headers
+}
+
+/// Extract email addresses from a header value (e.g., "user@domain, Name <user2@domain>").
+fn extract_addresses(value: &str) -> Vec<String> {
+    let mut addrs = Vec::new();
+    for part in value.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Look for angle-bracket form: "Name <addr>"
+        if let Some(start) = trimmed.find('<') {
+            if let Some(end) = trimmed.find('>') {
+                if end > start {
+                    let addr = trimmed[start + 1..end].trim().to_string();
+                    if !addr.is_empty() {
+                        addrs.push(addr);
+                        continue;
+                    }
+                }
+            }
+        }
+        // Bare address form
+        if trimmed.contains('@') {
+            addrs.push(trimmed.to_string());
+        }
+    }
+    addrs
+}
+
+/// Format a Unix epoch timestamp as an RFC 2822 date string.
+/// Produces: "Thu, 01 Jan 2025 00:00:00 +0000"
+fn format_rfc2822_ts(epoch_secs: u64) -> String {
+    let (year, month, day, hour, min, sec, wday) = epoch_to_utc(epoch_secs);
+    let days = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let day_name = days[(wday % 7) as usize];
+    let mon_name = if (1..=12).contains(&month) {
+        months[(month - 1) as usize]
+    } else {
+        "???"
+    };
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} +0000",
+        day_name, day, mon_name, year, hour, min, sec,
+    )
+}
+
+/// Format a Unix epoch timestamp for mainlog lines: "2025-01-01 00:00:00"
+fn format_log_ts(epoch_secs: u64) -> String {
+    let (year, month, day, hour, min, sec, _wday) = epoch_to_utc(epoch_secs);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hour, min, sec,
+    )
+}
+
+/// Convert Unix epoch seconds to UTC date/time components.
+/// Returns (year, month, day, hour, minute, second, weekday).
+/// Weekday: 0 = Thursday (epoch was a Thursday).
+fn epoch_to_utc(epoch_secs: u64) -> (i32, u32, u32, u32, u32, u32, u32) {
+    let secs = epoch_secs;
+    let sec = (secs % 60) as u32;
+    let mins_total = secs / 60;
+    let min = (mins_total % 60) as u32;
+    let hours_total = mins_total / 60;
+    let hour = (hours_total % 24) as u32;
+    let days_total = (hours_total / 24) as i64;
+    let wday = ((days_total % 7) as u32 + 7) % 7; // 0=Thu
+
+    // Civil date from day count (algorithm from Howard Hinnant)
+    let z = days_total + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    (year as i32, m, d, hour, min, sec, wday)
+}
+
+/// Write a line to the Exim mainlog file.
+/// Print a configuration error in the same format C Exim uses:
+///
+/// ```text
+/// TIMESTAMP Exim configuration error in line N of FILE:
+///   MESSAGE
+/// ```
+///
+/// For errors without file/line information, fall back to a simpler format.
+fn print_config_error(e: &exim_config::ConfigError) {
+    use exim_config::ConfigError;
+    match e {
+        ConfigError::ParseError {
+            file,
+            line,
+            message,
+        } if !file.is_empty() && *line > 0 => {
+            let ts = format_log_ts(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+            eprintln!(
+                "{} Exim configuration error in line {} of {}:\n  {}",
+                ts, line, file, message
+            );
+        }
+        _ => {
+            eprintln!("Exim configuration error: {e}");
+        }
+    }
+}
+
+fn write_mainlog_entry(config: &exim_config::ConfigContext, line: &str) {
+    let mainlog_path = if config.log_file_path.is_empty() {
+        format!("{}/log/mainlog", config.spool_directory)
+    } else {
+        config.log_file_path.replace("%slog", "mainlog")
+    };
+    let log_dir = std::path::Path::new(&mainlog_path).parent();
+    if let Some(dir) = log_dir {
+        let _ = std::fs::create_dir_all(dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750));
+        }
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o666);
+    }
+    if let Ok(mut f) = opts.open(&mainlog_path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", line);
+    }
 }
 
 // =============================================================================
@@ -1247,6 +2090,13 @@ fn apply_config_to_server_ctx(server_ctx: &mut ServerContext, config_ctx: &Confi
 }
 
 /// Configure debug logging based on CLI arguments.
+///
+/// Parses the `-d` selector string into a bitmask matching C Exim's
+/// `debug_options[]` table in globals.c.  The selector format is:
+///   - `-d`        → D_all (all bits set)
+///   - `-d+all`    → D_all
+///   - `-d-all+expand` → only D_expand
+///   - `-d-all+expand+noutf8` → D_expand | D_noutf8
 fn configure_debug_logging(cli_args: &cli::EximCli, server_ctx: &mut ServerContext) {
     if cli_args.verbose {
         debug!("verbose mode enabled (-v)");
@@ -1254,12 +2104,125 @@ fn configure_debug_logging(cli_args: &cli::EximCli, server_ctx: &mut ServerConte
 
     if let Some(ref selector) = cli_args.debug_selector {
         debug!(selector = %selector, "debug selector configured");
-        if selector.is_empty() || selector == "+all" {
-            server_ctx.debug_selector = u32::MAX;
+        server_ctx.debug_selector = parse_debug_selector(selector);
+    }
+}
+
+// ── Debug selector bit constants matching C Exim's macros.h ─────────
+const D_V: u32 = 1 << 0;
+const D_LOCAL_SCAN: u32 = 1 << 1;
+const D_ACL: u32 = 1 << 2;
+const D_AUTH: u32 = 1 << 3;
+const D_DELIVER: u32 = 1 << 4;
+const D_DNS: u32 = 1 << 5;
+const D_DNSBL: u32 = 1 << 6;
+const D_EXEC: u32 = 1 << 7;
+const D_EXPAND: u32 = 1 << 8;
+const D_FILTER: u32 = 1 << 9;
+const D_HINTS_LOOKUP: u32 = 1 << 10;
+const D_HOST_LOOKUP: u32 = 1 << 11;
+const D_IDENT: u32 = 1 << 12;
+const D_INTERFACE: u32 = 1 << 13;
+const D_LISTS: u32 = 1 << 14;
+const D_LOAD: u32 = 1 << 15;
+const D_LOOKUP: u32 = 1 << 16;
+const D_MEMORY: u32 = 1 << 17;
+const D_NOUTF8: u32 = 1 << 18;
+const D_PID: u32 = 1 << 19;
+const D_PROCESS_INFO: u32 = 1 << 20;
+const D_QUEUE_RUN: u32 = 1 << 21;
+const D_RECEIVE: u32 = 1 << 22;
+const D_RESOLVER: u32 = 1 << 23;
+const D_RETRY: u32 = 1 << 24;
+const D_REWRITE: u32 = 1 << 25;
+const D_ROUTE: u32 = 1 << 26;
+const D_TIMESTAMP: u32 = 1 << 27;
+const D_TLS: u32 = 1 << 28;
+const D_TRANSPORT: u32 = 1 << 29;
+const D_UID: u32 = 1 << 30;
+const D_VERIFY: u32 = 1 << 31;
+const D_ALL: u32 = 0xFFFF_FFFF;
+
+/// Parse a debug selector string into a bitmask.
+///
+/// Handles formats like: `""`, `"+all"`, `"-all+expand"`,
+/// `"-all+expand+noutf8"`, `"=0x1234"`, etc.
+fn parse_debug_selector(selector: &str) -> u32 {
+    if selector.is_empty() {
+        return D_ALL;
+    }
+
+    // Handle hex numeric format: `=0x1234`
+    if let Some(hex_str) = selector.strip_prefix("=0x") {
+        return u32::from_str_radix(hex_str, 16).unwrap_or(D_ALL);
+    }
+    if let Some(hex_str) = selector.strip_prefix("0x") {
+        return u32::from_str_radix(hex_str, 16).unwrap_or(D_ALL);
+    }
+
+    let mut bits: u32 = D_ALL;
+
+    // Parse +name / -name tokens
+    let mut rest = selector;
+    while !rest.is_empty() {
+        let (adding, name_rest) = if let Some(r) = rest.strip_prefix('+') {
+            (true, r)
+        } else if let Some(r) = rest.strip_prefix('-') {
+            (false, r)
         } else {
-            server_ctx.debug_selector = 1;
+            // Bare name — treat as +name
+            (true, rest)
+        };
+
+        // Find the next + or - to delimit the name
+        let end = name_rest.find(['+', '-']).unwrap_or(name_rest.len());
+        let name = &name_rest[..end];
+        rest = &name_rest[end..];
+
+        let bit = match name {
+            "all" => D_ALL,
+            "v" => D_V,
+            "local_scan" => D_LOCAL_SCAN,
+            "acl" => D_ACL,
+            "auth" => D_AUTH,
+            "deliver" => D_DELIVER,
+            "dns" => D_DNS,
+            "dnsbl" => D_DNSBL,
+            "exec" => D_EXEC,
+            "expand" => D_EXPAND,
+            "filter" => D_FILTER,
+            "hints_lookup" => D_HINTS_LOOKUP,
+            "host_lookup" => D_HOST_LOOKUP,
+            "ident" => D_IDENT,
+            "interface" => D_INTERFACE,
+            "lists" => D_LISTS,
+            "load" => D_LOAD,
+            "lookup" => D_LOOKUP,
+            "memory" => D_MEMORY,
+            "noutf8" => D_NOUTF8,
+            "pid" => D_PID,
+            "process_info" => D_PROCESS_INFO,
+            "queue_run" => D_QUEUE_RUN,
+            "receive" => D_RECEIVE,
+            "resolver" => D_RESOLVER,
+            "retry" => D_RETRY,
+            "rewrite" => D_REWRITE,
+            "route" => D_ROUTE,
+            "timestamp" => D_TIMESTAMP,
+            "tls" => D_TLS,
+            "transport" => D_TRANSPORT,
+            "uid" => D_UID,
+            "verify" => D_VERIFY,
+            _ => 0,
+        };
+
+        if adding {
+            bits |= bit;
+        } else {
+            bits &= !bit;
         }
     }
+    bits
 }
 
 /// Convert a `cli::QueueRunConfig` to a `queue_runner::QueueRunner`.

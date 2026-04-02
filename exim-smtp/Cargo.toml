@@ -266,6 +266,10 @@ exim-expand = { path = "../exim-expand" }
 # connection routing, and reverse DNS lookups for sender verification.
 exim-dns = { path = "../exim-dns" }
 
+# Spool file I/O — message ID generation, spool header/data file writing.
+# Used after SMTP DATA to write the received message to the spool directory.
+exim-spool = { path = "../exim-spool" }
+
 # ── Workspace-shared external dependencies ───────────────────────────────────
 # All versions inherited from root Cargo.toml [workspace.dependencies] to
 # guarantee version consistency across all 18 workspace crates (AAP §0.6.3).

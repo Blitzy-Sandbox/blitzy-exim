@@ -43,6 +43,8 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use thiserror::Error;
@@ -50,9 +52,10 @@ use tracing::{debug, error, info, trace, warn};
 
 use exim_config::types::{ConfigContext, DeliveryContext, MessageContext, ServerContext};
 use exim_drivers::registry::DriverRegistry;
-use exim_drivers::router_driver::RouterResult;
+use exim_drivers::router_driver::{RouterInstanceConfig, RouterResult};
 use exim_drivers::transport_driver::{TransportInstanceConfig, TransportResult};
 use exim_drivers::DriverError;
+use exim_expand::rfc2047_decode;
 use exim_spool::{spool_read_header, SpoolError, SpoolHeaderData};
 use exim_store::{MessageArena, Tainted};
 
@@ -448,6 +451,19 @@ pub struct AddressItem {
     /// Defaults to a lowercased copy of the address.
     pub unique: String,
 
+    /// Stripped prefix set by the accepting router (e.g. `"page+"`).
+    /// Used by transports for `$local_part_prefix` expansion.
+    pub prefix: Option<String>,
+
+    /// Stripped suffix set by the accepting router (e.g. `"-S"`).
+    /// Used by transports for `$local_part_suffix` expansion.
+    pub suffix: Option<String>,
+
+    /// For one-time redirect aliases, the original top-level recipient
+    /// address before any redirection occurred.  Used in the delivery log
+    /// to display the original address in angle brackets.
+    pub onetime_parent: Option<String>,
+
     /// Parent address index — when an alias/redirect creates a child address,
     /// this records the parent. `-1` means no parent.
     pub parent_index: i32,
@@ -462,7 +478,7 @@ impl AddressItem {
     /// The `address` field is set from the provided string (wrapped in
     /// `Tainted`), `unique` defaults to a lowercased copy of the address,
     /// and all other fields are zero/empty/None.
-    fn new_from_string(addr: &str) -> Self {
+    pub fn new_from_string(addr: &str) -> Self {
         let (local_part, domain) = split_address_parts(addr);
         Self {
             address: Tainted::new(addr.to_string()),
@@ -485,6 +501,9 @@ impl AddressItem {
             return_path: None,
             uid: 0,
             gid: 0,
+            prefix: None,
+            suffix: None,
+            onetime_parent: None,
             unique: addr.to_ascii_lowercase(),
             parent_index: -1,
             children: Vec::new(),
@@ -584,6 +603,60 @@ fn split_address_parts(address: &str) -> (String, String) {
     } else {
         // No '@' — treat the whole thing as a local part with empty domain
         (address.to_string(), String::new())
+    }
+}
+
+/// Compute the RCPT TO address from the original case-preserved `addr.address`
+/// by stripping prefix and suffix characters. This mirrors C Exim's
+/// `transport_rcpt_address()` function from `transport.c`:
+///
+/// ```c
+/// if (addr->suffix || addr->prefix) {
+///     at = Ustrrchr(addr->address, '@');
+///     plen = addr->prefix ? Ustrlen(addr->prefix) : 0;
+///     slen = addr->suffix ? Ustrlen(addr->suffix) : 0;
+///     return string_sprintf("%.*s@%s",
+///         (int)(at - addr->address - plen - slen), addr->address + plen, at + 1);
+/// }
+/// return addr->address;
+/// ```
+///
+/// This preserves the original case of the address (unlike using the lowercased
+/// `addr.local_part` and `addr.domain` fields used for routing/matching).
+fn transport_rcpt_address(addr: &AddressItem) -> String {
+    let original = addr.address.as_ref();
+    let prefix = addr.prefix.as_deref().unwrap_or("");
+    let suffix = addr.suffix.as_deref().unwrap_or("");
+
+    if prefix.is_empty() && suffix.is_empty() {
+        return original.to_string();
+    }
+
+    if let Some(at_pos) = original.rfind('@') {
+        let plen = prefix.len();
+        let slen = suffix.len();
+        let local_with_affixes = &original[..at_pos];
+        let domain = &original[at_pos + 1..];
+
+        // Strip prefix from start and suffix from end of local part
+        let stripped_end = if slen > 0 && local_with_affixes.len() >= plen + slen {
+            local_with_affixes.len() - slen
+        } else {
+            local_with_affixes.len()
+        };
+        let stripped_start = plen.min(local_with_affixes.len());
+        let stripped_local = &local_with_affixes[stripped_start..stripped_end];
+        format!("{}@{}", stripped_local, domain)
+    } else {
+        // No '@' — just strip prefix/suffix from the string
+        let plen = prefix.len();
+        let slen = suffix.len();
+        let stripped_end = if slen > 0 && original.len() >= plen + slen {
+            original.len() - slen
+        } else {
+            original.len()
+        };
+        original[plen..stripped_end].to_string()
     }
 }
 
@@ -764,10 +837,11 @@ pub fn deliver_msglog(
         })?;
     }
 
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o660);
+    let file = opts.open(&log_path)?;
 
     let mut writer = BufWriter::new(file);
     writer.write_all(message.as_bytes())?;
@@ -782,6 +856,95 @@ pub fn deliver_msglog(
 }
 
 // ---------------------------------------------------------------------------
+// Mainlog File Writer (deliver.c log_write() for LOG_MAIN)
+// ---------------------------------------------------------------------------
+
+/// Write a log entry to the Exim mainlog file.
+///
+/// The mainlog path is derived from `config.log_file_path` by replacing
+/// `%slog` with `mainlog` (matching C Exim `log_open_as` in log.c).
+/// If the log path template is empty, the default
+/// `{spool_directory}/log/mainlog` is used.
+///
+/// Each entry is a single line terminated by `\n`, prefixed with a timestamp
+/// in `YYYY-MM-DD HH:MM:SS` format.
+fn write_mainlog(config: &ConfigContext, line: &str) {
+    let mainlog_path = if config.log_file_path.is_empty() {
+        format!("{}/log/mainlog", config.spool_directory)
+    } else {
+        config.log_file_path.replace("%slog", "mainlog")
+    };
+
+    let log_dir = Path::new(&mainlog_path).parent();
+    if let Some(dir) = log_dir {
+        let _ = fs::create_dir_all(dir);
+        // Ensure log directory is accessible by both root and exim user
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o750));
+        }
+    }
+    // Create log file with mode 0666 so both root and the exim setuid
+    // binary can append to the same mainlog.  C Exim achieves this by
+    // always creating the file as the exim user (via a fork+setuid
+    // subprocess); we use permissive mode instead for simplicity.
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o666);
+    match opts.open(&mainlog_path) {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{line}");
+        }
+        Err(e) => {
+            tracing::error!(path = %mainlog_path, error = %e, "failed to write mainlog");
+        }
+    }
+}
+
+/// Format a Unix timestamp for Exim mainlog lines.
+///
+/// Produces: `YYYY-MM-DD HH:MM:SS`
+fn format_delivery_timestamp() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (year, month, day, hour, min, sec, _wday) = epoch_to_utc_components(now);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02}",)
+}
+
+/// Convert a Unix epoch timestamp to UTC calendar components.
+///
+/// Returns `(year, month, day, hour, minute, second, weekday)`.
+/// Weekday: 0 = Thursday (epoch day), 1 = Friday, ... (mod 7).
+fn epoch_to_utc_components(epoch_secs: u64) -> (u64, u64, u64, u64, u64, u64, u64) {
+    let secs_per_day: u64 = 86400;
+    let total_days = epoch_secs / secs_per_day;
+    let day_secs = epoch_secs % secs_per_day;
+    let hour = day_secs / 3600;
+    let min = (day_secs % 3600) / 60;
+    let sec = day_secs % 60;
+    let wday = (total_days + 4) % 7; // 1970-01-01 was Thursday (4)
+
+    // Civil date from day count (algorithm from Howard Hinnant)
+    let z = total_days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    (year, m, d, hour, min, sec, wday)
+}
+
+// ---------------------------------------------------------------------------
 // Log Formatting Helpers (deliver.c lines 748-843)
 // ---------------------------------------------------------------------------
 
@@ -789,7 +952,7 @@ pub fn deliver_msglog(
 ///
 /// Replaces C `d_log_interface()` (deliver.c line 748). Produces the
 /// `I=[ip]:[port]` component for Exim delivery log lines.
-fn d_log_interface(delivery_ctx: &DeliveryContext) -> String {
+fn _d_log_interface(delivery_ctx: &DeliveryContext) -> String {
     match (&delivery_ctx.sending_ip_address, delivery_ctx.sending_port) {
         (Some(ip), port) if !ip.is_empty() => {
             if port > 0 {
@@ -806,7 +969,7 @@ fn d_log_interface(delivery_ctx: &DeliveryContext) -> String {
 ///
 /// Replaces C `d_hostlog()` (deliver.c line 762). Produces the
 /// `H=hostname [ip]` component for delivery log lines.
-fn d_hostlog(delivery_ctx: &DeliveryContext) -> String {
+fn _d_hostlog(delivery_ctx: &DeliveryContext) -> String {
     let host = delivery_ctx.deliver_host.as_deref().unwrap_or("");
     let addr = delivery_ctx.deliver_host_address.as_deref().unwrap_or("");
 
@@ -835,7 +998,7 @@ fn d_hostlog(delivery_ctx: &DeliveryContext) -> String {
 /// Replaces C `d_tlslog()` (deliver.c line 801). Produces the `X=cipher`
 /// and `CV=status` components for delivery log lines.
 #[cfg(feature = "tls")]
-fn d_tlslog(msg_ctx: &MessageContext) -> String {
+fn _d_tlslog(msg_ctx: &MessageContext) -> String {
     let tls = &msg_ctx.tls_in;
     if !tls.active {
         return String::new();
@@ -855,7 +1018,7 @@ fn d_tlslog(msg_ctx: &MessageContext) -> String {
 
 /// Format TLS connection information for log output (no-TLS stub).
 #[cfg(not(feature = "tls"))]
-fn d_tlslog(_msg_ctx: &MessageContext) -> String {
+fn _d_tlslog(_msg_ctx: &MessageContext) -> String {
     String::new()
 }
 
@@ -863,7 +1026,7 @@ fn d_tlslog(_msg_ctx: &MessageContext) -> String {
 ///
 /// Replaces C `d_loglength()` (deliver.c line 843). Produces the `S=nnn`
 /// size component for delivery log lines.
-fn d_loglength(msg_ctx: &MessageContext) -> String {
+fn _d_loglength(msg_ctx: &MessageContext) -> String {
     if msg_ctx.message_size > 0 {
         format!(" S={}", msg_ctx.message_size)
     } else {
@@ -950,14 +1113,18 @@ pub fn post_process_one(
     result: &TransportResult,
     addr_lists: &mut AddressLists,
     msg_ctx: &MessageContext,
-    delivery_ctx: &DeliveryContext,
+    _delivery_ctx: &DeliveryContext,
     config: &ConfigContext,
 ) -> Result<(), DeliveryError> {
     let address_str = addr.address.as_ref().to_string();
     let transport_name = addr.transport.as_deref().unwrap_or("<none>");
 
     match result {
-        TransportResult::Ok => {
+        TransportResult::Ok {
+            ref host_name,
+            ref host_address,
+            ref smtp_confirmation,
+        } => {
             // Delivery succeeded — move to addr_succeed
             info!(
                 address = %address_str,
@@ -966,32 +1133,99 @@ pub fn post_process_one(
                 "delivery succeeded"
             );
 
-            // Log the success to the main log in Exim format
-            let host_log = d_hostlog(delivery_ctx);
-            let interface_log = d_log_interface(delivery_ctx);
-            let tls_log = d_tlslog(msg_ctx);
-            let size_log = d_loglength(msg_ctx);
+            // Build the C-compatible mainlog delivery line using the same
+            // logic as C Exim's `string_log_address()` (deliver.c ~line 1000).
+            //
+            // For local transports:  "=> local_part"
+            // For remote transports: "=> local_part@domain"
+            // Then, if the built display address differs from the top-level
+            // original address, append " <original>" in angle brackets.
+            let ts = format_delivery_timestamp();
+            let router_name = addr.router.as_deref().unwrap_or("<none>");
 
-            info!(
-                target: "exim_main_log",
-                "{msg_id} => {addr} R={router} T={transport}{host}{iface}{tls}{size}",
-                msg_id = msg_ctx.message_id,
-                addr = address_str,
-                router = addr.router.as_deref().unwrap_or("<none>"),
-                transport = transport_name,
-                host = host_log,
-                iface = interface_log,
-                tls = tls_log,
-                size = size_log,
-            );
+            // Determine local vs remote using the transport driver's
+            // `is_local` flag — matching C Exim's `rf_queue_add()`.
+            let is_local_transport = if let Some(ref tname) = addr.transport {
+                let driver_name = config.transport_instances.iter().find_map(|arc| {
+                    arc.downcast_ref::<TransportInstanceConfig>()
+                        .filter(|tc| tc.name == *tname)
+                        .map(|tc| tc.driver_name.clone())
+                });
+                if let Some(ref dname) = driver_name {
+                    DriverRegistry::find_transport(dname)
+                        .map(|f| f.is_local)
+                        .unwrap_or(addr.host_list.is_empty())
+                } else {
+                    addr.host_list.is_empty()
+                }
+            } else {
+                addr.host_list.is_empty()
+            };
+
+            let display_addr = if is_local_transport {
+                // C Exim: for local deliveries, show just the local part
+                addr.local_part.clone()
+            } else {
+                // C Exim: for remote deliveries, show local_part@domain
+                format!("{}@{}", addr.local_part, addr.domain)
+            };
+
+            // Determine the original (top-level) address for the angle
+            // bracket display.  C Exim uses `onetime_parent` if set,
+            // otherwise walks up the parent chain to the topaddr.
+            let top_addr = addr.onetime_parent.as_deref().unwrap_or(&address_str);
+
+            // C Exim (deliver.c ~line 1060): Only add the angle-bracket
+            // original address if it differs from the display address.
+            let need_angle = !display_addr.eq_ignore_ascii_case(top_addr);
+
+            // Build the base log line
+            let mut mainlog_line = if need_angle {
+                format!(
+                    "{ts} {msg_id} => {da} <{orig}> R={router} T={transport}",
+                    msg_id = msg_ctx.message_id,
+                    da = display_addr,
+                    orig = top_addr,
+                    router = router_name,
+                    transport = transport_name,
+                )
+            } else {
+                format!(
+                    "{ts} {msg_id} => {da} R={router} T={transport}",
+                    msg_id = msg_ctx.message_id,
+                    da = display_addr,
+                    router = router_name,
+                    transport = transport_name,
+                )
+            };
+
+            // For remote (SMTP) deliveries, append H=host [addr] and C="resp"
+            // matching C Exim deliver.c lines 1332+ and 1252+.
+            if let Some(ref hn) = host_name {
+                let ha = host_address.as_deref().unwrap_or(hn);
+                mainlog_line.push_str(&format!(" H={} [{}]", hn, ha));
+            }
+            if let Some(ref conf) = smtp_confirmation {
+                // C Exim quotes the confirmation string and escapes " and \.
+                let escaped: String = conf
+                    .chars()
+                    .flat_map(|c| {
+                        if c == '"' || c == '\\' {
+                            vec!['\\', c]
+                        } else {
+                            vec![c]
+                        }
+                    })
+                    .collect();
+                mainlog_line.push_str(&format!(" C=\"{}\"", escaped));
+            }
+
+            write_mainlog(config, &mainlog_line);
 
             // Write to per-message log
             let log_msg = format!(
                 "{} => {} R={} T={}\n",
-                msg_ctx.message_id,
-                address_str,
-                addr.router.as_deref().unwrap_or("<none>"),
-                transport_name,
+                msg_ctx.message_id, address_str, router_name, transport_name,
             );
             let _ = deliver_msglog(
                 &config.spool_directory,
@@ -1265,6 +1499,7 @@ fn deliver_local(
     msg_ctx: &MessageContext,
     delivery_ctx: &mut DeliveryContext,
     config: &ConfigContext,
+    spool_data: &SpoolHeaderData,
 ) -> Result<(), DeliveryError> {
     let address_str = addr.address.as_ref().to_string();
     let transport_name = addr.transport.as_deref().unwrap_or("<none>");
@@ -1274,6 +1509,45 @@ fn deliver_local(
         transport = transport_name,
         "starting local delivery"
     );
+
+    // ── Special case: /dev/null file delivery ──
+    //
+    // C Exim (transport.c ~line 280, deliver.c ~line 4175):
+    // When the delivery target is /dev/null, the transport is
+    // "bypassed" — the message is considered delivered without
+    // actually writing anything.  The mainlog shows:
+    //   => /dev/null <original_addr> R=router_name T=**bypassed**
+    //
+    // Detection: if the local_part is "/dev/null" (set by the
+    // redirect router for file deliveries), treat as bypassed.
+    if addr.local_part == "/dev/null" {
+        let router_name = addr.router.as_deref().unwrap_or("???");
+        let top_addr = addr.onetime_parent.as_deref().unwrap_or(&address_str);
+        let ts = format_delivery_timestamp();
+
+        let mainlog_line = format!(
+            "{ts} {mid} => /dev/null <{oa}> R={rn} T=**bypassed**",
+            mid = msg_ctx.message_id,
+            oa = top_addr,
+            rn = router_name,
+        );
+        write_mainlog(config, &mainlog_line);
+
+        let log_msg = format!(
+            "{} => /dev/null <{}> R={} T=**bypassed**\n",
+            msg_ctx.message_id, top_addr, router_name,
+        );
+        let _ = deliver_msglog(
+            &config.spool_directory,
+            &msg_ctx.message_id,
+            &log_msg,
+            config,
+        );
+
+        address_done(addr, "delivered (/dev/null bypassed)");
+        addr_lists.addr_succeed.push(addr.clone());
+        return Ok(());
+    }
 
     // Set expansion variables for this address
     deliver_set_expansions(Some(addr), delivery_ctx);
@@ -1391,6 +1665,78 @@ fn deliver_local(
                             msg_ctx.sender_address.clone(),
                         );
 
+                        // ── Compute message metrics from spool files ──
+                        // These are needed for variable expansion of
+                        // headers_add ($body_linecount, $message_linecount,
+                        // $received_count).
+                        let (body_linecount, message_linecount, received_count) =
+                            compute_message_metrics(&config.spool_directory, &msg_ctx.message_id);
+
+                        // ── Expand and inject transport add_headers ──
+                        // C Exim expands transport headers_add in
+                        // transport_write_message() with full variable
+                        // context.  We expand common variables here and
+                        // pass the result via __expanded_transport_add_headers.
+                        if let Some(ref add_hdr) = tc.add_headers {
+                            let expanded = expand_transport_add_headers(
+                                add_hdr,
+                                body_linecount,
+                                message_linecount,
+                                received_count,
+                                uid,
+                                gid,
+                                spool_data,
+                                &addr.local_part,
+                                addr.prefix.as_deref().unwrap_or(""),
+                                addr.suffix.as_deref().unwrap_or(""),
+                            );
+                            if !expanded.is_empty() {
+                                tc_with_data.private_options_map.insert(
+                                    "__expanded_transport_add_headers".to_string(),
+                                    expanded,
+                                );
+                            }
+                        }
+
+                        // ── Inject router extra_headers (already expanded) ──
+                        if let Some(ref extra) = addr.prop.extra_headers {
+                            if !extra.is_empty() {
+                                tc_with_data.private_options_map.insert(
+                                    "__expanded_router_add_headers".to_string(),
+                                    extra.clone(),
+                                );
+                            }
+                        }
+
+                        // ── Inject stripped local_part and affixes ──
+                        // C Exim's transport sees the STRIPPED local part
+                        // (after prefix/suffix removal by the accepting
+                        // router).  We pass it via the private_options_map
+                        // so the transport can use it for $local_part
+                        // expansion in file paths.
+                        tc_with_data
+                            .private_options_map
+                            .insert("__local_part".to_string(), addr.local_part.clone());
+                        tc_with_data.private_options_map.insert(
+                            "__local_part_prefix".to_string(),
+                            addr.prefix.clone().unwrap_or_default(),
+                        );
+                        tc_with_data.private_options_map.insert(
+                            "__local_part_suffix".to_string(),
+                            addr.suffix.clone().unwrap_or_default(),
+                        );
+
+                        // ── Inject the original (top-level) address ──
+                        // C Exim's Envelope-to header uses the progenitor
+                        // address (walking up addr->parent until root).
+                        // For one-time redirects, we stored this in
+                        // `onetime_parent`.
+                        if let Some(ref orig) = addr.onetime_parent {
+                            tc_with_data
+                                .private_options_map
+                                .insert("__original_address".to_string(), orig.clone());
+                        }
+
                         match driver.transport_entry(&tc_with_data, &address_str) {
                             Ok(tr) => tr,
                             Err(e) => {
@@ -1471,6 +1817,7 @@ fn do_local_deliveries(
     delivery_ctx: &mut DeliveryContext,
     config: &ConfigContext,
     _server_ctx: &ServerContext,
+    spool_data: &SpoolHeaderData,
 ) -> Result<(), DeliveryError> {
     if addr_lists.addr_local.is_empty() {
         trace!("no local addresses to deliver");
@@ -1494,7 +1841,14 @@ fn do_local_deliveries(
 
     // Process each address (or batch)
     for mut addr in local_addrs {
-        deliver_local(&mut addr, addr_lists, msg_ctx, delivery_ctx, config)?;
+        deliver_local(
+            &mut addr,
+            addr_lists,
+            msg_ctx,
+            delivery_ctx,
+            config,
+            spool_data,
+        )?;
     }
 
     debug!(
@@ -1506,6 +1860,260 @@ fn do_local_deliveries(
     );
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Remote Deliveries: execute transport for remote addresses
+// ---------------------------------------------------------------------------
+
+/// Execute remote deliveries for all addresses in `addr_remote`.
+///
+/// This implements step 7 of `deliver_message()`, replacing C Exim's
+/// `do_remote_deliveries()` in deliver.c. For each remote address, we
+/// look up the transport instance, resolve the driver factory, and invoke
+/// the transport's `transport_entry()` method — which for the smtp
+/// transport opens a TCP connection to the destination host and performs
+/// the SMTP transaction.
+///
+/// In C Exim this is done via a subprocess pool for parallelism.  For now
+/// we execute each delivery sequentially in-process, which is sufficient
+/// for correctness (parallelism is a performance optimisation).
+fn do_remote_deliveries(
+    addr_lists: &mut AddressLists,
+    msg_ctx: &MessageContext,
+    delivery_ctx: &mut DeliveryContext,
+    config: &ConfigContext,
+    _server_ctx: &ServerContext,
+    spool_data: &SpoolHeaderData,
+) -> Result<(), DeliveryError> {
+    if addr_lists.addr_remote.is_empty() {
+        trace!("no remote addresses to deliver");
+        return Ok(());
+    }
+
+    let remote_count = addr_lists.addr_remote.len();
+    debug!(count = remote_count, "processing remote deliveries");
+
+    let mut remote_addrs: Vec<AddressItem> = addr_lists.addr_remote.drain(..).collect();
+
+    for mut addr in remote_addrs.drain(..) {
+        let address_str = addr.address.as_ref().to_string();
+
+        // For remote delivery, the RCPT TO address uses the original case-preserved
+        // address with prefix/suffix characters stripped. C Exim's
+        // transport_rcpt_address() reconstructs from addr->address, not from
+        // the lowercased addr->local_part. This preserves original case.
+        let delivery_addr = transport_rcpt_address(&addr);
+
+        let transport_name = addr.transport.clone().unwrap_or_default();
+
+        if transport_name.is_empty() {
+            addr.message = Some("no transport assigned for remote delivery".to_string());
+            addr_lists.addr_failed.push(addr);
+            continue;
+        }
+
+        deliver_set_expansions(Some(&addr), delivery_ctx);
+
+        // Find the transport instance config and driver, then invoke delivery.
+        let transport_config = config.transport_instances.iter().find_map(|arc| {
+            arc.downcast_ref::<TransportInstanceConfig>()
+                .filter(|tc| tc.name == transport_name)
+        });
+
+        let result = match transport_config {
+            Some(tc) => {
+                let driver_type = tc.driver_name.clone();
+                match DriverRegistry::find_transport(&driver_type) {
+                    Some(factory) => {
+                        let driver = (factory.create)();
+                        debug!(
+                            address = %address_str,
+                            transport = %transport_name,
+                            driver = %driver_type,
+                            "invoking remote transport driver"
+                        );
+
+                        // Build a transport config with spool data injected
+                        let mut tc_copy = TransportInstanceConfig {
+                            name: tc.name.clone(),
+                            driver_name: tc.driver_name.clone(),
+                            srcfile: tc.srcfile.clone(),
+                            srcline: tc.srcline,
+                            batch_max: tc.batch_max,
+                            batch_id: tc.batch_id.clone(),
+                            home_dir: tc.home_dir.clone(),
+                            current_dir: tc.current_dir.clone(),
+                            expand_multi_domain: tc.expand_multi_domain.clone(),
+                            multi_domain: tc.multi_domain,
+                            overrides_hosts: tc.overrides_hosts,
+                            max_addresses: tc.max_addresses.clone(),
+                            connection_max_messages: tc.connection_max_messages,
+                            deliver_as_creator: tc.deliver_as_creator,
+                            disable_logging: tc.disable_logging,
+                            initgroups: tc.initgroups,
+                            uid_set: tc.uid_set,
+                            gid_set: tc.gid_set,
+                            uid: tc.uid,
+                            gid: tc.gid,
+                            expand_uid: tc.expand_uid.clone(),
+                            expand_gid: tc.expand_gid.clone(),
+                            warn_message: tc.warn_message.clone(),
+                            shadow: tc.shadow.clone(),
+                            shadow_condition: tc.shadow_condition.clone(),
+                            filter_command: tc.filter_command.clone(),
+                            filter_timeout: tc.filter_timeout,
+                            event_action: tc.event_action.clone(),
+                            add_headers: tc.add_headers.clone(),
+                            remove_headers: tc.remove_headers.clone(),
+                            return_path: tc.return_path.clone(),
+                            debug_string: tc.debug_string.clone(),
+                            max_parallel: tc.max_parallel.clone(),
+                            message_size_limit: tc.message_size_limit.clone(),
+                            headers_rewrite: tc.headers_rewrite.clone(),
+                            body_only: tc.body_only,
+                            delivery_date_add: tc.delivery_date_add,
+                            envelope_to_add: tc.envelope_to_add,
+                            headers_only: tc.headers_only,
+                            rcpt_include_affixes: tc.rcpt_include_affixes,
+                            return_path_add: tc.return_path_add,
+                            return_output: tc.return_output,
+                            return_fail_output: tc.return_fail_output,
+                            log_output: tc.log_output,
+                            log_fail_output: tc.log_fail_output,
+                            log_defer_output: tc.log_defer_output,
+                            retry_use_local_part: tc.retry_use_local_part,
+                            private_options_map: tc.private_options_map.clone(),
+                            // The transport's get_options() builds typed options
+                            // from private_options_map when a downcast fails.
+                            options: Box::new(0u8),
+                        };
+
+                        // Inject spool data for message content access
+                        inject_spool_data_to_transport(
+                            &mut tc_copy,
+                            spool_data,
+                            msg_ctx,
+                            config,
+                            &addr,
+                        );
+
+                        // Inject primary hostname for EHLO expansion
+                        tc_copy.private_options_map.insert(
+                            "__primary_hostname".to_string(),
+                            config.primary_hostname.clone(),
+                        );
+
+                        // Use the stripped delivery address for RCPT TO
+                        // (local_part@domain without prefix/suffix)
+                        let rcpt_addr = if tc_copy.rcpt_include_affixes {
+                            address_str.clone()
+                        } else {
+                            delivery_addr.clone()
+                        };
+
+                        match driver.transport_entry(&tc_copy, &rcpt_addr) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!(
+                                    address = %address_str,
+                                    error = %e,
+                                    "remote transport execution failed"
+                                );
+                                TransportResult::Deferred {
+                                    message: Some(format!("remote transport error: {}", e)),
+                                    errno: Some(0),
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        error!(
+                            driver = %driver_type,
+                            "remote transport driver not found in registry"
+                        );
+                        TransportResult::Deferred {
+                            message: Some(format!("transport driver '{}' not found", driver_type)),
+                            errno: Some(0),
+                        }
+                    }
+                }
+            }
+            None => {
+                error!(
+                    transport = %transport_name,
+                    "remote transport instance not found in config"
+                );
+                TransportResult::Deferred {
+                    message: Some(format!(
+                        "transport '{}' not found in config",
+                        transport_name
+                    )),
+                    errno: Some(0),
+                }
+            }
+        };
+
+        post_process_one(
+            &mut addr,
+            &result,
+            addr_lists,
+            msg_ctx,
+            delivery_ctx,
+            config,
+        )?;
+    }
+
+    debug!(
+        count = remote_count,
+        succeeded = addr_lists.addr_succeed.len(),
+        deferred = addr_lists.addr_defer.len(),
+        failed = addr_lists.addr_failed.len(),
+        "remote deliveries complete"
+    );
+
+    Ok(())
+}
+
+/// Helper: inject spool data into transport config for message content access.
+fn inject_spool_data_to_transport(
+    tc: &mut TransportInstanceConfig,
+    spool_data: &SpoolHeaderData,
+    msg_ctx: &MessageContext,
+    config: &ConfigContext,
+    addr: &AddressItem,
+) {
+    // Inject spool data path for the transport to read message content
+    let data_path = format!("{}/input/{}-D", config.spool_directory, msg_ctx.message_id);
+    tc.private_options_map
+        .insert("__spool_data_file".to_string(), data_path);
+
+    // Inject message headers for transports that need them.
+    // HeaderLine.text already contains the full header line (name: value\n).
+    let mut header_text = String::new();
+    for hdr in &spool_data.headers {
+        header_text.push_str(&hdr.text);
+    }
+    tc.private_options_map
+        .insert("__message_headers".to_string(), header_text);
+
+    // Inject sender address
+    tc.private_options_map.insert(
+        "__sender_address".to_string(),
+        msg_ctx.sender_address.clone(),
+    );
+
+    // Inject stripped local_part and affixes
+    tc.private_options_map
+        .insert("__local_part".to_string(), addr.local_part.clone());
+    tc.private_options_map.insert(
+        "__local_part_prefix".to_string(),
+        addr.prefix.clone().unwrap_or_default(),
+    );
+    tc.private_options_map.insert(
+        "__local_part_suffix".to_string(),
+        addr.suffix.clone().unwrap_or_default(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1633,10 +2241,79 @@ fn route_addresses(
                     transport_name,
                     host_list,
                 } => {
-                    addr.transport = transport_name;
+                    addr.transport = transport_name.clone();
                     addr.host_list = host_list.clone();
 
-                    if host_list.is_empty() {
+                    // ── Special case: blackhole discard (transport_name = None) ──
+                    //
+                    // When the redirect router returns Accept with no transport,
+                    // this is a :blackhole: discard.  C Exim (deliver.c ~line 4175)
+                    // handles this by writing a "=> :blackhole:" mainlog entry and
+                    // marking the address as delivered without invoking any transport.
+                    //
+                    // Without this special case, the address would be pushed onto
+                    // addr_local and then fail in do_local_deliveries() because
+                    // there is no transport to dispatch to.
+                    if transport_name.is_none() {
+                        let router_name = addr.router.as_deref().unwrap_or("???");
+                        let top_addr = addr.onetime_parent.as_deref().unwrap_or(&address_str);
+                        let ts = format_delivery_timestamp();
+
+                        // C Exim format: "=> :blackhole: <original_addr> R=router_name"
+                        let mainlog_line = format!(
+                            "{ts} {mid} => :blackhole: <{oa}> R={rn}",
+                            mid = msg_ctx.message_id,
+                            oa = top_addr,
+                            rn = router_name,
+                        );
+                        write_mainlog(config, &mainlog_line);
+
+                        // Write to per-message log as well
+                        let log_msg = format!(
+                            "{} => :blackhole: <{}> R={}\n",
+                            msg_ctx.message_id, top_addr, router_name,
+                        );
+                        let _ = deliver_msglog(
+                            &config.spool_directory,
+                            &msg_ctx.message_id,
+                            &log_msg,
+                            config,
+                        );
+
+                        address_done(&mut addr, "delivered (blackhole)");
+                        addr_lists.addr_succeed.push(addr);
+                        continue;
+                    }
+
+                    // Classify as local vs remote using the transport
+                    // driver's `is_local` flag — matching C Exim's
+                    // `rf_queue_add()` logic in routers/rf_queue_add.c.
+                    //
+                    // Steps:
+                    //  1. Find the transport *instance* config by name
+                    //  2. Look up the driver *factory* by driver_name
+                    //  3. If factory.is_local → local, else → remote
+                    //
+                    // Fallback: if transport cannot be resolved, use the
+                    // host_list emptiness heuristic.
+                    let is_local_transport = if let Some(ref tname) = transport_name {
+                        let driver_name = config.transport_instances.iter().find_map(|arc| {
+                            arc.downcast_ref::<TransportInstanceConfig>()
+                                .filter(|tc| tc.name == *tname)
+                                .map(|tc| tc.driver_name.clone())
+                        });
+                        if let Some(ref dname) = driver_name {
+                            DriverRegistry::find_transport(dname)
+                                .map(|f| f.is_local)
+                                .unwrap_or(host_list.is_empty())
+                        } else {
+                            host_list.is_empty()
+                        }
+                    } else {
+                        host_list.is_empty()
+                    };
+
+                    if is_local_transport {
                         // Local delivery
                         trace!(
                             address = %address_str,
@@ -1645,7 +2322,9 @@ fn route_addresses(
                         );
                         addr_lists.addr_local.push(addr);
                     } else {
-                        // Remote delivery
+                        // Remote delivery — if the router didn't supply
+                        // hosts, the transport itself defines them (e.g.
+                        // smtp transport with `hosts = ...`).
                         trace!(
                             address = %address_str,
                             transport = addr.transport.as_deref().unwrap_or("<none>"),
@@ -1697,10 +2376,77 @@ fn route_addresses(
                         new_count = new_addresses.len(),
                         "address rerouted to new addresses"
                     );
+                    // Track the original top-level address for delivery
+                    // logging.  C Exim (deliver.c ~line 7377) sets
+                    // `new->onetime_parent = recipients_list[pno].address`.
+                    // IMPORTANT: use addr.address (qualified after routing),
+                    // NOT the stale pre-qualification `address_str`.
+                    let original = addr
+                        .onetime_parent
+                        .clone()
+                        .unwrap_or_else(|| addr.address.as_ref().to_string());
+                    let parent_router = addr.router.clone();
+
                     for new_addr_str in &new_addresses {
                         let mut new_addr = deliver_make_addr(new_addr_str);
-                        new_addr.parent_index = 0; // Would be the index of parent
-                        addr_lists.addr_new.push(new_addr);
+                        new_addr.parent_index = 0;
+                        new_addr.onetime_parent = Some(original.clone());
+
+                        // ── File/pipe delivery detection ──
+                        //
+                        // C Exim: the redirect router places file and pipe
+                        // delivery addresses directly on addr_local with
+                        // the appropriate transport already assigned.
+                        // These addresses are NOT re-routed.
+                        //
+                        // Detection:
+                        //  - File delivery: address starts with '/'
+                        //  - Pipe delivery: address starts with '|'
+                        //
+                        // For file deliveries, the redirect router's
+                        // `file_transport` config option provides the
+                        // transport name.  We look it up from the router
+                        // config.  For `/dev/null`, the transport is set
+                        // but bypassed — the `deliver_local` function
+                        // handles the `/dev/null` special case.
+                        if new_addr_str.starts_with('/') || new_addr_str.starts_with('|') {
+                            // Set the router name from the parent address
+                            new_addr.router = parent_router.clone();
+
+                            // Find the file/pipe transport from the router config
+                            let is_pipe = new_addr_str.starts_with('|');
+                            if let Some(ref rname) = parent_router {
+                                let transport_name =
+                                    config.router_instances.iter().find_map(|arc| {
+                                        arc.downcast_ref::<RouterInstanceConfig>()
+                                            .filter(|rc| rc.name == *rname)
+                                            .and_then(|rc| {
+                                                if is_pipe {
+                                                    rc.private_options_map
+                                                        .get("pipe_transport")
+                                                        .cloned()
+                                                } else {
+                                                    rc.private_options_map
+                                                        .get("file_transport")
+                                                        .cloned()
+                                                }
+                                            })
+                                    });
+                                new_addr.transport = transport_name;
+                            }
+
+                            // Set local_part for /dev/null detection
+                            new_addr.local_part = new_addr_str.clone();
+
+                            trace!(
+                                address = %new_addr_str,
+                                transport = new_addr.transport.as_deref().unwrap_or("<none>"),
+                                "file/pipe delivery — direct to local queue"
+                            );
+                            addr_lists.addr_local.push(new_addr);
+                        } else {
+                            addr_lists.addr_new.push(new_addr);
+                        }
                     }
                 }
             }
@@ -1739,7 +2485,24 @@ fn route_single_address(
     _msg_ctx: &MessageContext,
     _delivery_ctx: &DeliveryContext,
 ) -> Result<RouterResult, DeliveryError> {
-    let address_str = addr.address.as_ref().to_string();
+    let mut address_str = addr.address.as_ref().to_string();
+
+    // ── Address qualification (C: route.c ~line 1700) ──
+    // If the address has no domain, qualify it with qualify_domain.
+    // In C Exim, unqualified local addresses are qualified during
+    // reception (receive.c), but we also ensure it here for safety.
+    if !address_str.contains('@') {
+        let qualify = if config.qualify_domain_recipient.is_empty() {
+            &config.qualify_domain_sender
+        } else {
+            &config.qualify_domain_recipient
+        };
+        if !qualify.is_empty() {
+            address_str = format!("{}@{}", address_str, qualify);
+            addr.address = exim_store::taint::Tainted::new(address_str.clone());
+            addr.domain = qualify.clone();
+        }
+    }
 
     // Walk through configured router instances. Each entry is an
     // Arc<dyn Any + Send + Sync> wrapping a RouterInstanceConfig created
@@ -1781,11 +2544,193 @@ fn route_single_address(
             "trying router"
         );
 
+        // ── Router precondition checks (C: route.c route_address() lines 1760–2100) ──
+        // These checks mirror the generic preconditions evaluated by the C routing
+        // framework BEFORE calling the driver-specific route() entry point.
+        //
+        // IMPORTANT: In C Exim the ordering is:
+        //   1. domains check
+        //   2. prefix/suffix stripping
+        //   3. local_parts check (uses STRIPPED local part)
+        //   4. check_local_user (uses STRIPPED local part)
+        //   5. condition check
+        //   6. driver.route()
+
+        // Extract local part and domain from the address
+        let (local_part, domain) = {
+            if let Some(at_pos) = address_str.rfind('@') {
+                (&address_str[..at_pos], &address_str[at_pos + 1..])
+            } else {
+                (address_str.as_str(), "")
+            }
+        };
+
+        // 1. Check `domains` precondition (C: route.c ~line 1830)
+        //    If the router specifies a domain list, skip if the address domain
+        //    doesn't match.
+        if let Some(ref domains_list) = router_config.domains {
+            let named = build_named_domain_map(config);
+            // Resolve `@` in the domain list to primary_hostname
+            let expanded = domains_list.replace("@", &config.primary_hostname);
+            let matched = match_domain_list(domain, &expanded, &named);
+            if !matched {
+                debug!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    domains = %domains_list,
+                    "router skipped: domain does not match domains list"
+                );
+                continue;
+            }
+        }
+
+        // 2. Prefix / suffix stripping (C: route.c ~line 2050-2100)
+        //    MUST happen BEFORE local_parts / check_local_user checks
+        //    because those checks use the stripped local part.
+        //
+        // C Exim (route.c ~line 1658): By default, addr->local_part is set
+        // to the lowercased version (`lc_local_part`) unless the router has
+        // `caseful_local_part` enabled.
+        let working_lp = if router_config.caseful_local_part {
+            local_part.to_string()
+        } else {
+            local_part.to_ascii_lowercase()
+        };
+        let mut routed_local_part = working_lp.clone();
+        let mut stripped_prefix = String::new();
+        let mut stripped_suffix = String::new();
+
+        // Strip prefix if configured (e.g. `local_part_prefix = *+`)
+        if let Some(ref pfx_pattern) = router_config.prefix {
+            if let Some((pfx, rest)) = match_affix(&working_lp, pfx_pattern, true) {
+                stripped_prefix = pfx;
+                routed_local_part = rest;
+            } else if !router_config.prefix_optional {
+                // Prefix is required but doesn't match — skip router
+                debug!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    prefix = %pfx_pattern,
+                    "router skipped: required prefix not found"
+                );
+                continue;
+            }
+        }
+
+        // Strip suffix if configured (e.g. `local_part_suffix = -S`)
+        if let Some(ref sfx_pattern) = router_config.suffix {
+            if let Some((sfx, rest)) = match_affix(&routed_local_part, sfx_pattern, false) {
+                stripped_suffix = sfx;
+                routed_local_part = rest;
+            } else if !router_config.suffix_optional {
+                // Suffix is required but doesn't match — skip router
+                debug!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    suffix = %sfx_pattern,
+                    "router skipped: required suffix not found"
+                );
+                continue;
+            }
+        }
+
+        // 3. Check `local_parts` precondition (C: route.c ~line 1850)
+        //    Uses the STRIPPED local part (after prefix/suffix removal).
+        if let Some(ref lp_list) = router_config.local_parts {
+            let named = build_named_localpart_map(config);
+            let matched = match_string_list_generic(&routed_local_part, lp_list, false, &named);
+            if !matched {
+                debug!(
+                    router = %router_config.name,
+                    address = %address_str,
+                    stripped_local = %routed_local_part,
+                    "router skipped: local_part does not match local_parts list"
+                );
+                continue;
+            }
+        }
+
+        // 4. Check `check_local_user` precondition (C: route.c ~line 1960)
+        //    Uses the STRIPPED local part.
+        if router_config.check_local_user {
+            match check_local_user_exists(&routed_local_part) {
+                Some((uid, gid)) => {
+                    debug!(
+                        router = %router_config.name,
+                        local_part = %routed_local_part,
+                        uid = uid,
+                        gid = gid,
+                        "check_local_user: user found"
+                    );
+                    // Set uid/gid on the address for later use by transport
+                    addr.uid = uid;
+                    addr.gid = gid;
+                }
+                None => {
+                    debug!(
+                        router = %router_config.name,
+                        local_part = %routed_local_part,
+                        "router skipped: check_local_user failed — user not found"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // 5. Check `condition` precondition (C: route.c ~line 1900)
+        //    If set, expand the condition string and skip if it evaluates to false/empty.
+        if let Some(ref condition) = router_config.condition {
+            // Simple condition check: expand the string and check if non-empty/truthy
+            let expanded = condition.trim();
+            if expanded.is_empty()
+                || expanded == "0"
+                || expanded.eq_ignore_ascii_case("false")
+                || expanded.eq_ignore_ascii_case("no")
+            {
+                debug!(
+                    router = %router_config.name,
+                    "router skipped: condition evaluated to false"
+                );
+                continue;
+            }
+        }
+
+        // ── End precondition checks — proceed to driver dispatch ──
+
+        // ── Set up thread-local ExpandContext for variable resolution ──
+        // In C Exim, global variables like `deliver_domain`, `deliver_localpart`,
+        // `deliver_localpart_prefix`, `deliver_localpart_suffix` are set before
+        // the driver route() call.  We populate the thread-local ExpandContext
+        // so that $domain, $local_part, $local_part_prefix, etc. resolve
+        // correctly during string expansion within the router.
+        {
+            let mut exp_ctx = exim_expand::variables::ExpandContext::new();
+            exp_ctx.domain = domain.to_string();
+            exp_ctx.local_part = routed_local_part.clone();
+            exp_ctx.local_part_prefix = stripped_prefix.clone();
+            exp_ctx.local_part_suffix = stripped_suffix.clone();
+            exp_ctx.local_part_prefix_v = stripped_prefix.clone();
+            exp_ctx.local_part_suffix_v = stripped_suffix.clone();
+            exp_ctx.router_name = router_config.name.clone();
+            exp_ctx.primary_hostname =
+                exim_store::taint::Clean::new(config.primary_hostname.clone());
+            exp_ctx.qualify_domain =
+                exim_store::taint::Clean::new(config.qualify_domain_sender.clone());
+            exp_ctx.qualify_recipient =
+                exim_store::taint::Clean::new(config.qualify_domain_recipient.clone());
+            // Sender address from message context
+            exp_ctx.sender_address =
+                exim_store::taint::Tainted::new(_msg_ctx.sender_address.clone());
+            exp_ctx.message_id = _msg_ctx.message_id.clone();
+            exim_expand::set_expand_context(Some(exp_ctx));
+        }
+
         // Look up the driver factory in the registry.
         let factory =
             match exim_drivers::registry::DriverRegistry::find_router(&router_config.driver_name) {
                 Some(f) => f,
                 None => {
+                    exim_expand::set_expand_context(None);
                     warn!(
                         router = %router_config.name,
                         driver = %router_config.driver_name,
@@ -1799,6 +2744,9 @@ fn route_single_address(
         let driver = (factory.create)();
         let result = driver.route(router_config, &address_str, None);
 
+        // Clear thread-local context after routing
+        exim_expand::set_expand_context(None);
+
         match result {
             Ok(RouterResult::Accept {
                 transport_name,
@@ -1811,6 +2759,48 @@ fn route_single_address(
                     transport = %tname,
                     "router accepted address"
                 );
+                // Set the router name on the address for logging/post-processing
+                addr.router = Some(router_config.name.clone());
+
+                // ── Update addr.local_part to the stripped (routed) value ──
+                // C Exim (route.c ~line 1658): addr->local_part is set to
+                // the lowercased, prefix/suffix-stripped local part after
+                // routing.  The prefix and suffix are stored separately.
+                addr.local_part = routed_local_part.clone();
+                if !stripped_prefix.is_empty() {
+                    addr.prefix = Some(stripped_prefix.clone());
+                }
+                if !stripped_suffix.is_empty() {
+                    addr.suffix = Some(stripped_suffix.clone());
+                }
+
+                // ── Copy router extra_headers (headers_add) ──
+                // C Exim route.c copies extra_headers from the router
+                // config to the address, expanding $local_user_uid /
+                // $local_user_gid using the passwd results from
+                // check_local_user.
+                if let Some(ref extra) = router_config.extra_headers {
+                    let mut exp_ctx = exim_expand::variables::ExpandContext::new();
+                    exp_ctx.local_user_uid = addr.uid;
+                    exp_ctx.local_user_gid = addr.gid;
+                    match exim_expand::expand_string_with_context(extra, &mut exp_ctx) {
+                        Ok(expanded) => {
+                            if !expanded.is_empty() {
+                                addr.prop.extra_headers = Some(expanded);
+                            }
+                        }
+                        Err(_e) => {
+                            // Expansion failure for router extra_headers is non-fatal;
+                            // C Exim logs and continues delivery.
+                        }
+                    }
+                }
+
+                // ── Copy router remove_headers ──
+                if let Some(ref remove) = router_config.remove_headers {
+                    addr.prop.remove_headers = Some(remove.clone());
+                }
+
                 return Ok(RouterResult::Accept {
                     transport_name,
                     host_list,
@@ -1858,6 +2848,11 @@ fn route_single_address(
                     address = %address_str,
                     "router rerouted address"
                 );
+                // Record which router produced the Rerouted result so that
+                // downstream delivery-log lines can print `R=<name>`.  In C
+                // Exim, the parent router is always known when generating
+                // child addresses from redirect/alias expansion.
+                addr.router = Some(router_config.name.clone());
                 return Ok(RouterResult::Rerouted { new_addresses });
             }
             Err(e) => {
@@ -2089,7 +3084,14 @@ pub fn deliver_message(
             count = addr_lists.addr_local.len(),
             "dispatching local deliveries"
         );
-        do_local_deliveries(&mut addr_lists, msg_ctx, delivery_ctx, config, server_ctx)?;
+        do_local_deliveries(
+            &mut addr_lists,
+            msg_ctx,
+            delivery_ctx,
+            config,
+            server_ctx,
+            &spool_data,
+        )?;
         update_spool = true;
     }
 
@@ -2099,14 +3101,14 @@ pub fn deliver_message(
             count = addr_lists.addr_remote.len(),
             "dispatching remote deliveries"
         );
-        // In production, this calls parallel::do_remote_deliveries() which
-        // manages a subprocess pool for parallel remote delivery.
-        // For the orchestrator framework, we defer all remote addresses.
-        let remote_addrs: Vec<AddressItem> = addr_lists.addr_remote.drain(..).collect();
-        for mut addr in remote_addrs {
-            addr.message = Some("remote delivery pending transport implementation".to_string());
-            addr_lists.addr_defer.push(addr);
-        }
+        do_remote_deliveries(
+            &mut addr_lists,
+            msg_ctx,
+            delivery_ctx,
+            config,
+            server_ctx,
+            &spool_data,
+        )?;
         update_spool = true;
     }
 
@@ -2229,7 +3231,27 @@ pub fn deliver_message(
             failed = addr_lists.addr_failed.len(),
             "all recipients processed — message complete"
         );
-        // In production: remove -H and -D files from spool
+
+        // Write "Completed" entry to mainlog (C Exim deliver.c line ~7059).
+        let ts = format_delivery_timestamp();
+        write_mainlog(config, &format!("{ts} {id} Completed"));
+
+        // Remove spool files: -H, -D, and -J (journal) files.
+        let spool_dir = &config.spool_directory;
+        let input_dir = Path::new(spool_dir).join("input");
+        for suffix in &["-H", "-D", "-J"] {
+            let path = input_dir.join(format!("{id}{suffix}"));
+            if path.exists() {
+                let _ = fs::remove_file(&path);
+            }
+        }
+
+        // Remove msglog file — C Exim removes it when delivery is complete
+        // (deliver.c ~line 7106).
+        let msglog_path = Path::new(spool_dir).join("msglog").join(id);
+        if msglog_path.exists() {
+            let _ = fs::remove_file(&msglog_path);
+        }
     } else {
         info!(
             message_id = id,
@@ -2260,6 +3282,486 @@ pub fn deliver_message(
     );
 
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Router precondition helpers
+// ---------------------------------------------------------------------------
+
+/// Build a named domain list map from ConfigContext for domain matching.
+///
+/// Converts from ConfigContext's `BTreeMap<String, NamedList>` to the
+/// `HashMap<String, String>` format expected by `match_domain_list`.
+fn build_named_domain_map(config: &ConfigContext) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for (name, nl) in &config.named_lists.domain_lists {
+        // Resolve `@` in the list value to primary_hostname
+        let val = nl.value.replace("@", &config.primary_hostname);
+        map.insert(name.clone(), val);
+    }
+    map
+}
+
+/// Build a named local-part list map from ConfigContext.
+fn build_named_localpart_map(config: &ConfigContext) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for (name, nl) in &config.named_lists.localpart_lists {
+        map.insert(name.clone(), nl.value.clone());
+    }
+    map
+}
+
+/// Match a prefix or suffix pattern against a local part.
+///
+/// In C Exim (route.c `route_check_prefix`/`route_check_suffix`), prefix
+/// and suffix patterns are colon-separated lists.  Each element may contain
+/// a wildcard `*` matching zero or more characters.
+///
+/// For a **prefix** (e.g. `*+`):
+///   - The pattern is matched against the beginning of the local part.
+///   - `*+` means "any characters followed by `+`". For `page+user`, the
+///     prefix is `page+` and the remaining local part is `user`.
+///
+/// For a **suffix** (e.g. `-S`):
+///   - The pattern is matched against the end of the local part.
+///   - `-S` means the local part must end with `-S`. For `user-S`, the
+///     suffix is `-S` and the remaining local part is `user`.
+///
+/// Returns `Some((matched_affix, remaining_local_part))` on success,
+/// `None` if no pattern matches.
+fn match_affix(local_part: &str, pattern_list: &str, is_prefix: bool) -> Option<(String, String)> {
+    // C Exim uses strncmpic() (case-insensitive) for all prefix/suffix
+    // matching in route_check_prefix() and route_check_suffix().  We
+    // replicate that by lowercasing both sides before comparison, but
+    // return the ORIGINAL (non-lowercased) matched portions so callers
+    // see the actual characters from the local part.
+    let lp_lower = local_part.to_ascii_lowercase();
+
+    for pattern in pattern_list.split(':') {
+        let pat = pattern.trim();
+        if pat.is_empty() {
+            continue;
+        }
+        let pat_lower = pat.to_ascii_lowercase();
+
+        if is_prefix {
+            // Prefix matching
+            if let Some(star_pos) = pat.find('*') {
+                // Wildcard prefix: e.g. `*+` means any chars then `+`
+                let after_star = &pat_lower[star_pos + 1..];
+                let before_star = &pat_lower[..star_pos];
+                // The local part must start with before_star, then have
+                // the after_star delimiter somewhere after that.
+                if !before_star.is_empty() && !lp_lower.starts_with(before_star) {
+                    continue;
+                }
+                let search_start = before_star.len();
+                let search_area = &lp_lower[search_start..];
+                // C Exim scans from the RIGHT for prefix wildcards (route.c
+                // line 420: `for (p = local_part + Ustrlen(local_part) - (--plen); p >= local_part; p--)`)
+                // That finds the RIGHTMOST occurrence.  But the `*` is at the
+                // START of the pattern for prefixes, and the fixed part is at
+                // the end.  The scan finds the rightmost position where the
+                // fixed part starts, so the wildcard portion is as LARGE as
+                // possible.
+                if let Some(delim_pos) = search_area.rfind(after_star) {
+                    let prefix_end = search_start + delim_pos + after_star.len();
+                    if prefix_end < local_part.len() {
+                        let prefix_str = &local_part[..prefix_end];
+                        let remainder = &local_part[prefix_end..];
+                        return Some((prefix_str.to_string(), remainder.to_string()));
+                    }
+                }
+            } else {
+                // Exact prefix match (no wildcard) — case-insensitive
+                if lp_lower.starts_with(&pat_lower) && pat_lower.len() < local_part.len() {
+                    let prefix_str = &local_part[..pat.len()];
+                    let remainder = &local_part[pat.len()..];
+                    return Some((prefix_str.to_string(), remainder.to_string()));
+                }
+            }
+        } else {
+            // Suffix matching
+            if let Some(star_pos) = pat.find('*') {
+                // Wildcard suffix: e.g. `-*` means `-` then any chars
+                let before_star = &pat_lower[..star_pos];
+                let _after_star = &pat_lower[star_pos + 1..];
+                // C code scans left-to-right: `for (p = local_part; p < pend; p++)`
+                // checking strncmpic(suffix, p, slen).
+                let slen = before_star.len();
+                if slen == 0 {
+                    // Just `*` — matches zero-length suffix
+                    return Some((String::new(), local_part.to_string()));
+                }
+                let alen = local_part.len();
+                // Scan from left to right like C code
+                if alen > slen {
+                    for pos in 0..=(alen - slen) {
+                        if lp_lower[pos..].starts_with(before_star) {
+                            let suffix_str = &local_part[pos..];
+                            let remainder = &local_part[..pos];
+                            if !remainder.is_empty() {
+                                return Some((suffix_str.to_string(), remainder.to_string()));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Exact suffix match (no wildcard) — case-insensitive
+                let slen = pat.len();
+                if local_part.len() > slen && lp_lower[local_part.len() - slen..] == pat_lower[..] {
+                    let suffix_str = &local_part[local_part.len() - slen..];
+                    let remainder = &local_part[..local_part.len() - slen];
+                    return Some((suffix_str.to_string(), remainder.to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Match a domain against a domain list (colon-separated).
+/// Supports: exact match, wildcard (*.), negation (!), named lists (+name),
+/// and `@` for primary hostname.
+fn match_domain_list(
+    domain: &str,
+    list: &str,
+    named_lists: &std::collections::HashMap<String, String>,
+) -> bool {
+    let domain_lower = domain.to_lowercase();
+    let items = split_list(list);
+
+    for item in &items {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (negated, pattern) = if let Some(rest) = trimmed.strip_prefix('!') {
+            (true, rest.trim())
+        } else {
+            (false, trimmed)
+        };
+
+        // Named list: +listname
+        if let Some(list_name) = pattern.strip_prefix('+') {
+            if let Some(list_value) = named_lists.get(list_name) {
+                let inner = match_domain_list(&domain_lower, list_value, named_lists);
+                if inner {
+                    return !negated;
+                }
+            }
+            continue;
+        }
+
+        let pat_lower = pattern.to_lowercase();
+
+        // Wildcard: *.example.com
+        if let Some(_rest) = pat_lower.strip_prefix("*.") {
+            let suffix = &pat_lower[1..]; // .example.com
+            let matched = domain_lower.ends_with(suffix) || domain_lower == pat_lower[2..];
+            if matched {
+                return !negated;
+            }
+        } else if let Some(rest) = pat_lower.strip_prefix('.') {
+            let matched = domain_lower.ends_with(&pat_lower) || domain_lower == rest;
+            if matched {
+                return !negated;
+            }
+        } else {
+            // Exact match
+            if domain_lower == pat_lower {
+                return !negated;
+            }
+        }
+    }
+    false
+}
+
+/// Match a string against a colon-separated list.
+/// Supports: exact match (case-insensitive), wildcard (*), negation (!),
+/// named lists (+name).
+fn match_string_list_generic(
+    value: &str,
+    list: &str,
+    case_sensitive: bool,
+    named_lists: &std::collections::HashMap<String, String>,
+) -> bool {
+    let val = if case_sensitive {
+        value.to_string()
+    } else {
+        value.to_lowercase()
+    };
+    let items = split_list(list);
+
+    for item in &items {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (negated, pattern) = if let Some(rest) = trimmed.strip_prefix('!') {
+            (true, rest.trim())
+        } else {
+            (false, trimmed)
+        };
+
+        // Named list: +listname
+        if let Some(list_name) = pattern.strip_prefix('+') {
+            if let Some(list_value) = named_lists.get(list_name) {
+                let inner =
+                    match_string_list_generic(value, list_value, case_sensitive, named_lists);
+                if inner {
+                    return !negated;
+                }
+            }
+            continue;
+        }
+
+        let pat = if case_sensitive {
+            pattern.to_string()
+        } else {
+            pattern.to_lowercase()
+        };
+
+        // Wildcard prefix: *suffix
+        if let Some(suffix) = pat.strip_prefix('*') {
+            if val.ends_with(suffix) {
+                return !negated;
+            }
+        } else if val == pat {
+            return !negated;
+        }
+    }
+    false
+}
+
+/// Split a colon-separated Exim list, handling doubled colons as escape.
+fn split_list(list: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut chars = list.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == ':' {
+            if chars.peek() == Some(&':') {
+                // Doubled colon → literal colon
+                chars.next();
+                current.push(':');
+            } else {
+                items.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        items.push(current);
+    }
+    items
+}
+
+/// Check if a local part corresponds to a valid local system user.
+///
+/// Returns `Some((uid, gid))` if the user exists, `None` otherwise.
+/// This replaces the C `route_finduser()` function call that sets
+/// `pw` (passwd struct) and `local_user_uid`/`local_user_gid`.
+///
+/// Uses the `nix` crate's safe `User::from_name()` wrapper to avoid
+/// any `unsafe` code in this crate (which has `#![forbid(unsafe_code)]`).
+fn check_local_user_exists(local_part: &str) -> Option<(u32, u32)> {
+    match nix::unistd::User::from_name(local_part) {
+        Ok(Some(user)) => Some((user.uid.as_raw(), user.gid.as_raw())),
+        _ => None,
+    }
+}
+
+/// Compute message metrics from spool files.
+///
+/// Reads the -H and -D files to determine:
+/// - `body_linecount`: lines in the message body (from -D file)
+/// - `message_linecount`: total lines in the message (headers + body)
+/// - `received_count`: number of Received: headers
+///
+/// Returns (body_linecount, message_linecount, received_count).
+fn compute_message_metrics(spool_dir: &str, msg_id: &str) -> (i32, i32, i32) {
+    let input_dir = format!("{}/input", spool_dir);
+
+    // Count Received: headers and header lines from -H file
+    let h_path = format!("{}/{}-H", input_dir, msg_id);
+    let mut received_count = 0i32;
+    let mut header_linecount = 0i32;
+    if let Ok(f) = std::fs::File::open(&h_path) {
+        if let Ok(hdr_data) = exim_spool::spool_read_header(f, true) {
+            for hdr in &hdr_data.headers {
+                if hdr.header_type == 'X' {
+                    continue; // skip deleted
+                }
+                // Count lines in header text
+                header_linecount += hdr.text.lines().count() as i32;
+                // Check if it's a Received: header
+                if hdr.text.starts_with("Received:") || hdr.header_type == '*' {
+                    received_count += 1;
+                }
+            }
+        }
+    }
+
+    // Count body lines from -D file
+    let d_path = format!("{}/{}-D", input_dir, msg_id);
+    let mut body_linecount = 0i32;
+    if let Ok(data) = std::fs::read(&d_path) {
+        // Skip the first line (header line "msgid-D\n")
+        let msg_start = data
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let body = &data[msg_start..];
+        // Count newlines in body
+        body_linecount = body.iter().filter(|&&b| b == b'\n').count() as i32;
+    }
+
+    let message_linecount = header_linecount + body_linecount;
+    (body_linecount, message_linecount, received_count)
+}
+
+/// Expand transport `headers_add` template with message metric variables.
+///
+/// C Exim expands these in `transport_write_message()`.  The common variables
+/// used in transport headers_add are:
+/// - `$body_linecount`
+/// - `$message_linecount`
+/// - `$received_count`
+/// - `$local_user_uid`
+/// - `$local_user_gid`
+#[allow(clippy::too_many_arguments)] // mirrors C Exim's expand_transport_add_headers parameter set
+fn expand_transport_add_headers(
+    template: &str,
+    body_linecount: i32,
+    message_linecount: i32,
+    received_count: i32,
+    uid: u32,
+    gid: u32,
+    spool_data: &SpoolHeaderData,
+    local_part: &str,
+    prefix: &str,
+    suffix: &str,
+) -> String {
+    let mut result = template.to_string();
+    // Replace \\n (literal backslash-n in config) with actual newlines.
+    // Config parser may have already translated these, but handle both.
+    result = result.replace("\\n", "\n");
+
+    // C Exim config continuation (`\n\` followed by indented next line)
+    // strips leading whitespace on continuation lines when the value is
+    // a multi-header string like headers_add.  After converting `\n` to
+    // real newlines, strip leading whitespace from every line except the
+    // first so that each header starts at column 0.
+    //
+    // Example config:
+    //   headers_add = "X-a: 1\n\
+    //                  X-b: 2"
+    // Must produce two headers "X-a: 1" and "X-b: 2" (no indent on X-b).
+    let lines: Vec<&str> = result.split('\n').collect();
+    if lines.len() > 1 {
+        let mut cleaned = String::with_capacity(result.len());
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                cleaned.push('\n');
+                cleaned.push_str(line.trim_start());
+            } else {
+                cleaned.push_str(line);
+            }
+        }
+        result = cleaned;
+    }
+
+    result = result.replace("$body_linecount", &body_linecount.to_string());
+    result = result.replace("$message_linecount", &message_linecount.to_string());
+    result = result.replace("$received_count", &received_count.to_string());
+    result = result.replace("$local_user_uid", &uid.to_string());
+    result = result.replace("$local_user_gid", &gid.to_string());
+
+    // Expand variables sourced from the spool header envelope data.
+    // C Exim's expand_string() resolves these from global variables that
+    // were populated when the spool header was read during delivery.
+    let iface = spool_data.interface_address.as_deref().unwrap_or("");
+    result = result.replace("$interface_address", iface);
+
+    let host_addr = spool_data.host_address.as_deref().unwrap_or("");
+    result = result.replace("$sender_host_address", host_addr);
+
+    let host_name = spool_data.host_name.as_deref().unwrap_or("");
+    result = result.replace("$sender_host_name", host_name);
+
+    let protocol = spool_data.received_protocol.as_deref().unwrap_or("");
+    result = result.replace("$received_protocol", protocol);
+
+    let ident = spool_data.sender_ident.as_deref().unwrap_or("");
+    result = result.replace("$sender_ident", ident);
+
+    // ── $message_headers / $message_headers_raw ──
+    // C Exim's find_header(NULL, ...) iterates all headers that are not
+    // htype_old ('*') and concatenates their text.
+    //
+    // For the COOKED variant ($message_headers), C Exim:
+    //   1. Concatenates header texts
+    //   2. Strips trailing whitespace (including newlines)
+    //   3. Applies RFC 2047 decoding
+    //
+    // For the RAW variant ($message_headers_raw), C Exim:
+    //   1. Concatenates header texts verbatim
+    //   2. Preserves trailing whitespace/newlines as-is
+    //   3. No RFC 2047 decoding
+    if result.contains("$message_headers") {
+        // Build raw header text from spool headers (skip deleted '*' type)
+        let mut raw_headers = String::new();
+        for h in &spool_data.headers {
+            if h.header_type == '*' {
+                continue;
+            }
+            raw_headers.push_str(&h.text);
+        }
+        // Cooked: strip trailing whitespace, then RFC 2047 decode
+        let cooked = {
+            let trimmed = raw_headers.trim_end();
+            rfc2047_decode(trimmed)
+        };
+        // IMPORTANT: Replace the longer name first to avoid partial
+        // matching ("$message_headers_raw" contains "$message_headers").
+        // Raw: preserve trailing newlines verbatim (matches C Exim).
+        result = result.replace("$message_headers_raw", &raw_headers);
+        result = result.replace("$message_headers", &cooked);
+    }
+
+    // ── Address-derived variables (C: transport sets these from addr->*) ──
+    // $local_part_prefix_v is the "variable" part (without the wildcard
+    // delimiter).  For `local_part_prefix = *+` matching `page+`, the
+    // variable part is `page` (everything before the `+`).
+    let prefix_v = if prefix.len() > 1 {
+        // Strip the last char (the wildcard delimiter like '+')
+        &prefix[..prefix.len() - 1]
+    } else {
+        prefix
+    };
+    let suffix_v = if suffix.len() > 1 {
+        // Strip the first char (the wildcard delimiter like '-')
+        &suffix[1..]
+    } else {
+        suffix
+    };
+    // CRITICAL: Replace longer variable names FIRST to prevent partial
+    // matching (e.g. "$local_part_prefix" must not eat the start of
+    // "$local_part_prefix_v").
+    result = result.replace("$local_part_prefix_v", prefix_v);
+    result = result.replace("$local_part_prefix", prefix);
+    result = result.replace("$local_part_suffix_v", suffix_v);
+    result = result.replace("$local_part_suffix", suffix);
+    // $local_part_data defaults to $local_part when no override.
+    result = result.replace("$local_part_data", local_part);
+    result = result.replace("$local_part", local_part);
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -2472,17 +3974,17 @@ mod tests {
     #[test]
     fn test_log_formatting() {
         let mut ctx = DeliveryContext::default();
-        assert_eq!(d_log_interface(&ctx), "");
-        assert_eq!(d_hostlog(&ctx), "");
+        assert_eq!(_d_log_interface(&ctx), "");
+        assert_eq!(_d_hostlog(&ctx), "");
 
         ctx.sending_ip_address = Some("192.168.1.1".to_string());
         ctx.sending_port = 25;
-        assert_eq!(d_log_interface(&ctx), " I=[192.168.1.1]:25");
+        assert_eq!(_d_log_interface(&ctx), " I=[192.168.1.1]:25");
 
         ctx.deliver_host = Some("mx.example.com".to_string());
         ctx.deliver_host_address = Some("10.0.0.1".to_string());
         ctx.deliver_host_port = 587;
-        let hl = d_hostlog(&ctx);
+        let hl = _d_hostlog(&ctx);
         assert!(hl.contains("mx.example.com"));
         assert!(hl.contains("[10.0.0.1]"));
         assert!(hl.contains(":587"));
@@ -2491,10 +3993,10 @@ mod tests {
     #[test]
     fn test_d_loglength() {
         let mut ctx = MessageContext::default();
-        assert_eq!(d_loglength(&ctx), "");
+        assert_eq!(_d_loglength(&ctx), "");
 
         ctx.message_size = 1234;
-        assert_eq!(d_loglength(&ctx), " S=1234");
+        assert_eq!(_d_loglength(&ctx), " S=1234");
     }
 
     #[test]
@@ -2511,7 +4013,7 @@ mod tests {
         let delivery_ctx = DeliveryContext::default();
         let config = ConfigContext::default();
 
-        let result = TransportResult::Ok;
+        let result = TransportResult::ok();
         post_process_one(
             &mut addr,
             &result,

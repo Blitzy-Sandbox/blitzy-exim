@@ -316,6 +316,18 @@ pub struct EximCli {
     /// `-oMt <ident>`: override sender ident (testing).
     pub sender_ident: Option<String>,
 
+    /// `-oMaa <name>`: override sender_host_authenticated (testing).
+    pub sender_host_authenticated: Option<String>,
+
+    /// `-oMai <id>`: override authenticated_id (testing).
+    pub authenticated_id: Option<String>,
+
+    /// `-oMas <sender>`: override authenticated_sender (testing).
+    pub authenticated_sender: Option<String>,
+
+    /// `-oMm <id>`: override message reference (testing).
+    pub message_reference: Option<String>,
+
     /// `-ps` / `-pd`: Perl startup option. `1` = force start, `-1` = delay.
     pub perl_start_option: i32,
 
@@ -1162,6 +1174,10 @@ impl Default for EximCli {
             incoming_interface: None,
             received_protocol: None,
             sender_ident: None,
+            sender_host_authenticated: None,
+            authenticated_id: None,
+            authenticated_sender: None,
+            message_reference: None,
             perl_start_option: 0,
             flag_n: false,
             selective_force: false,
@@ -1222,6 +1238,35 @@ fn print_usage() {
 fn fail_bad_option(opt: &str) -> ! {
     eprintln!("exim: unknown, malformed, or incomplete option {}", opt);
     std::process::exit(1);
+}
+
+/// Validate an Exim message ID format: `XXXXXX-YYYYYY-XX`
+/// 6 base-62 chars, hyphen, 6 base-62 chars, hyphen, 2 base-62 chars.
+fn is_valid_message_id(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 16 {
+        return false;
+    }
+    if bytes[6] != b'-' || bytes[13] != b'-' {
+        return false;
+    }
+    let is_base62 = |b: u8| b.is_ascii_alphanumeric();
+    for &i in &[0, 1, 2, 3, 4, 5] {
+        if !is_base62(bytes[i]) {
+            return false;
+        }
+    }
+    for &i in &[7, 8, 9, 10, 11, 12] {
+        if !is_base62(bytes[i]) {
+            return false;
+        }
+    }
+    for &i in &[14, 15] {
+        if !is_base62(bytes[i]) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Require the next argument to exist, or exit with an error.
@@ -1700,7 +1745,18 @@ fn parse_o_options(cli: &mut EximCli, args: &[String], mut i: usize, rest: &str)
                 "r" => cli.received_protocol = Some(val),
                 "s" => cli.sender_host_name = Some(val),
                 "t" => cli.sender_ident = Some(val),
-                "aa" | "as" | "ai" | "m" => { /* accepted, stored by caller */ }
+                "aa" => cli.sender_host_authenticated = Some(val),
+                "ai" => cli.authenticated_id = Some(val),
+                "as" => cli.authenticated_sender = Some(val),
+                "m" => {
+                    // Validate message ID format: XXXXXX-YYYYYY-ZZ
+                    // C Exim checks for valid base-62 characters and hyphen positions
+                    if !is_valid_message_id(&val) {
+                        eprintln!("exim: -oMm must be a valid message ID");
+                        std::process::exit(1);
+                    }
+                    cli.message_reference = Some(val);
+                }
                 _ => fail_bad_option(&args[i - 1]),
             }
         }

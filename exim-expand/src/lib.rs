@@ -40,7 +40,17 @@
 #![warn(missing_docs)]
 #![deny(clippy::all)]
 
+use std::cell::RefCell;
+
 // ── Submodule declarations ──────────────────────────────────────────────
+
+/// C-Exim–compatible box-drawing expansion debug trace output.
+///
+/// When `-d+expand` is active, this module emits a tree-structured trace
+/// to stderr showing every step of string expansion, using the same
+/// Unicode (or ASCII, with `+noutf8`) box-drawing characters and
+/// indentation rules as the C reference implementation.
+pub mod debug_trace;
 
 /// Lexical analysis of `${…}` expansion expressions.
 pub mod tokenizer;
@@ -85,6 +95,7 @@ use rand::RngExt;
 
 // ── Re-exports from submodules ──────────────────────────────────────────
 
+pub use evaluator::rfc2047_decode;
 pub use evaluator::Evaluator;
 pub use parser::AstNode;
 pub use tokenizer::Token;
@@ -131,13 +142,29 @@ pub enum ExpandError {
     #[error("forced failure")]
     ForcedFail,
 
+    /// The expansion's `{fail}` keyword was triggered in an item branch
+    /// (e.g. `${lookup{key}lsearch{file}{$value}fail}`).
+    ///
+    /// In C Exim this sets both `expand_string_message` (the descriptive
+    /// text shown by `-be` mode) **and** `f.expand_string_forcedfail`
+    /// (checked by the redirect router to decide DECLINE vs DEFER).
+    ///
+    /// The `-be` mode displays this as `Failed: {message}` (same format
+    /// as [`Failed`](Self::Failed)), while the redirect router treats it
+    /// as a forced failure → DECLINE.
+    #[error("expansion failed: {message}")]
+    FailRequested {
+        /// Descriptive message, e.g. `"lookup" failed and "fail" requested`.
+        message: String,
+    },
+
     /// A tainted (untrusted) string was used in a context that requires
     /// a clean (trusted) value.
     #[error("tainted string expansion attempt: {0}")]
     TaintedInput(String),
 
     /// The expanded string could not be interpreted as an integer.
-    #[error("integer interpretation error: {0}")]
+    #[error("{0}")]
     IntegerError(String),
 
     /// A lookup operation deferred (temporary failure) during expansion.
@@ -326,7 +353,43 @@ const DB_KEYWORDS: &[&str] = &[
 //  Primary expansion functions
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Expand an Exim configuration string containing `${…}` expressions.
+// ── Thread-local expansion context ─────────────────────────────────────
+//
+// In C Exim, the expansion engine reads from global variables (domain,
+// local_part, sender_address, etc.) which are set before each expansion
+// call site.  In Rust, we replace this with a thread-local `ExpandContext`
+// that the routing and delivery code populates before expanding strings.
+
+thread_local! {
+    /// Thread-local expansion context.
+    ///
+    /// When set (via [`set_expand_context`]), `expand_string()` and
+    /// `expand_string_2()` use this context for variable resolution.
+    /// When unset (`None`), a fresh default context is used (backwards
+    /// compatible with existing callers that don't set routing variables).
+    static THREAD_EXPAND_CTX: RefCell<Option<variables::ExpandContext>> = const { RefCell::new(None) };
+}
+
+/// Set the thread-local expansion context.
+///
+/// Call this before invoking expansion functions that need access to
+/// variables like `$local_part`, `$domain`, `$sender_address`, etc.
+/// Typically called by the routing framework before processing each
+/// address through the router chain.
+///
+/// Pass `None` to clear the context (restoring default empty behavior).
+pub fn set_expand_context(ctx: Option<variables::ExpandContext>) {
+    THREAD_EXPAND_CTX.with(|cell| {
+        *cell.borrow_mut() = ctx;
+    });
+}
+
+/// Get a clone of the current thread-local expansion context, or
+/// `None` if no context has been set.
+pub fn get_expand_context() -> Option<variables::ExpandContext> {
+    THREAD_EXPAND_CTX.with(|cell| cell.borrow().clone())
+}
+
 ///
 /// This is the main expansion entry point, consumed by virtually every
 /// subsystem in the Exim MTA.  It replaces the C `expand_string()`
@@ -375,12 +438,30 @@ pub fn expand_string(string: &str) -> Result<String, ExpandError> {
 /// Same as [`expand_string`].
 pub fn expand_string_with_context(
     string: &str,
-    ctx: &variables::ExpandContext,
+    ctx: &mut variables::ExpandContext,
 ) -> Result<String, ExpandError> {
     tracing::debug!(input = %string, "expand_string_with_context entry");
 
+    let debug_on = ctx.debug_expand;
+    let noutf8 = ctx.debug_noutf8;
+    let saved_depth = ctx.expand_depth;
+
+    // C Exim: expand_level++ happens BEFORE the "considering:" output,
+    // so the top-level invocation prints at depth 1 (1 leading space).
+    let depth = saved_depth + 1;
+    ctx.expand_depth = depth;
+
+    // Emit the "considering:" trace when debug+expand is active.
+    if debug_on {
+        debug_trace::trace_considering(depth, string, noutf8);
+    }
+
     // Fast path: no expansion characters → return input unchanged.
     if !string.contains('$') && !string.contains('\\') {
+        if debug_on {
+            debug_trace::trace_result(depth, string, noutf8);
+        }
+        ctx.expand_depth = saved_depth;
         return Ok(string.to_owned());
     }
 
@@ -390,7 +471,26 @@ pub fn expand_string_with_context(
 
     let mut eval = evaluator::Evaluator::new(ctx);
     let flags = EsiFlags::ESI_HONOR_DOLLAR;
-    eval.evaluate(&ast, flags)
+    let result = eval.evaluate(&ast, flags);
+    ctx.expand_depth = saved_depth;
+
+    match &result {
+        Ok(ref expanded) => {
+            if debug_on {
+                // C Exim emits "expanded:" showing the original input, then
+                // "result:" showing the final output, both at the same depth.
+                debug_trace::trace_expanded(depth, string, noutf8);
+                debug_trace::trace_result(depth, expanded, noutf8);
+            }
+        }
+        Err(ref e) => {
+            if debug_on {
+                debug_trace::trace_failed_expand(depth, string, noutf8);
+                debug_trace::trace_error_message(depth, &e.to_string(), noutf8);
+            }
+        }
+    }
+    result
 }
 
 /// Expand an Exim configuration string with text-only detection.
@@ -423,9 +523,22 @@ pub fn expand_string_2(string: &str, textonly: &mut bool) -> Result<String, Expa
     let mut parser_inst = parser::Parser::new(string);
     let ast = parser_inst.parse()?;
 
-    let mut eval = evaluator::Evaluator::new_default();
-    let flags = EsiFlags::ESI_HONOR_DOLLAR;
-    eval.evaluate(&ast, flags)
+    // Use the thread-local expand context if one has been set (e.g., by
+    // the routing framework), otherwise fall back to the default empty
+    // context for backward compatibility.
+    let result = THREAD_EXPAND_CTX.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(ref mut ctx) = *guard {
+            let mut eval = evaluator::Evaluator::new(ctx);
+            let flags = EsiFlags::ESI_HONOR_DOLLAR;
+            eval.evaluate(&ast, flags)
+        } else {
+            let mut eval = evaluator::Evaluator::new_default();
+            let flags = EsiFlags::ESI_HONOR_DOLLAR;
+            eval.evaluate(&ast, flags)
+        }
+    });
+    result
 }
 
 /// Return whether `string` expands to a non-empty value.
@@ -449,12 +562,24 @@ pub fn expand_string_nonempty(string: &str) -> bool {
         Err(_) => return false,
     };
 
-    let mut eval = evaluator::Evaluator::new_default();
-    let flags = EsiFlags::ESI_HONOR_DOLLAR | EsiFlags::ESI_EXISTS_ONLY;
-    match eval.evaluate(&ast, flags) {
-        Ok(s) => !s.is_empty(),
-        Err(_) => false,
-    }
+    THREAD_EXPAND_CTX.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(ref mut ctx) = *guard {
+            let mut eval = evaluator::Evaluator::new(ctx);
+            let flags = EsiFlags::ESI_HONOR_DOLLAR | EsiFlags::ESI_EXISTS_ONLY;
+            match eval.evaluate(&ast, flags) {
+                Ok(s) => !s.is_empty(),
+                Err(_) => false,
+            }
+        } else {
+            let mut eval = evaluator::Evaluator::new_default();
+            let flags = EsiFlags::ESI_HONOR_DOLLAR | EsiFlags::ESI_EXISTS_ONLY;
+            match eval.evaluate(&ast, flags) {
+                Ok(s) => !s.is_empty(),
+                Err(_) => false,
+            }
+        }
+    })
 }
 
 /// Expand a string and guarantee a new owned copy is returned.
@@ -958,10 +1083,7 @@ mod tests {
     #[test]
     fn expand_error_display_integer() {
         let e = ExpandError::IntegerError("not a number".into());
-        assert_eq!(
-            format!("{}", e),
-            "integer interpretation error: not a number"
-        );
+        assert_eq!(format!("{}", e), "not a number");
     }
 
     #[test]

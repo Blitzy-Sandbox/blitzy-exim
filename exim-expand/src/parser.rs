@@ -94,6 +94,10 @@ pub enum ItemKind {
     Env,
     /// `${extract{field}{…}{string}}` — sub-field extraction.
     Extract,
+    /// `${extract json {key}{json_data}}` — JSON value extraction (unquoted).
+    ExtractJson,
+    /// `${extract jsons{key}{json_data}}` — JSON string extraction (quoted).
+    ExtractJsons,
     /// `${filter{list}{condition}{…}}` — list filtering.
     Filter,
     /// `${hash{limit}{prime}{string}}` — hash-bucket mapping.
@@ -155,7 +159,7 @@ pub enum ItemKind {
 /// Operators use the `${operator:subject}` syntax, applying a
 /// transformation to their subject expression.  Each variant maps to
 /// an `EOP_*` enum value in the C code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatorKind {
     // ── Underscore operators (op_table_underscore, lines 184-197) ────
     /// `${from_utf8:…}` — decode UTF-8 to Latin-1.
@@ -218,6 +222,9 @@ pub enum OperatorKind {
     HashOp,
     /// `${headerwrap:…}` — wrap header at 76 columns with continuation.
     Headerwrap,
+    /// `${headerwrap_N:…}` or `${headerwrap_N_M:…}` — wrap header at
+    /// N columns (or N columns with M max).
+    HeaderwrapParam(i64, Option<i64>),
     /// `${hex2b64:…}` — hex to base-64.
     Hex2b64,
     /// `${hexquote:…}` — hex-encode non-printables.
@@ -236,8 +243,20 @@ pub enum OperatorKind {
     Listcount,
     /// `${listnamed:…}` — retrieve a named list by name.
     Listnamed,
+    /// `${listnamed_d:…}` — retrieve a domain named list.
+    ListnamedD,
+    /// `${listnamed_h:…}` — retrieve a host named list.
+    ListnamedH,
+    /// `${listnamed_a:…}` — retrieve an address named list.
+    ListnamedA,
+    /// `${listnamed_l:…}` — retrieve a local_part named list.
+    ListnamedL,
     /// `${mask:…}` — apply CIDR mask to IP address.
     Mask,
+    /// `${mask_n:…}` — mask with normalized/compressed IPv6 output.
+    MaskNorm,
+    /// `${mask_N:…}` — apply N-bit CIDR mask to IP address.
+    MaskParam(u8),
     /// `${md5:…}` — MD5 hash (hex digest).
     Md5,
     /// `${nh:…}` — alias for numeric hash.
@@ -246,6 +265,8 @@ pub enum OperatorKind {
     Nhash,
     /// `${quote:…}` — shell-safe quoting.
     Quote,
+    /// `${quote_TYPE:…}` — lookup-type-specific quoting.
+    QuoteLookup(String),
     /// `${randint:…}` — random integer 0..N-1.
     Randint,
     /// `${rfc2047:…}` — RFC 2047 encode.
@@ -431,6 +452,12 @@ pub struct ConditionNode {
     pub condition_type: ConditionType,
     /// Operands for the condition (0, 1, 2, or more depending on type).
     pub operands: Vec<AstNode>,
+    /// Sub-conditions for `and`/`or` compound conditions.
+    ///
+    /// In C Exim, `and{...}` and `or{...}` read a single brace-enclosed
+    /// block containing multiple `{subcondition}` sub-blocks.  Each
+    /// sub-condition is a complete condition expression.
+    pub sub_conditions: Vec<ConditionNode>,
 }
 
 /// Abstract Syntax Tree node for Exim expansion strings.
@@ -494,6 +521,10 @@ pub enum AstNode {
         yes_branch: Option<Box<AstNode>>,
         /// Optional failure branch `{no_string}`.
         no_branch: Option<Box<AstNode>>,
+        /// When true, a bare `fail` keyword was present after the
+        /// yes-branch, causing forced failure when the item produces
+        /// no result (C Exim expand.c line 3107).
+        fail_force: bool,
     },
 
     /// Operator/transform: `${operator:subject}`.
@@ -508,10 +539,16 @@ pub enum AstNode {
     Conditional {
         /// The parsed condition with type and operands.
         condition: Box<ConditionNode>,
-        /// The "yes" / success branch.
-        yes_branch: Box<AstNode>,
+        /// The "yes" / success branch.  `None` when the caller used the
+        /// bare `${if condition}` form (no braces at all) — the evaluator
+        /// returns the literal string `"true"` when the condition is true
+        /// and an empty string when false.
+        yes_branch: Option<Box<AstNode>>,
         /// Optional "no" / failure branch.
         no_branch: Option<Box<AstNode>>,
+        /// When `true`, the bare `fail` keyword was used after the
+        /// yes-branch, causing forced failure when the condition is false.
+        fail_force: bool,
     },
 
     /// A sequence of adjacent AST nodes that are concatenated in order.
@@ -533,6 +570,46 @@ pub enum AstNode {
 ///
 /// The lookup table matches `item_table[]` (expand.c lines 109-142).
 /// Returns `None` for unrecognised names.
+/// Map an [`ItemKind`] back to its canonical lowercase name string.
+pub fn item_kind_to_name(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Acl => "acl",
+        ItemKind::AuthResults => "authresults",
+        ItemKind::CertExtract => "certextract",
+        ItemKind::Dlfunc => "dlfunc",
+        ItemKind::Env => "env",
+        ItemKind::Extract => "extract",
+        ItemKind::ExtractJson => "extract json",
+        ItemKind::ExtractJsons => "extract jsons",
+        ItemKind::Filter => "filter",
+        ItemKind::Hash => "hash",
+        ItemKind::Hmac => "hmac",
+        ItemKind::If => "if",
+        ItemKind::ImapFolder => "imapfolder",
+        ItemKind::Length => "length",
+        ItemKind::ListExtract => "listextract",
+        ItemKind::ListQuote => "listquote",
+        ItemKind::Lookup => "lookup",
+        ItemKind::Map => "map",
+        ItemKind::Nhash => "nhash",
+        ItemKind::Perl => "perl",
+        ItemKind::Prvs => "prvs",
+        ItemKind::PrvsCheck => "prvscheck",
+        ItemKind::ReadFile => "readfile",
+        ItemKind::ReadSocket => "readsocket",
+        ItemKind::Reduce => "reduce",
+        ItemKind::Run => "run",
+        ItemKind::Sg => "sg",
+        ItemKind::Sort => "sort",
+        ItemKind::SrsEncode => "srs_encode",
+        ItemKind::Substr => "substr",
+        ItemKind::Tr => "tr",
+    }
+}
+
+/// Map a keyword string to its [`ItemKind`] discriminant.
+///
+/// Returns `None` for unrecognised names.
 pub fn item_name_to_kind(name: &str) -> Option<ItemKind> {
     match name {
         "acl" => Some(ItemKind::Acl),
@@ -542,16 +619,16 @@ pub fn item_name_to_kind(name: &str) -> Option<ItemKind> {
         "env" => Some(ItemKind::Env),
         "extract" => Some(ItemKind::Extract),
         "filter" => Some(ItemKind::Filter),
-        "hash" => Some(ItemKind::Hash),
+        "h" | "hash" => Some(ItemKind::Hash),
         "hmac" => Some(ItemKind::Hmac),
         "if" => Some(ItemKind::If),
         "imapfolder" => Some(ItemKind::ImapFolder),
-        "length" => Some(ItemKind::Length),
+        "l" | "length" => Some(ItemKind::Length),
         "listextract" => Some(ItemKind::ListExtract),
         "listquote" => Some(ItemKind::ListQuote),
         "lookup" => Some(ItemKind::Lookup),
         "map" => Some(ItemKind::Map),
-        "nhash" => Some(ItemKind::Nhash),
+        "nh" | "nhash" => Some(ItemKind::Nhash),
         "perl" => Some(ItemKind::Perl),
         "prvs" => Some(ItemKind::Prvs),
         "prvscheck" => Some(ItemKind::PrvsCheck),
@@ -559,10 +636,10 @@ pub fn item_name_to_kind(name: &str) -> Option<ItemKind> {
         "readsocket" => Some(ItemKind::ReadSocket),
         "reduce" => Some(ItemKind::Reduce),
         "run" => Some(ItemKind::Run),
+        "s" | "substr" => Some(ItemKind::Substr),
         "sg" => Some(ItemKind::Sg),
         "sort" => Some(ItemKind::Sort),
         "srs_encode" => Some(ItemKind::SrsEncode),
-        "substr" => Some(ItemKind::Substr),
         "tr" => Some(ItemKind::Tr),
         _ => None,
     }
@@ -613,7 +690,12 @@ pub fn operator_name_to_kind(name: &str) -> Option<OperatorKind> {
         "length" => Some(OperatorKind::LengthOp),
         "listcount" => Some(OperatorKind::Listcount),
         "listnamed" => Some(OperatorKind::Listnamed),
+        "listnamed_d" => Some(OperatorKind::ListnamedD),
+        "listnamed_h" => Some(OperatorKind::ListnamedH),
+        "listnamed_a" => Some(OperatorKind::ListnamedA),
+        "listnamed_l" => Some(OperatorKind::ListnamedL),
         "mask" => Some(OperatorKind::Mask),
+        "mask_n" => Some(OperatorKind::MaskNorm),
         "md5" => Some(OperatorKind::Md5),
         "nh" => Some(OperatorKind::Nh),
         "nhash" => Some(OperatorKind::Nhash),
@@ -634,7 +716,11 @@ pub fn operator_name_to_kind(name: &str) -> Option<OperatorKind> {
         "uc" => Some(OperatorKind::Uc),
         "utf8clean" => Some(OperatorKind::Utf8clean),
         "xtextd" => Some(OperatorKind::Xtextd),
-        _ => None,
+        _ => {
+            // Check for quote_TYPE pattern (lookup-type-specific quoting)
+            name.strip_prefix("quote_")
+                .map(|lookup_type| OperatorKind::QuoteLookup(lookup_type.to_string()))
+        }
     }
 }
 
@@ -771,14 +857,16 @@ fn condition_operand_count(ctype: &ConditionType) -> usize {
 /// collection up to a sane limit.
 fn item_arg_spec(kind: &ItemKind) -> (usize, usize, bool) {
     match kind {
-        ItemKind::Acl => (2, 2, true),
+        ItemKind::Acl => (1, 10, true),
         ItemKind::AuthResults => (1, 1, false),
         ItemKind::CertExtract => (2, 2, true),
         ItemKind::Dlfunc => (2, usize::MAX, false),
         ItemKind::Env => (1, 1, true),
         ItemKind::Extract => (2, 3, true),
+        ItemKind::ExtractJson => (2, 2, true),
+        ItemKind::ExtractJsons => (2, 2, true),
         ItemKind::Filter => (2, 2, false),
-        ItemKind::Hash => (3, 3, false),
+        ItemKind::Hash => (2, 3, false),
         ItemKind::Hmac => (3, 3, false),
         ItemKind::If => (0, 0, false), // special-cased via parse_conditional_item
         ItemKind::ImapFolder => (1, 1, false),
@@ -787,10 +875,10 @@ fn item_arg_spec(kind: &ItemKind) -> (usize, usize, bool) {
         ItemKind::ListQuote => (2, 2, false),
         ItemKind::Lookup => (0, 0, false), // special-cased via parse_lookup_item
         ItemKind::Map => (2, 2, false),
-        ItemKind::Nhash => (3, 3, false),
+        ItemKind::Nhash => (2, 3, false),
         ItemKind::Perl => (1, usize::MAX, false),
-        ItemKind::Prvs => (3, 4, false),
-        ItemKind::PrvsCheck => (2, 2, true),
+        ItemKind::Prvs => (2, 3, false),
+        ItemKind::PrvsCheck => (2, 3, false),
         ItemKind::ReadFile => (1, 2, false),
         ItemKind::ReadSocket => (1, 5, false),
         ItemKind::Reduce => (3, 3, false),
@@ -842,12 +930,20 @@ fn try_header_prefix(name: &str) -> Option<(HeaderPrefix, &str)> {
     best.map(|(variant, plen)| (variant, &name[plen..]))
 }
 
+// Returns `true` if `name` starts with a recognised header prefix.
+//
+// Used by the braced-expression parser to distinguish `${h_subject:}`
+// (header reference — colon terminates the name) from `${unknown_op:…}`
+// (unknown operator — colon separates operator from subject).
+
 // ═══════════════════════════════════════════════════════════════════════
 //  Parser — recursive-descent AST construction
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Result type for yes/no branch parsing — `(optional_yes, optional_no)`.
-type YesNoBranches = (Option<Box<AstNode>>, Option<Box<AstNode>>);
+/// Tuple type for parsed yes/no branches and optional `fail` keyword.
+/// `(yes_branch, no_branch, fail_force)`
+type YesNoBranches = (Option<Box<AstNode>>, Option<Box<AstNode>>, bool);
 
 /// Recursive-descent parser that builds an [`AstNode`] tree from a
 /// token stream produced by [`crate::tokenizer::Tokenizer`].
@@ -873,6 +969,13 @@ pub struct Parser {
     tokens: Vec<Token>,
     /// Current read position (index) into the token vector.
     position: usize,
+    /// Tokenization error deferred until parse() is called.
+    tokenizer_error: Option<ExpandError>,
+    /// Mirrors C Exim's `malformed_header` flag (expand.c line 868).
+    /// Set when a header variable name consumed characters that look
+    /// like expression syntax (e.g. braces), indicating the header
+    /// name was probably not terminated by a colon.
+    pub malformed_header: bool,
 }
 
 impl Parser {
@@ -885,20 +988,30 @@ impl Parser {
     /// let mut parser = Parser::new(input);
     /// let ast = parser.parse()?;
     /// ```
+    /// Creates a parser from an input string.
+    ///
+    /// Tokenization errors are stored and re-raised on first `parse()` call.
     pub fn new(input: &str) -> Self {
         let mut tokenizer = Tokenizer::new(input);
-        // Tokenize entire input; on error produce a single Eof token
-        // so the parser can report a clean error message.
-        let spanned = tokenizer.tokenize().unwrap_or_else(|_| {
-            vec![crate::tokenizer::SpannedToken {
-                token: Token::Eof,
-                span: crate::tokenizer::TokenSpan::new(0, 0),
-            }]
-        });
-        let tokens: Vec<Token> = spanned.into_iter().map(|st| st.token).collect();
-        Self {
-            tokens,
-            position: 0,
+        match tokenizer.tokenize() {
+            Ok(spanned) => {
+                let tokens: Vec<Token> = spanned.into_iter().map(|st| st.token).collect();
+                Self {
+                    tokens,
+                    position: 0,
+                    tokenizer_error: None,
+                    malformed_header: tokenizer.malformed_header,
+                }
+            }
+            Err(e) => {
+                // Store the error to re-raise on parse()
+                Self {
+                    tokens: vec![Token::Eof],
+                    position: 0,
+                    tokenizer_error: Some(e),
+                    malformed_header: tokenizer.malformed_header,
+                }
+            }
         }
     }
 
@@ -913,6 +1026,8 @@ impl Parser {
         Self {
             tokens,
             position: 0,
+            tokenizer_error: None,
+            malformed_header: false,
         }
     }
 
@@ -958,6 +1073,110 @@ impl Parser {
         }
     }
 
+    /// Reconstruct a truncated raw-text preview of the token stream
+    /// from the current position, matching C Exim's 16-char snippet
+    /// style used in error diagnostics.
+    fn peek_text_preview(&self, max_chars: usize) -> String {
+        let mut buf = String::new();
+        let mut pos = self.position;
+        while buf.len() < max_chars {
+            let tok = self.tokens.get(pos).unwrap_or(&Token::Eof);
+            let frag = match tok {
+                Token::Literal(s) => s.clone(),
+                Token::Identifier(s) => s.clone(),
+                Token::ConditionKeyword(s) => s.clone(),
+                Token::ItemKeyword(s) => s.clone(),
+                Token::OperatorKeyword(s) => s.clone(),
+                Token::OpenBrace => "{".to_string(),
+                Token::CloseBrace => "}".to_string(),
+                Token::Dollar => "$".to_string(),
+                Token::Colon => ":".to_string(),
+                Token::Eof => break,
+                _ => format!("{:?}", tok),
+            };
+            buf.push_str(&frag);
+            pos += 1;
+        }
+        if buf.len() > max_chars {
+            buf.truncate(max_chars);
+        }
+        buf
+    }
+
+    /// Build a preview of the remaining token stream for inclusion in
+    /// error messages (e.g. curly-bracket problem diagnostics).
+    ///
+    /// Behaves like [`peek_text_preview`] but with an arbitrary length
+    /// cap and always starting from the current parser position.
+    fn remaining_text_preview(&self, max_chars: usize) -> String {
+        self.peek_text_preview(max_chars)
+    }
+
+    /// Produce the correct "unknown expansion operator" error for an
+    /// identifier followed by `:` inside `${ … }`.
+    ///
+    /// C Exim (expand.c §7370-7410) distinguishes two sub-cases:
+    ///
+    /// 1. The prefix before the first `_` is a known main-table operator
+    ///    that does NOT support `_arg` → error includes "(\"prefix\"
+    ///    does not take an _arg)".
+    /// 2. Everything else → plain "unknown expansion operator \"name\"".
+    fn make_unknown_operator_error(&self, name: &str) -> ExpandError {
+        // Operators that support underscore arguments (C: case list
+        // at expand.c ~7393-7404).
+        const ACCEPTS_ARG: &[&str] = &[
+            "sha2",
+            "sha256",
+            "sha3",
+            "headerwrap",
+            "listnamed",
+            "mask",
+            "quote",
+            "quote_local_part",
+            "length",
+            "l",
+            "substr",
+            "s",
+            "hash",
+            "h",
+            "nhash",
+            "nh",
+        ];
+
+        // Special case: listnamed with bad suffix → C Exim returns
+        // "bad suffix on "list" operator" (expand.c ~7378).
+        if let Some(suffix) = name.strip_prefix("listnamed_") {
+            if !matches!(suffix, "d" | "h" | "a" | "l") {
+                return ExpandError::Failed {
+                    message: "bad suffix on \"list\" operator".into(),
+                };
+            }
+        }
+
+        if let Some(underscore_pos) = name.find('_') {
+            let prefix = &name[..underscore_pos];
+            // Check if the prefix IS a known main-table operator
+            if operator_name_to_kind(prefix).is_some() {
+                // Prefix is known — does it accept _arg?
+                if !ACCEPTS_ARG.contains(&prefix) {
+                    return ExpandError::Failed {
+                        message: format!(
+                            "unknown expansion operator \"{}\" (\"{}\" does not take an _arg)",
+                            name, prefix
+                        ),
+                    };
+                }
+                // Known prefix that accepts args — shouldn't normally
+                // reach here because such forms go through
+                // ParametricOperator, but fall through to generic error.
+            }
+        }
+
+        ExpandError::Failed {
+            message: format!("unknown expansion operator \"{}\"", name),
+        }
+    }
+
     // ─── Primary parsing entry points ───────────────────────────────
 
     /// Parse the entire token stream into an AST.
@@ -966,6 +1185,10 @@ impl Parser {
     /// complete input and returns a single [`AstNode`] (which may be a
     /// [`Sequence`](AstNode::Sequence) of sub-nodes).
     pub fn parse(&mut self) -> Result<AstNode, ExpandError> {
+        // Re-raise deferred tokenizer error if present
+        if let Some(e) = self.tokenizer_error.take() {
+            return Err(e);
+        }
         let node = self.parse_sequence()?;
         Ok(node)
     }
@@ -980,7 +1203,23 @@ impl Parser {
     /// The closing brace is **not** consumed — the caller is
     /// responsible for consuming it when appropriate.
     pub fn parse_sequence(&mut self) -> Result<AstNode, ExpandError> {
+        self.parse_sequence_inner(false)
+    }
+
+    /// Parse a sequence of nodes until `Eof` or `CloseBrace`.
+    ///
+    /// When `inside_braces` is true (i.e. we are inside a `{…}` delimited
+    /// argument), bare `{` is tracked for brace-nesting depth so that the
+    /// correct closing `}` is matched.  When `inside_braces` is false
+    /// (top-level input), bare `{` and `}` are treated as literal text per
+    /// C Exim's expansion loop behaviour.
+    pub fn parse_sequence_inner(&mut self, _inside_braces: bool) -> Result<AstNode, ExpandError> {
         let mut nodes: Vec<AstNode> = Vec::new();
+        // Track whether the last emitted node was a literal `$` from a
+        // `\$` escape.  If so, the next `{` should be literal text (not
+        // the start of a grouped expression), matching C Exim behaviour
+        // where `\$` prevents expansion of the following characters.
+        let mut prev_was_escaped_dollar = false;
 
         loop {
             match self.peek().clone() {
@@ -989,34 +1228,117 @@ impl Parser {
                 Token::Literal(s) => {
                     self.advance();
                     nodes.push(AstNode::Literal(s));
+                    prev_was_escaped_dollar = false;
                 }
                 Token::EscapeChar(c) => {
                     self.advance();
                     nodes.push(AstNode::Escape(c));
+                    prev_was_escaped_dollar = false;
                 }
                 Token::BackslashLiteral(c) => {
                     self.advance();
                     nodes.push(AstNode::Escape(c));
+                    prev_was_escaped_dollar = c == '$';
                 }
                 Token::ProtectedRegion(s) => {
                     self.advance();
                     nodes.push(AstNode::Protected(s));
+                    prev_was_escaped_dollar = false;
                 }
                 Token::Dollar => {
                     let node = self.parse_dollar_expression()?;
                     nodes.push(node);
+                    prev_was_escaped_dollar = false;
                 }
                 Token::OpenBrace => {
-                    // Bare `{` outside `${}` context — in Exim expansion
-                    // strings, unquoted braces that are not part of a
-                    // construct are literal text.  We parse the inner
-                    // content and absorb the closing brace if present.
-                    self.advance();
-                    let inner = self.parse_sequence()?;
-                    if self.peek() == &Token::CloseBrace {
+                    if prev_was_escaped_dollar {
+                        // After `\$`, treat `{` as literal text, but
+                        // `$variable` references inside are still expanded
+                        // (matching C Exim behavior where `\$` just outputs
+                        // a literal `$` then scanning continues normally).
+                        // So `\${before $acl_m0 after}` → `${before EXPANDED after}`.
+                        self.advance(); // consume `{`
+                        let mut text = String::from("{");
+                        let mut depth = 1u32;
+                        while depth > 0 && self.peek() != &Token::Eof {
+                            match self.peek().clone() {
+                                Token::Dollar => {
+                                    // Flush accumulated literal text
+                                    if !text.is_empty() {
+                                        nodes.push(AstNode::Literal(text.clone()));
+                                        text.clear();
+                                    }
+                                    // Parse the dollar expression normally
+                                    // so that $var inside \${...} is expanded
+                                    let node = self.parse_dollar_expression()?;
+                                    nodes.push(node);
+                                }
+                                Token::OpenBrace => {
+                                    text.push('{');
+                                    depth += 1;
+                                    self.advance();
+                                }
+                                Token::CloseBrace => {
+                                    depth -= 1;
+                                    text.push('}');
+                                    self.advance();
+                                }
+                                Token::Literal(s) => {
+                                    text.push_str(&s);
+                                    self.advance();
+                                }
+                                Token::EscapeChar(c) => {
+                                    text.push(c);
+                                    self.advance();
+                                }
+                                Token::BackslashLiteral(c) => {
+                                    text.push(c);
+                                    self.advance();
+                                }
+                                Token::Colon => {
+                                    text.push(':');
+                                    self.advance();
+                                }
+                                Token::Comma => {
+                                    text.push(',');
+                                    self.advance();
+                                }
+                                Token::Identifier(s) => {
+                                    text.push_str(&s);
+                                    self.advance();
+                                }
+                                Token::ItemKeyword(s)
+                                | Token::OperatorKeyword(s)
+                                | Token::ConditionKeyword(s) => {
+                                    text.push_str(&s);
+                                    self.advance();
+                                }
+                                Token::ProtectedRegion(s) => {
+                                    text.push_str(&s);
+                                    self.advance();
+                                }
+                                _ => {
+                                    // Any other token — render as-is
+                                    self.advance();
+                                }
+                            }
+                        }
+                        if !text.is_empty() {
+                            nodes.push(AstNode::Literal(text));
+                        }
+                    } else {
+                        // Bare `{` outside `${}` context — in Exim expansion
+                        // strings, unquoted braces that are not part of a
+                        // construct are literal text.  We parse the inner
+                        // content and absorb the closing brace if present.
                         self.advance();
+                        let inner = self.parse_sequence_inner(false)?;
+                        if self.peek() == &Token::CloseBrace {
+                            self.advance();
+                        }
+                        nodes.push(inner);
                     }
-                    nodes.push(inner);
+                    prev_was_escaped_dollar = false;
                 }
                 Token::Colon => {
                     // Bare `:` at sequence level — literal text.
@@ -1092,13 +1414,13 @@ impl Parser {
         let result = match self.peek().clone() {
             Token::ItemKeyword(ref name) => {
                 let kind = item_name_to_kind(name)
-                    .ok_or_else(|| self.error(format!("unknown expansion item: {name}")))?;
+                    .ok_or_else(|| self.error(format!("unknown expansion operator \"{name}\"")))?;
                 self.advance(); // consume ItemKeyword
                 self.parse_item(kind)?
             }
             Token::OperatorKeyword(ref name) => {
                 let kind = operator_name_to_kind(name)
-                    .ok_or_else(|| self.error(format!("unknown operator: {name}")))?;
+                    .ok_or_else(|| self.error(format!("unknown expansion operator \"{name}\"")))?;
                 self.advance(); // consume OperatorKeyword
                 self.parse_operator(kind)?
             }
@@ -1106,19 +1428,24 @@ impl Parser {
                 // Parametric operator with embedded numeric arguments.
                 // This is the underscore form: ${length_5:string}
                 //
-                // We desugar this into the equivalent Item form, which is
-                // the same as the brace form: ${length{5}{string}}
+                // The desugaring depends on whether the base is an item or
+                // an operator:
                 //
-                // The desugaring converts:
+                // Item forms (desugared to Item AST node):
                 //   ${length_N:subject}    → Item(Length, [N, subject])
                 //   ${substr_N_M:subject}  → Item(Substr, [N, M, subject])
                 //   ${hash_N_M:subject}    → Item(Hash, [N, M, subject])
                 //   ${nhash_N:subject}     → Item(Nhash, [N, subject])
                 //   ${nhash_N_M:subject}   → Item(Nhash, [N, M, subject])
-                let item_kind = item_name_to_kind(base)
-                    .ok_or_else(|| self.error(format!("unknown parametric operator: {base}")))?;
+                //
+                // Operator forms (desugared to Operator AST node with
+                // parameters stored in the OperatorKind variant):
+                //   ${headerwrap_N:subj}   → Operator(HeaderwrapN(N), subj)
+                //   ${headerwrap_N_M:subj} → Operator(HeaderwrapNM(N,M), subj)
+                //   ${mask_N:subject}      → Operator(MaskN(N), subject)
                 let p1 = *param1;
                 let p2 = *param2;
+                let base_owned = base.clone();
                 self.advance(); // consume ParametricOperator
 
                 // Expect the colon separator (same as operator form).
@@ -1127,7 +1454,7 @@ impl Parser {
                 } else {
                     return Err(self.error(format!(
                         "expected ':' after parametric operator {}, got {:?}",
-                        base,
+                        base_owned,
                         self.peek()
                     )));
                 }
@@ -1135,24 +1462,64 @@ impl Parser {
                 // Parse the subject expression.
                 let subject = self.parse_sequence()?;
 
-                // Build args: numeric params as Literal nodes, then subject.
-                let mut args = Vec::new();
-                args.push(AstNode::Literal(p1.to_string()));
-                if let Some(m) = p2 {
-                    args.push(AstNode::Literal(m.to_string()));
-                }
-                args.push(subject);
-
-                AstNode::Item {
-                    kind: item_kind,
-                    args,
-                    yes_branch: None,
-                    no_branch: None,
+                // Check if this is an operator-type or item-type parametric.
+                match base_owned.as_str() {
+                    "headerwrap" => {
+                        let col = p1;
+                        let max_col = p2;
+                        AstNode::Operator {
+                            kind: OperatorKind::HeaderwrapParam(col, max_col),
+                            subject: Box::new(subject),
+                        }
+                    }
+                    "mask" => AstNode::Operator {
+                        kind: OperatorKind::MaskParam(p1 as u8),
+                        subject: Box::new(subject),
+                    },
+                    _ => {
+                        // Item-type parametric operators.
+                        let item_kind = item_name_to_kind(&base_owned).ok_or_else(|| {
+                            self.error(format!("unknown expansion operator \"{}\"", base_owned))
+                        })?;
+                        let mut args = Vec::new();
+                        args.push(AstNode::Literal(p1.to_string()));
+                        if let Some(m) = p2 {
+                            args.push(AstNode::Literal(m.to_string()));
+                        }
+                        args.push(subject);
+                        AstNode::Item {
+                            kind: item_kind,
+                            args,
+                            yes_branch: None,
+                            no_branch: None,
+                            fail_force: false,
+                        }
+                    }
                 }
             }
             Token::Identifier(ref name) => {
                 let name_owned = name.clone();
                 self.advance(); // consume Identifier
+
+                // C Exim behaviour for ${name:...}:
+                //
+                // Inside `${...}`, a name followed by `:` is ALWAYS
+                // interpreted as an operator invocation.  Header
+                // variable syntax like `$header_subject:` or `$h_subject:`
+                // works ONLY in the bare (non-braced) `$` context.
+                //
+                // Therefore `${header_subject:}` → unknown expansion
+                // operator "header_subject", NOT a header ref.
+                //
+                // Braced header references only work WITHOUT a colon:
+                //   `${h_subject}` → header variable (parsed by
+                //   classify_and_build_variable)
+                if self.peek() == &Token::Colon {
+                    // The name followed by `:` means the user intended
+                    // an operator.  Produce the same diagnostic C would.
+                    return Err(self.make_unknown_operator_error(&name_owned));
+                }
+
                 self.classify_and_build_variable(&name_owned, true)?
             }
             Token::ConditionKeyword(ref name) => {
@@ -1170,9 +1537,86 @@ impl Parser {
             }
         };
 
-        // Consume the outer closing brace.
+        // Consume the outer closing brace — REQUIRED for ${...} expressions.
+        // C Exim produces: "\"${<name>\" is not a known operator
+        // (or a } is missing in a variable reference)"
         if self.peek() == &Token::CloseBrace {
             self.advance();
+        } else {
+            // If this is a plain variable (not an operator/item), then the
+            // missing } is an error matching C Exim's format.
+            match &result {
+                AstNode::Variable(vr) => {
+                    return Err(self.error(format!(
+                        "\"${{{}\" is not a known operator (or a }} is missing in a variable reference)",
+                        vr.name
+                    )));
+                }
+                AstNode::HeaderRef { name: _, .. } => {
+                    return Err(self.error(
+                        "missing } at end of string - could be header name not terminated by colon"
+                            .to_string(),
+                    ));
+                }
+                AstNode::Conditional { .. } => {
+                    // When malformed_header is set (header name consumed
+                    // a `}` because it was not terminated by colon), C
+                    // Exim hits EXPAND_FAILED_CURLY with the
+                    // malformed_header override:
+                    //   "missing or misplaced { or } - could be header
+                    //    name not terminated by colon"
+                    if self.malformed_header {
+                        return Err(ExpandError::Failed {
+                            message: "missing or misplaced { or } - could be \
+                                      header name not terminated by colon"
+                                .to_string(),
+                        });
+                    }
+                    // C Exim's process_yesno_item produces a specific
+                    // error when the closing `}` is missing after the
+                    // yes/no branches of `${if ...}`:
+                    //   "curly-bracket problem in conditional yes/no
+                    //    parsing: did not close with '}'\n remaining
+                    //    string is '...'"
+                    let remaining = self.remaining_text_preview(60);
+                    return Err(ExpandError::Failed {
+                        message: format!(
+                            "curly-bracket problem in conditional yes/no \
+                             parsing: did not close with '}}'\n \
+                             remaining string is '{}'",
+                            remaining
+                        ),
+                    });
+                }
+                AstNode::Item { kind, .. } => {
+                    // Produce a C-compatible error that names the item.
+                    // C Exim reaches EXPAND_FAILED_CURLY after reading
+                    // the yes/no branches of an item and not finding the
+                    // closing `}`.  In modern Exim, the error includes
+                    // context: "missing '}' closing <item_name>".
+                    if self.malformed_header {
+                        return Err(ExpandError::Failed {
+                            message: "missing or misplaced { or } - could be \
+                                      header name not terminated by colon"
+                                .to_string(),
+                        });
+                    }
+                    let item_name = item_kind_to_name(*kind);
+                    return Err(ExpandError::Failed {
+                        message: format!("missing '}}' closing {}", item_name,),
+                    });
+                }
+                _ => {
+                    if self.malformed_header {
+                        return Err(ExpandError::Failed {
+                            message: "missing or misplaced { or } - could be \
+                                      header name not terminated by colon"
+                                .to_string(),
+                        });
+                    }
+                    return Err(self.error("missing } at end of string".to_string()));
+                }
+            }
         }
 
         Ok(result)
@@ -1224,11 +1668,24 @@ impl Parser {
     }
 
     /// Parse a bare `$name` variable reference (not braced).
+    ///
+    /// In C Exim, `$h_subject:` uses the trailing colon as the header
+    /// name terminator — the colon is consumed and NOT emitted as
+    /// literal text.  We replicate this: after recognising a header
+    /// reference, eat the optional colon that immediately follows.
     pub fn parse_variable(&mut self) -> Result<AstNode, ExpandError> {
         match self.peek().clone() {
             Token::Identifier(name) => {
                 self.advance();
-                self.classify_and_build_variable(&name, false)
+                let node = self.classify_and_build_variable(&name, false)?;
+
+                // Consume the trailing colon that terminates bare header
+                // references ($h_subject:, $rh_from:, $bh_to:, $lh_cc:).
+                if matches!(node, AstNode::HeaderRef { .. }) && self.peek() == &Token::Colon {
+                    self.advance();
+                }
+
+                Ok(node)
             }
             _ => Err(self.error(format!(
                 "expected identifier after '$', got {:?}",
@@ -1247,8 +1704,40 @@ impl Parser {
         match kind {
             ItemKind::If => self.parse_conditional_item(),
             ItemKind::Lookup => self.parse_lookup_item(),
+            ItemKind::Filter => self.parse_filter_item(),
+            ItemKind::Map => self.parse_map_item(),
+            ItemKind::Reduce => self.parse_reduce_item(),
+            ItemKind::Sort => self.parse_sort_item(),
+            ItemKind::Extract => self.parse_extract_item(),
             _ => self.parse_generic_item(kind),
         }
+    }
+
+    /// Parse extract item — detects `json`/`jsons` modifier before braced args.
+    ///
+    /// C Exim syntax:
+    /// - `${extract{field}{separator}{data}{yes}{no}}` — classic extract
+    /// - `${extract json {key}{json_data}{yes}{no}}` — JSON value extract
+    /// - `${extract jsons{key}{json_data}{yes}{no}}` — JSON string extract
+    fn parse_extract_item(&mut self) -> Result<AstNode, ExpandError> {
+        // Check if next token is a Literal containing "json" or "jsons"
+        // before the opening brace
+        self.skip_whitespace_literals();
+        if let Token::Literal(ref text) = self.peek().clone() {
+            let trimmed = text.trim();
+            if trimmed == "json" || trimmed == "jsons" {
+                let is_jsons = trimmed == "jsons";
+                self.advance(); // consume the json/jsons literal
+                let kind = if is_jsons {
+                    ItemKind::ExtractJsons
+                } else {
+                    ItemKind::ExtractJson
+                };
+                return self.parse_generic_item(kind);
+            }
+        }
+        // Fall through to normal extract parsing
+        self.parse_generic_item(ItemKind::Extract)
     }
 
     /// Parse a generic item: collect N brace-delimited arguments then
@@ -1256,6 +1745,42 @@ impl Parser {
     fn parse_generic_item(&mut self, kind: ItemKind) -> Result<AstNode, ExpandError> {
         let (min_args, max_args, has_yes_no) = item_arg_spec(&kind);
         let mut args = Vec::new();
+
+        // Handle comma-separated modifiers after item keyword.
+        // C Exim syntax: ${run,preexpand {cmd}} — the `preexpand`
+        // modifier is silently consumed.  Our evaluator already
+        // pre-expands all arguments, so the modifier is a no-op.
+        while self.peek() == &Token::Comma {
+            self.advance(); // consume comma
+                            // Read the modifier name and ignore it.
+                            // C Exim syntax: ${run,preexpand {cmd}}.  The modifier
+                            // appears after the comma inside the brace context, so the
+                            // tokenizer often returns it as a Literal (not Identifier,
+                            // since it is not preceded by `$`).  The literal may also
+                            // include trailing whitespace (e.g. "preexpand ") because
+                            // the tokenizer's `read_literal()` only stops on special
+                            // characters and whitespace is not special.
+            self.skip_whitespace_literals();
+            match self.peek().clone() {
+                Token::Identifier(ref _name) | Token::ItemKeyword(ref _name) => {
+                    self.advance(); // consume modifier name
+                }
+                Token::Literal(ref s) => {
+                    // Trim trailing whitespace and validate that the
+                    // remaining text is a plausible modifier name
+                    // (alphanumeric / underscore only).
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty()
+                        && trimmed
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        self.advance(); // consume modifier (e.g., "preexpand ")
+                    }
+                }
+                _ => {}
+            }
+        }
 
         // Skip any whitespace between keyword and first argument.
         self.skip_whitespace_literals();
@@ -1270,19 +1795,30 @@ impl Parser {
             } else if i >= min_args {
                 break;
             } else {
+                let name = item_kind_to_name(kind);
                 return Err(self.error(format!(
-                    "expected '{{' for argument {} of {:?}, got {:?}",
-                    i + 1,
-                    kind,
-                    self.peek()
+                    "Not enough arguments for '{}' (min is {})",
+                    name, min_args,
                 )));
             }
         }
 
-        let (yes_branch, no_branch) = if has_yes_no {
+        // Parse optional yes/no branches first for items that support them.
+        // This MUST happen before the "too many arguments" check so that
+        // trailing `{yes}{no}` braces aren't mistaken for extra arguments.
+        let (yes_branch, no_branch, fail_force) = if has_yes_no {
             self.parse_yes_no()?
         } else {
-            (None, None)
+            // Check for too many arguments — if there are more braced args
+            // waiting after we've consumed max_args, report an error.
+            if max_args < usize::MAX && self.peek() == &Token::OpenBrace {
+                let name = item_kind_to_name(kind);
+                return Err(self.error(format!(
+                    "Too many arguments for '{}' (max is {})",
+                    name, max_args,
+                )));
+            }
+            (None, None, false)
         };
 
         Ok(AstNode::Item {
@@ -1290,6 +1826,7 @@ impl Parser {
             args,
             yes_branch,
             no_branch,
+            fail_force,
         })
     }
 
@@ -1304,28 +1841,150 @@ impl Parser {
         // Skip whitespace before yes/no branches.
         self.skip_whitespace_literals();
 
-        // Parse the mandatory yes branch.
-        let yes_branch = if self.peek() == &Token::OpenBrace {
-            Box::new(self.parse_braced_expression()?)
-        } else {
-            return Err(self.error("expected '{' for yes-branch of ${if ...}"));
-        };
+        // C Exim supports three forms:
+        //   ${if condition{yes}{no}}   — standard with both branches
+        //   ${if condition{yes}}       — no-branch absent (returns "" if false)
+        //   ${if condition}            — both branches absent (returns "true"/"")
+        //   ${if condition{yes}fail}   — bare "fail" keyword as no-branch
+        //
+        // When no yes-branch is provided (next token is CloseBrace or EOF),
+        // the evaluator returns "true" when the condition is true, "" when false.
+
+        // Check if there are any branches at all.
+        if self.peek() != &Token::OpenBrace {
+            // C Exim: only `}` (CloseBrace) or EOF means "no branches".
+            // Bare `fail` keyword before closing `}` is also accepted.
+            // Anything else that is NOT `{` is a curly-bracket error
+            // (e.g. `${if def:tod_log:{y}{n}}` where the `:` is left over).
+            if self.peek_is_fail_keyword() {
+                self.advance();
+                return Ok(AstNode::Conditional {
+                    condition: Box::new(condition),
+                    yes_branch: None,
+                    no_branch: None,
+                    fail_force: true,
+                });
+            }
+            if self.peek() == &Token::CloseBrace || self.peek() == &Token::Eof {
+                return Ok(AstNode::Conditional {
+                    condition: Box::new(condition),
+                    yes_branch: None,
+                    no_branch: None,
+                    fail_force: false,
+                });
+            }
+            // C Exim: report curly-bracket problem with remaining string
+            let remaining = self.remaining_text_preview(60);
+            return Err(ExpandError::Failed {
+                message: format!(
+                    "curly-bracket problem in conditional yes/no parsing: \
+                     'yes' part did not start with '{{'\n remaining string is '{}'",
+                    remaining
+                ),
+            });
+        }
+
+        // Parse the yes branch.
+        let yes_branch = Box::new(self.parse_braced_expression()?);
 
         // Skip whitespace between branches.
         self.skip_whitespace_literals();
 
-        // Parse the optional no branch.
-        let no_branch = if self.peek() == &Token::OpenBrace {
-            Some(Box::new(self.parse_braced_expression()?))
+        // Parse the optional no branch (may be braced or bare "fail").
+        let (no_branch, fail_force) = if self.peek() == &Token::OpenBrace {
+            (Some(Box::new(self.parse_braced_expression()?)), false)
+        } else if self.peek_is_fail_keyword() {
+            // Bare "fail" keyword after the yes-branch causes forced
+            // failure on the "no" path (C Exim expand.c line ~3107).
+            self.advance(); // consume `fail`
+            (None, true)
         } else {
-            None
+            (None, false)
         };
 
         Ok(AstNode::Conditional {
             condition: Box::new(condition),
-            yes_branch,
+            yes_branch: Some(yes_branch),
             no_branch,
+            fail_force,
         })
+    }
+
+    /// Parse `${filter{list}{condition}}` — list filtering.
+    ///
+    /// The second argument is parsed as a CONDITION (like ${if}'s condition),
+    /// not as regular expansion text.  This matches C Exim behaviour where
+    /// `eval_condition()` is called for the filter predicate.
+    fn parse_filter_item(&mut self) -> Result<AstNode, ExpandError> {
+        self.skip_whitespace_literals();
+        // Arg 0: the list expression (regular expansion)
+        if self.peek() != &Token::OpenBrace {
+            return Err(self.error("expected '{' for argument 1 of filter"));
+        }
+        let list_expr = self.parse_braced_expression()?;
+        self.skip_whitespace_literals();
+        // Arg 1: the condition — parse inside braces as a condition
+        if self.peek() != &Token::OpenBrace {
+            return Err(self.error("expected '{' for argument 2 of filter"));
+        }
+        self.advance(); // consume '{'
+        let condition = self.parse_condition()?;
+        self.skip_whitespace_literals();
+        if self.peek() == &Token::CloseBrace {
+            self.advance(); // consume '}'
+        }
+        // Wrap the condition in a Conditional node so the evaluator
+        // can distinguish it from a plain expression.
+        let cond_node = AstNode::Conditional {
+            condition: Box::new(condition),
+            yes_branch: Some(Box::new(AstNode::Literal(String::new()))),
+            no_branch: None,
+            fail_force: false,
+        };
+        Ok(AstNode::Item {
+            kind: ItemKind::Filter,
+            args: vec![list_expr, cond_node],
+            yes_branch: None,
+            no_branch: None,
+            fail_force: false,
+        })
+    }
+
+    /// Parse `${map{list}{expression}}` — list mapping.
+    ///
+    /// Both arguments are regular expansions; $item is set during evaluation.
+    fn parse_map_item(&mut self) -> Result<AstNode, ExpandError> {
+        self.parse_generic_item(ItemKind::Map).map_err(|e| {
+            // C Exim wraps inner errors from map template expansion
+            // with the map item context.  E.g. "missing '}' closing
+            // extract" becomes "missing '}' closing extract inside
+            // \"map\" item".
+            match e {
+                ExpandError::Failed { ref message }
+                    if message.starts_with("missing '}' closing ") =>
+                {
+                    ExpandError::Failed {
+                        message: format!("{} inside \"map\" item", message),
+                    }
+                }
+                other => other,
+            }
+        })
+    }
+
+    /// Parse `${reduce{list}{initial}{expression}}` — list reduction.
+    ///
+    /// All three arguments are regular expansions; $item and $value are
+    /// set during evaluation.
+    fn parse_reduce_item(&mut self) -> Result<AstNode, ExpandError> {
+        self.parse_generic_item(ItemKind::Reduce)
+    }
+
+    /// Parse `${sort{list}{comparator}{expression}}` — list sorting.
+    ///
+    /// All arguments are regular expansions; $item is set for key extraction.
+    fn parse_sort_item(&mut self) -> Result<AstNode, ExpandError> {
+        self.parse_generic_item(ItemKind::Sort)
     }
 
     /// Parse `${lookup{key} type {source} {yes}{no}}` — the lookup item.
@@ -1346,21 +2005,37 @@ impl Parser {
         }
 
         // The lookup type name appears as literal text (possibly with
-        // surrounding whitespace) between the key and the source.
+        // surrounding whitespace and modifiers) between the key and the
+        // source.  In C Exim, names like "lsearch*@,ret=full",
+        // "partial-lsearch,ret=full", "partial1-lsearch" are valid.
+        // The tokenizer may split these across Literal, Comma, Identifier
+        // tokens.  We greedily consume tokens until we see an OpenBrace
+        // (the source file argument) or CloseBrace (no more arguments).
         self.skip_whitespace_literals();
-        let lookup_type = match self.peek().clone() {
-            Token::Literal(s) => {
-                let name = s.trim().to_owned();
-                self.advance();
-                name
+        let mut lookup_type = String::new();
+        loop {
+            match self.peek().clone() {
+                Token::Literal(ref s) => {
+                    lookup_type.push_str(s);
+                    self.advance();
+                }
+                Token::Identifier(ref s) => {
+                    lookup_type.push_str(s);
+                    self.advance();
+                }
+                Token::Comma => {
+                    lookup_type.push(',');
+                    self.advance();
+                }
+                Token::Colon => {
+                    // Colons can appear in type names (unlikely) but
+                    // shouldn't be consumed as part of the name.
+                    break;
+                }
+                _ => break,
             }
-            Token::Identifier(s) => {
-                self.advance();
-                s
-            }
-            _ => String::new(),
-        };
-
+        }
+        let lookup_type = lookup_type.trim().to_owned();
         if !lookup_type.is_empty() {
             args.push(AstNode::Literal(lookup_type));
         }
@@ -1373,8 +2048,43 @@ impl Parser {
             self.skip_whitespace_literals();
         }
 
-        // If we have 4+ args the last two are yes/no branches.
-        // Typical: args = [key, type, source, yes, no]
+        // Check for trailing `fail` keyword before closing brace.
+        // C Exim syntax: ${lookup{key}type{source}{yes}fail} or
+        // ${lookup{key}type{source}fail}.  The `fail` keyword causes
+        // lookup failure to produce an expansion error instead of empty.
+        let mut fail_force = false;
+        loop {
+            match self.peek().clone() {
+                Token::Literal(ref s) => {
+                    let trimmed = s.trim();
+                    if trimmed == "fail" {
+                        fail_force = true;
+                        self.advance();
+                        self.skip_whitespace_literals();
+                        continue;
+                    } else if trimmed.is_empty() {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                Token::Identifier(ref s) if s == "fail" => {
+                    fail_force = true;
+                    self.advance();
+                    self.skip_whitespace_literals();
+                    continue;
+                }
+                Token::ItemKeyword(ref s) if s == "fail" => {
+                    fail_force = true;
+                    self.advance();
+                    self.skip_whitespace_literals();
+                    continue;
+                }
+                _ => break,
+            }
+        }
+
+        // args layout: [key, type, source, [yes, [no]]]
         let (yes_branch, no_branch) = if args.len() >= 5 {
             let no = args.pop().map(Box::new);
             let yes = args.pop().map(Box::new);
@@ -1392,6 +2102,7 @@ impl Parser {
             args,
             yes_branch,
             no_branch,
+            fail_force,
         })
     }
 
@@ -1461,8 +2172,242 @@ impl Parser {
 
         let operand_count = condition_operand_count(&condition_type);
         let mut operands = Vec::with_capacity(operand_count);
+        let mut sub_conditions: Vec<ConditionNode> = Vec::new();
 
-        if condition_type == ConditionType::Def {
+        if condition_type == ConditionType::And || condition_type == ConditionType::Or {
+            // ── And/Or compound conditions ──
+            //
+            // C Exim behaviour (expand.c ~2360-2410):
+            //   and/or read ONE outer brace block containing multiple
+            //   subconditions, each wrapped in their own { }.
+            //
+            //   ${if and {{eq{a}{b}}{match{x}{^x$}}} {yes} {no}}
+            //
+            //   The outer { } is the single argument.  Inside it,
+            //   each { subcondition } is parsed as a complete
+            //   condition expression.
+            let cond_name = if condition_type == ConditionType::And {
+                "and"
+            } else {
+                "or"
+            };
+
+            self.skip_whitespace_literals();
+            if self.peek() != &Token::OpenBrace {
+                return Err(self.error(format!(
+                    "missing open brace after \"{cond_name}\" condition"
+                )));
+            }
+            self.advance(); // consume outer `{`
+
+            // Read sub-conditions until the matching outer `}`.
+            loop {
+                self.skip_whitespace_literals();
+                if self.peek() == &Token::CloseBrace {
+                    self.advance(); // consume outer `}`
+                    break;
+                }
+                if self.peek() == &Token::Eof {
+                    return Err(self.error(format!(
+                        "missing }} at end of condition inside \"{cond_name}\" group"
+                    )));
+                }
+                // Each sub-condition MUST be in its own `{...}`.
+                if self.peek() != &Token::OpenBrace {
+                    return Err(self.error(format!(
+                        "each subcondition inside an \"{cond_name}{{...}}\" condition must be in its own {{}}"
+                    )));
+                }
+                self.advance(); // consume sub-condition `{`
+
+                // Parse a complete condition inside the sub-braces.
+                // Capture a raw-text preview BEFORE attempting the
+                // sub-condition parse so we can produce a C-compatible
+                // error message if the parse fails.
+                let text_preview = self.peek_text_preview(16);
+
+                let sub_cond = self.parse_condition().map_err(|e| {
+                    // Re-wrap parse errors to add context about which
+                    // compound condition we are inside.
+                    match e {
+                        ExpandError::Failed { message } => {
+                            // If the inner error is "unknown condition",
+                            // rewrite to match C Exim format.
+                            if message.starts_with("unknown condition: ") {
+                                let name = message
+                                    .strip_prefix("unknown condition: ")
+                                    .unwrap_or("");
+                                ExpandError::Failed {
+                                    message: format!(
+                                        "unknown condition \"{name}\" inside \"{cond_name}{{...}}\" condition"
+                                    ),
+                                }
+                            } else if message.contains("expected condition name") {
+                                // "condition name expected, but found ..."
+                                ExpandError::Failed {
+                                    message: format!(
+                                        "condition name expected, but found \"{text_preview}\" inside \"{cond_name}{{...}}\" condition"
+                                    ),
+                                }
+                            } else {
+                                ExpandError::Failed { message }
+                            }
+                        }
+                        other => other,
+                    }
+                })?;
+
+                self.skip_whitespace_literals();
+                if self.peek() == &Token::CloseBrace {
+                    self.advance(); // consume sub-condition `}`
+                } else {
+                    return Err(self.error(format!(
+                        "missing }} at end of condition inside \"{cond_name}\" group"
+                    )));
+                }
+                sub_conditions.push(sub_cond);
+            }
+        } else if matches!(
+            condition_type,
+            ConditionType::ForAll
+                | ConditionType::ForAny
+                | ConditionType::ForAllJson
+                | ConditionType::ForAnyJson
+                | ConditionType::ForAllJsons
+                | ConditionType::ForAnyJsons
+        ) {
+            // ── ForAll/ForAny compound conditions ──
+            //
+            // C Exim forany/forall read two brace-enclosed arguments:
+            //   {list} {condition}
+            //
+            // The first brace is a regular list expression.  The second
+            // brace contains a CONDITION expression (like `eq{$item}{a}`)
+            // that is parsed as a condition, not as a regular expansion.
+            let cond_name = match condition_type {
+                ConditionType::ForAll | ConditionType::ForAllJson | ConditionType::ForAllJsons => {
+                    "forall"
+                }
+                _ => "forany",
+            };
+
+            // First operand: the list.
+            self.skip_whitespace_literals();
+            if self.peek() == &Token::OpenBrace {
+                operands.push(self.parse_braced_expression()?);
+            }
+
+            // Second operand: a condition inside braces.
+            self.skip_whitespace_literals();
+            if self.peek() == &Token::OpenBrace {
+                self.advance(); // consume `{`
+
+                let text_preview = self.peek_text_preview(16);
+                let is_iteration_cond = matches!(
+                    condition_type,
+                    ConditionType::ForAll
+                        | ConditionType::ForAllJson
+                        | ConditionType::ForAllJsons
+                        | ConditionType::ForAny
+                        | ConditionType::ForAnyJson
+                        | ConditionType::ForAnyJsons
+                );
+                let sub_cond = self.parse_condition().map_err(|e| {
+                    match e {
+                        ExpandError::Failed { message } => {
+                            if message.starts_with("unknown condition: ") {
+                                let name = message
+                                    .strip_prefix("unknown condition: ")
+                                    .unwrap_or("");
+                                ExpandError::Failed {
+                                    message: format!(
+                                        "unknown condition \"{name}\" inside \"{cond_name}\" condition"
+                                    ),
+                                }
+                            } else if message.contains("expected condition name") {
+                                ExpandError::Failed {
+                                    message: format!(
+                                        "condition name expected, but found \"{text_preview}\" inside \"{cond_name}\" condition"
+                                    ),
+                                }
+                            } else if is_iteration_cond {
+                                // C Exim wraps any inner error with the
+                                // outer condition context for forall/forany.
+                                ExpandError::Failed {
+                                    message: format!(
+                                        "{} inside \"{}\" condition", message, cond_name
+                                    ),
+                                }
+                            } else {
+                                ExpandError::Failed { message }
+                            }
+                        }
+                        other => other,
+                    }
+                })?;
+
+                self.skip_whitespace_literals();
+                if self.peek() == &Token::CloseBrace {
+                    self.advance(); // consume `}`
+                } else {
+                    return Err(self.error(format!(
+                        "missing }} at end of condition inside \"{cond_name}\""
+                    )));
+                }
+                sub_conditions.push(sub_cond);
+            }
+        } else if condition_type == ConditionType::Acl {
+            // ── ACL condition (C Exim expand.c ~2882-2926) ──
+            //
+            // The ACL condition reads ONE outer brace block containing
+            // multiple sub-brace arguments:
+            //   ${if acl {{name}{arg1}{arg2}} {yes}{no}}
+            //
+            // The first sub-arg is the ACL name, subsequent ones are
+            // positional arguments ($acl_arg1 .. $acl_arg9).
+            self.skip_whitespace_literals();
+            if self.peek() != &Token::OpenBrace {
+                return Err(self.error("missing { after \"acl\" condition".to_owned()));
+            }
+            self.advance(); // consume outer `{`
+
+            // Read sub-arguments until the matching outer `}`.
+            loop {
+                self.skip_whitespace_literals();
+                if self.peek() == &Token::CloseBrace {
+                    self.advance(); // consume outer `}`
+                    break;
+                }
+                if self.peek() == &Token::Eof {
+                    return Err(
+                        self.error("missing } at end of acl condition arguments".to_owned())
+                    );
+                }
+                if self.peek() == &Token::OpenBrace {
+                    operands.push(self.parse_braced_expression()?);
+                } else {
+                    // Bare word (unbraced ACL name) — should not normally
+                    // occur, but handle gracefully.
+                    let token = self.peek().clone();
+                    self.advance();
+                    match token {
+                        Token::Literal(s) | Token::Identifier(s) => {
+                            operands.push(AstNode::Literal(s));
+                        }
+                        _ => {
+                            return Err(self.error(format!(
+                                "unexpected token {:?} in acl condition arguments",
+                                token
+                            )));
+                        }
+                    }
+                }
+            }
+
+            if operands.is_empty() {
+                return Err(self.error("too few arguments for acl condition".to_owned()));
+            }
+        } else if condition_type == ConditionType::Def {
             // `def` uses colon-separated name: `def:variable_name`.
             let operand = self.parse_def_operand()?;
             operands.push(operand);
@@ -1482,6 +2427,7 @@ impl Parser {
             negated,
             condition_type,
             operands,
+            sub_conditions,
         })
     }
 
@@ -1505,18 +2451,101 @@ impl Parser {
         if self.peek() == &Token::Colon {
             self.advance();
         }
+
         // Collect the variable name from the next token.
-        match self.peek().clone() {
+        //
+        // Track whether the raw literal had trailing whitespace.
+        // The tokenizer's `read_literal()` does NOT stop at spaces
+        // (only at `is_special_char` characters like `{`, `}`, `:`,
+        // etc.), so `Literal("h_xxx ")` is produced when the input
+        // is `h_xxx {y}`.  In contrast, C's `read_header_name()`
+        // stops at the space because `isgraph(' ')` is false.  When
+        // there IS trailing whitespace in the raw literal, we must
+        // NOT enter the brace-consumption loop — the space already
+        // acted as the stop condition.
+        let (name, had_trailing_ws) = match self.peek().clone() {
             Token::Literal(s) => {
                 self.advance();
-                Ok(AstNode::Literal(s.trim().to_owned()))
+                let trimmed = s.trim().to_owned();
+                let trailing = s.trim_start().len() > trimmed.len();
+                (trimmed, trailing)
             }
             Token::Identifier(s) => {
                 self.advance();
-                Ok(AstNode::Literal(s))
+                (s, false) // identifiers never include whitespace
             }
-            _ => Ok(AstNode::Literal(String::new())),
+            _ => (String::new(), false),
+        };
+
+        // C Exim: for header variables (h_, header_, rh_, lh_, bh_), the
+        // terminating colon is part of the variable specification.  When
+        // we see a colon immediately after a header-prefix name, consume
+        // it so that the yes/no branches can be parsed normally.
+        //
+        // When there is NO terminating colon AND no whitespace separated
+        // the name from the next token, C's `read_header_name()`
+        // continues reading graphic characters (including `}`) into the
+        // header name until it finds `:` or a non-graphic char.  If the
+        // consumed name includes `}`, `malformed_header` is set, and the
+        // subsequent brace-check produces:
+        //   "missing or misplaced { or } - could be header name not
+        //    terminated by colon"
+        if !name.is_empty() && Self::is_header_variable_prefix(&name) {
+            if self.peek() == &Token::Colon {
+                self.advance(); // consume trailing `:` that is part of header spec
+            } else if !had_trailing_ws {
+                // No colon AND no whitespace — C Exim's
+                // `read_header_name()` reads ALL graphic characters
+                // (printable, non-space) from the input until it finds
+                // `:` or a non-graphic character.  `isgraph()` returns
+                // true for printable chars EXCEPT space.  This means
+                // `}`, `{`, letters are consumed, but space stops the
+                // read.  If a `}` is found in the name,
+                // `malformed_header` is set.
+                let mut consumed_brace = false;
+                loop {
+                    match self.peek() {
+                        Token::Colon => {
+                            self.advance(); // consume terminating colon
+                            break;
+                        }
+                        Token::Eof => break,
+                        Token::CloseBrace | Token::OpenBrace => {
+                            consumed_brace = true;
+                            self.advance();
+                        }
+                        _ => {
+                            // Other printable tokens count as graphic
+                            self.advance();
+                        }
+                    }
+                }
+                if consumed_brace {
+                    self.malformed_header = true;
+                }
+            }
+            // If had_trailing_ws is true, C's read_header_name()
+            // stopped at the space boundary.  The header name is just
+            // the trimmed identifier, no braces consumed, no
+            // malformed_header flag set.
         }
+
+        Ok(AstNode::Literal(name))
+    }
+
+    /// Returns `true` when `name` starts with one of the header variable
+    /// prefixes used by C Exim (`h_`, `header_`, `rh_`, `lh_`, `bh_`,
+    /// `rheader_`, `lheader_`, `bheader_`).
+    fn is_header_variable_prefix(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        lower.starts_with("h_")
+            || lower.starts_with("header_")
+            || lower.starts_with("rh_")
+            || lower.starts_with("rheader_")
+            || lower.starts_with("lh_")
+            || lower.starts_with("lheader_")
+            || lower.starts_with("bh_")
+            || lower.starts_with("bheader_")
     }
 
     // ─── Braced expression and yes/no parsing ───────────────────────
@@ -1535,6 +2564,13 @@ impl Parser {
 
         if self.peek() == &Token::CloseBrace {
             self.advance(); // consume `}`
+        } else if self.malformed_header {
+            // C Exim (expand.c line 8637): when a header variable name
+            // consumed expression syntax, produce the hint about the
+            // missing colon.
+            return Err(self.error(
+                "missing } at end of string - could be header name not terminated by colon",
+            ));
         } else {
             return Err(self.error("expected '}' to close braced expression"));
         }
@@ -1552,7 +2588,12 @@ impl Parser {
         let yes = if self.peek() == &Token::OpenBrace {
             Some(Box::new(self.parse_braced_expression()?))
         } else {
-            return Ok((None, None));
+            // Check for bare `fail` keyword (no yes/no branches).
+            if self.peek_is_fail_keyword() {
+                self.advance(); // consume `fail`
+                return Ok((None, None, true));
+            }
+            return Ok((None, None, false));
         };
 
         self.skip_whitespace_literals();
@@ -1560,10 +2601,24 @@ impl Parser {
         let no = if self.peek() == &Token::OpenBrace {
             Some(Box::new(self.parse_braced_expression()?))
         } else {
+            // Check for bare `fail` keyword after yes-branch.
+            // C Exim expand.c line ~3107: `fail` without braces after
+            // the yes-branch causes forced failure on the "no" path.
+            if self.peek_is_fail_keyword() {
+                self.advance(); // consume `fail`
+                return Ok((yes, None, true));
+            }
             None
         };
 
-        Ok((yes, no))
+        Ok((yes, no, false))
+    }
+
+    /// Check if the current token is the bare `fail` keyword.
+    fn peek_is_fail_keyword(&self) -> bool {
+        matches!(self.peek(),
+            Token::Identifier(s) | Token::Literal(s) if s.trim() == "fail"
+        )
     }
 }
 
@@ -1765,13 +2820,13 @@ mod tests {
     #[test]
     fn test_item_arg_spec_selected() {
         let (min, max, yn) = item_arg_spec(&ItemKind::Acl);
-        assert_eq!((min, max, yn), (2, 2, true));
+        assert_eq!((min, max, yn), (1, 10, true));
 
         let (min, max, yn) = item_arg_spec(&ItemKind::Run);
         assert_eq!((min, max, yn), (1, 1, true));
 
         let (min, max, yn) = item_arg_spec(&ItemKind::Hash);
-        assert_eq!((min, max, yn), (3, 3, false));
+        assert_eq!((min, max, yn), (2, 3, false));
 
         let (min, _, _) = item_arg_spec(&ItemKind::Dlfunc);
         assert_eq!(min, 2);
@@ -1988,6 +3043,7 @@ mod tests {
                 ref args,
                 ref yes_branch,
                 ref no_branch,
+                fail_force,
             } => {
                 assert_eq!(kind, ItemKind::Sg);
                 assert_eq!(args.len(), 3);
@@ -1995,6 +3051,7 @@ mod tests {
                 assert_eq!(args[1], AstNode::Literal("regex".to_owned()));
                 assert_eq!(args[2], AstNode::Literal("repl".to_owned()));
                 assert!(yes_branch.is_none());
+                assert!(!fail_force);
                 assert!(no_branch.is_none());
             }
             other => panic!("expected Item, got {other:?}"),
@@ -2027,11 +3084,13 @@ mod tests {
                 ref args,
                 ref yes_branch,
                 ref no_branch,
+                fail_force,
             } => {
                 assert_eq!(kind, ItemKind::Run);
                 assert_eq!(args.len(), 1);
                 assert!(yes_branch.is_some());
                 assert!(no_branch.is_some());
+                assert!(!fail_force);
             }
             other => panic!("expected Item, got {other:?}"),
         }

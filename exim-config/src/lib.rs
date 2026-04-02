@@ -99,6 +99,7 @@ pub use types::ConfigError;
 // Configuration parsing entry points — equivalent of the C readconf_main()
 // and readconf_rest() functions from readconf.c.
 pub use parser::parse_main_config;
+pub use parser::parse_main_config_with_debug;
 pub use parser::parse_rest;
 
 // Driver initialization — equivalent of the C readconf_driver_init() function

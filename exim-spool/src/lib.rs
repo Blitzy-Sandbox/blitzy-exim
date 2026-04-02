@@ -417,6 +417,21 @@ pub struct SpoolHeaderData {
     /// receive the message). `None` when the tree is empty (serialized as
     /// `"XX\n"` in the spool file).
     pub non_recipients_tree: Option<TreeNode>,
+
+    /// Sender host address (set via `-oMa` or from SMTP connection).
+    pub host_address: Option<String>,
+
+    /// Sender host name (set via `-oMs` or from DNS reverse lookup).
+    pub host_name: Option<String>,
+
+    /// Interface address the message was received on (set via `-oMi`).
+    pub interface_address: Option<String>,
+
+    /// Received protocol (e.g., `"local"`, `"smtp"`, `"esmtp"`).
+    pub received_protocol: Option<String>,
+
+    /// Sender ident (set via `-oMt` or RFC 1413 ident query).
+    pub sender_ident: Option<String>,
 }
 
 impl SpoolHeaderData {
@@ -437,6 +452,11 @@ impl SpoolHeaderData {
                 .map(RecipientItem::from)
                 .collect(),
             non_recipients_tree: hdr.non_recipients.map(non_recipient_to_tree),
+            host_address: hdr.host_address,
+            host_name: hdr.host_name,
+            interface_address: hdr.interface_address,
+            received_protocol: hdr.received_protocol,
+            sender_ident: hdr.sender_ident,
         }
     }
 
@@ -464,6 +484,11 @@ impl SpoolHeaderData {
                 .map(header_file::Recipient::from)
                 .collect(),
             non_recipients: self.non_recipients_tree.clone().map(tree_to_non_recipient),
+            host_address: self.host_address.clone(),
+            host_name: self.host_name.clone(),
+            interface_address: self.interface_address.clone(),
+            received_protocol: self.received_protocol.clone(),
+            sender_ident: self.sender_ident.clone(),
             ..Default::default()
         }
     }
@@ -1255,6 +1280,11 @@ mod tests {
                 dsn_flags: 0,
             }],
             non_recipients_tree: Some(TreeNode::leaf("old@example.com")),
+            host_address: None,
+            host_name: None,
+            interface_address: None,
+            received_protocol: None,
+            sender_ident: None,
         };
 
         let internal = data.to_internal();

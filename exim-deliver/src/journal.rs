@@ -577,6 +577,11 @@ impl JournalState {
             headers: Vec::new(),
             recipients: Vec::new(),
             non_recipients_tree: tree,
+            host_address: None,
+            host_name: None,
+            interface_address: None,
+            received_protocol: None,
+            sender_ident: None,
         };
 
         // Populate recipients from message context
@@ -1029,6 +1034,9 @@ mod tests {
             unique: address.to_ascii_lowercase(),
             parent_index: -1,
             children: Vec::new(),
+            prefix: None,
+            suffix: None,
+            onetime_parent: None,
         }
     }
 }

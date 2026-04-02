@@ -897,10 +897,8 @@ fn extract_header_name(name: &str) -> &str {
 ///
 /// The `_evaluator` parameter is accepted for API compatibility and
 /// future use when `Evaluator::ctx()` becomes public.
-fn evaluator_context<'a>(_evaluator: &'a Evaluator<'a>) -> &'a ExpandContext {
-    static DEFAULT_CTX: std::sync::LazyLock<ExpandContext> =
-        std::sync::LazyLock::new(ExpandContext::new);
-    &DEFAULT_CTX
+fn evaluator_context<'a>(evaluator: &'a Evaluator<'a>) -> &'a ExpandContext {
+    evaluator.context()
 }
 
 // ── File existence (expand.c lines 2760–2792) ──────────────────────────
@@ -1816,28 +1814,350 @@ fn eval_acl(rest: &str, evaluator: &mut Evaluator) -> Result<bool, ExpandError> 
         });
     }
 
-    let acl_name = &args[0];
-    tracing::debug!(acl = %acl_name, nargs = args.len(), "acl condition: evaluating");
+    let acl_name = args[0].clone();
+    let acl_args: Vec<String> = args[1..].to_vec();
+    let narg = acl_args.len() as i32;
+    tracing::debug!(acl = %acl_name, nargs = narg, "acl condition: evaluating");
 
-    // ACL evaluation would be delegated to the exim-acl crate in production.
-    // For the expansion engine, we provide a stub that:
-    // 1. Checks if the ACL name is known (via context variables)
-    // 2. Returns the appropriate result
-    //
-    // In production, this calls eval_acl() which returns OK/FAIL/DEFER.
-    // For DEFER, we set forced_fail = true (expand.c line 2917).
-
-    // Check ACL variables as a basic evaluation
-    let ctx = evaluator_context(evaluator);
-    let acl_key = format!("acl_{}", acl_name);
-    if ctx.acl_var_c.contains_key(&acl_key) || ctx.acl_var_m.contains_key(&acl_key) {
-        evaluator.lookup_value = None;
-        Ok(true)
-    } else {
-        evaluator.lookup_value = None;
-        // Default: ACL FAIL (false) when not found
-        Ok(false)
+    // Set ACL argument variables ($acl_narg, $acl_arg1..$acl_arg9).
+    {
+        let ctx = evaluator.context_mut();
+        ctx.acl_narg = narg;
+        ctx.acl_args = acl_args;
     }
+
+    // Look up the ACL definition in the context.
+    let raw_def = match evaluator.context().acl_definitions.get(&acl_name).cloned() {
+        Some(def) => def,
+        None => {
+            // ACL not found — return error.
+            return Err(ExpandError::Failed {
+                message: format!("unknown ACL \"{acl_name}\""),
+            });
+        }
+    };
+
+    // Basic ACL evaluation: parse the raw definition line-by-line to find
+    // verbs (accept/deny/defer/require/warn) and their modifiers.
+    let result = eval_acl_definition(&raw_def, evaluator)?;
+
+    match result {
+        AclResult::Accept(msg) => {
+            evaluator.context_mut().value = msg;
+            Ok(true)
+        }
+        AclResult::Deny(msg) => {
+            evaluator.context_mut().value = msg;
+            Ok(false)
+        }
+        AclResult::Defer => Err(ExpandError::Failed {
+            message: format!("DEFER from acl \"{acl_name}\""),
+        }),
+    }
+}
+
+/// Result of evaluating an ACL definition.
+#[derive(Debug)]
+pub enum AclResult {
+    /// ACL accepted with optional message.
+    Accept(String),
+    /// ACL denied with optional message.
+    Deny(String),
+    /// ACL deferred — causes forced-fail in expansion context.
+    Defer,
+}
+
+/// Parse ACL condition arguments from a value string such as
+/// `a_deny "new arg1" $acl_arg1`.  Returns `(acl_name, vec_of_args)`.
+///
+/// Handles double-quoted arguments (containing whitespace) and expands
+/// each token through the expansion engine.
+fn parse_acl_condition_value(
+    value: &str,
+    evaluator: &mut Evaluator,
+) -> Result<(String, Vec<String>), ExpandError> {
+    use crate::EsiFlags;
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = value.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(&ch) = chars.peek() {
+        if in_quotes {
+            if ch == '"' {
+                chars.next();
+                in_quotes = false;
+                parts.push(std::mem::take(&mut current));
+            } else {
+                current.push(ch);
+                chars.next();
+            }
+        } else if ch == '"' {
+            chars.next();
+            in_quotes = true;
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+            chars.next();
+        } else {
+            current.push(ch);
+            chars.next();
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    if parts.is_empty() {
+        return Err(ExpandError::Failed {
+            message: "ACL condition: missing ACL name".to_owned(),
+        });
+    }
+
+    // Expand the ACL name.
+    let acl_name = evaluator.expand_string(&parts[0], EsiFlags::default())?;
+
+    // Expand each argument, stopping at well-known ACL modifiers that
+    // could follow the condition on the same line.
+    let mut args = Vec::new();
+    for part in &parts[1..] {
+        let word = part.as_str();
+        if matches!(
+            word,
+            "message" | "logwrite" | "log_message" | "control" | "set"
+        ) {
+            break;
+        }
+        args.push(evaluator.expand_string(word, EsiFlags::default())?);
+    }
+
+    Ok((acl_name, args))
+}
+
+/// Evaluate conditions present on an ACL verb line.
+///
+/// Currently recognises the `acl = <name> <args>` condition which calls
+/// a sub-ACL and returns its result.  Unknown conditions (e.g. `hosts`,
+/// `sender_domains`) are treated as TRUE in the expansion context since
+/// they require live SMTP session state not available during `${acl ...}`
+/// evaluation.
+///
+/// Returns `(condition_passed, message_from_sub_acl)`.
+fn eval_verb_line_conditions(
+    rest_of_line: &str,
+    evaluator: &mut Evaluator,
+) -> Result<(bool, String), ExpandError> {
+    let rest = rest_of_line.trim();
+
+    // Empty rest = no conditions → pass unconditionally.
+    if rest.is_empty() {
+        return Ok((true, String::new()));
+    }
+
+    // ── Check for `acl = <name> <args>` condition ──────────────────
+    if let Some(after_kw) = rest.strip_prefix("acl") {
+        // Must be followed by whitespace or `=` (word boundary).
+        if after_kw.is_empty()
+            || after_kw.starts_with(char::is_whitespace)
+            || after_kw.starts_with('=')
+        {
+            let after_kw = after_kw.trim_start();
+            if let Some(value_str) = after_kw.strip_prefix('=') {
+                let value_str = value_str.trim_start();
+                let (acl_name, acl_args) = parse_acl_condition_value(value_str, evaluator)?;
+
+                // Look up the ACL definition in the evaluator context.
+                let acl_def = evaluator.context().acl_definitions.get(&acl_name).cloned();
+                if let Some(def) = acl_def {
+                    // Save and restore acl_narg / acl_args around the
+                    // recursive sub-ACL call.
+                    let saved_narg = evaluator.context().acl_narg;
+                    let saved_args = evaluator.context().acl_args.clone();
+
+                    evaluator.context_mut().acl_narg = acl_args.len() as i32;
+                    evaluator.context_mut().acl_args = acl_args;
+
+                    let result = eval_acl_definition(&def, evaluator)?;
+
+                    evaluator.context_mut().acl_narg = saved_narg;
+                    evaluator.context_mut().acl_args = saved_args;
+
+                    return match result {
+                        AclResult::Accept(msg) => Ok((true, msg)),
+                        AclResult::Deny(msg) => Ok((false, msg)),
+                        AclResult::Defer => Err(ExpandError::Failed {
+                            message: "DEFER in ACL sub-condition".to_owned(),
+                        }),
+                    };
+                }
+                // Unknown ACL name → error.
+                return Err(ExpandError::Failed {
+                    message: format!("unknown ACL \"{}\" in condition", acl_name),
+                });
+            }
+        }
+    }
+
+    // ── Check for `condition = <expansion>` boolean condition ──────
+    if let Some(after_kw) = rest.strip_prefix("condition") {
+        let after_kw = after_kw.trim_start();
+        if let Some(value_str) = after_kw.strip_prefix('=') {
+            let value_str = value_str.trim_start();
+            let expanded = evaluator.expand_string(value_str, crate::EsiFlags::default())?;
+            // C Exim: non-empty and not "0"/"no"/"false" → true
+            let passed = !expanded.is_empty()
+                && expanded != "0"
+                && !expanded.eq_ignore_ascii_case("no")
+                && !expanded.eq_ignore_ascii_case("false");
+            return Ok((passed, String::new()));
+        }
+    }
+
+    // ── Unknown condition (hosts, sender_domains, etc.) ────────────
+    // In expansion context these cannot be evaluated; treat as TRUE
+    // so that unconditional verbs and modifier-only lines still work.
+    // Check if rest_of_line looks like a condition (`word = value`) or
+    // only modifiers. Either way, return true to let the verb proceed.
+    Ok((true, String::new()))
+}
+
+/// Evaluate a raw ACL definition string, returning the ACL result.
+///
+/// This is a simplified ACL evaluator for the `${if acl {...}}` expansion
+/// condition. It handles the basic verbs and the `message` modifier.
+pub fn eval_acl_definition(raw: &str, evaluator: &mut Evaluator) -> Result<AclResult, ExpandError> {
+    use crate::EsiFlags;
+
+    /// Try to match a verb at the start of the trimmed line.  Returns
+    /// `Some((verb, rest_after_verb))` only when the match is at a word
+    /// boundary (followed by whitespace, end-of-string, or `=`).
+    fn match_verb(trimmed: &str) -> Option<(&'static str, &str)> {
+        const VERBS: &[&str] = &[
+            "accept", "deny", "defer", "require", "warn", "discard", "drop",
+        ];
+        for &v in VERBS {
+            if let Some(r) = trimmed.strip_prefix(v) {
+                // Word-boundary check on the RAW rest (before trimming).
+                if r.is_empty() || r.starts_with(char::is_whitespace) {
+                    return Some((v, r.trim_start()));
+                }
+            }
+        }
+        None
+    }
+
+    // Collect all lines of the raw definition so we can iterate with
+    // look-ahead for multi-line modifier collection.
+    let all_lines: Vec<&str> = raw.lines().collect();
+    let mut i = 0;
+
+    while i < all_lines.len() {
+        let line = all_lines[i];
+        let trimmed = line.trim();
+        i += 1;
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let (verb, rest_of_line) = match match_verb(trimmed) {
+            Some(v) => v,
+            None => continue, // Not a verb line (modifier continuation).
+        };
+
+        // Collect `message = VALUE` from the same line or continuation lines.
+        let mut message_value = String::new();
+
+        // 1) Check same-line message modifier.
+        if let Some(idx) = rest_of_line.find("message") {
+            let after = rest_of_line[idx + 7..].trim_start();
+            if let Some(val) = after.strip_prefix('=') {
+                let val = val.trim_start();
+                message_value = evaluator.expand_string(val, EsiFlags::default())?;
+            }
+        }
+
+        // 2) Check indented continuation lines for message modifier.
+        if message_value.is_empty() {
+            let mut j = i;
+            while j < all_lines.len() {
+                let raw_line = all_lines[j];
+                // Continuation lines are indented (start with whitespace).
+                if !raw_line.starts_with(char::is_whitespace) && !raw_line.starts_with('\t') {
+                    break; // Next verb or non-continuation.
+                }
+                let lt = raw_line.trim();
+                if lt.is_empty() || lt.starts_with('#') {
+                    j += 1;
+                    continue;
+                }
+                if let Some(after_msg) = lt.strip_prefix("message") {
+                    let after_msg = after_msg.trim_start();
+                    if let Some(val) = after_msg.strip_prefix('=') {
+                        let val = val.trim_start();
+                        message_value = evaluator.expand_string(val, EsiFlags::default())?;
+                        break;
+                    }
+                }
+                j += 1;
+            }
+        }
+
+        // Evaluate any conditions on this verb line (e.g. `acl = name args`).
+        // Returns (conditions_passed, condition_message).
+        let (cond_passed, cond_message) = eval_verb_line_conditions(rest_of_line, evaluator)?;
+
+        // Dispatch on the verb using C Exim ACL semantics:
+        //   accept/discard: conditions TRUE → accept; FALSE → fall through
+        //   deny/drop:      conditions TRUE → deny;   FALSE → fall through
+        //   require:        conditions TRUE → continue; FALSE → deny
+        //   defer:          unconditional defer
+        //   warn:           always continue (apply modifiers only)
+        match verb {
+            "accept" | "discard" => {
+                if cond_passed {
+                    return Ok(AclResult::Accept(message_value));
+                }
+                // Conditions not met — fall through to next statement.
+                continue;
+            }
+            "deny" | "drop" => {
+                if cond_passed {
+                    return Ok(AclResult::Deny(message_value));
+                }
+                // Conditions not met — fall through to next statement.
+                continue;
+            }
+            "defer" => {
+                return Ok(AclResult::Defer);
+            }
+            "require" => {
+                if cond_passed {
+                    // All conditions met — continue to next statement.
+                    continue;
+                }
+                // A condition failed — require causes deny.
+                // Use the sub-ACL's deny message if available, else the
+                // message modifier from the require line.
+                let deny_msg = if !cond_message.is_empty() {
+                    cond_message
+                } else {
+                    message_value
+                };
+                return Ok(AclResult::Deny(deny_msg));
+            }
+            "warn" => {
+                // warn = always continue, log the message.
+                // Not a terminal verb — continue to next statement.
+                continue;
+            }
+            _ => return Ok(AclResult::Accept(String::new())),
+        }
+    }
+
+    // No terminal verb found — default accept.
+    Ok(AclResult::Accept(String::new()))
 }
 
 // ── External service conditions ────────────────────────────────────────

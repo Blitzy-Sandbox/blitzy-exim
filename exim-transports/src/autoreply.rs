@@ -1226,7 +1226,7 @@ impl TransportDriver for AutoreplyTransport {
     ///
     /// # Returns
     ///
-    /// - `Ok(TransportResult::Ok)` — Auto-reply sent (or suppressed) successfully
+    /// - `Ok(TransportResult::ok())` — Auto-reply sent (or suppressed) successfully
     /// - `Ok(TransportResult::Deferred { .. })` — Temporary failure (retry later)
     /// - `Ok(TransportResult::Failed { .. })` — Permanent failure
     /// - `Err(DriverError)` — Driver-level error
@@ -1368,7 +1368,7 @@ impl TransportDriver for AutoreplyTransport {
             // If all recipients were removed, silently succeed.
             if final_to.is_none() && final_cc.is_none() && final_bcc.is_none() {
                 tracing::debug!("*** all recipients removed by never_mail");
-                return Ok(TransportResult::Ok);
+                return Ok(TransportResult::ok());
             }
         }
 
@@ -1514,7 +1514,7 @@ impl TransportDriver for AutoreplyTransport {
                     }
 
                     // Cleanup and return success (message suppressed).
-                    return Ok(TransportResult::Ok);
+                    return Ok(TransportResult::ok());
                 }
 
                 tracing::debug!(
@@ -1681,7 +1681,7 @@ impl TransportDriver for AutoreplyTransport {
                 }
 
                 tracing::debug!("{} transport succeeded", transport_name);
-                return Ok(TransportResult::Ok);
+                return Ok(TransportResult::ok());
             }
         }
 
@@ -1781,7 +1781,7 @@ impl TransportDriver for AutoreplyTransport {
         }
 
         tracing::debug!("{} transport succeeded", transport_name);
-        Ok(TransportResult::Ok)
+        Ok(TransportResult::ok())
     }
 
     /// Returns `true` — autoreply is a local transport.

@@ -768,11 +768,96 @@ pub fn fn_hdrs_added(msg_ctx: &MessageContext) -> usize {
 /// The first line of the message (before the first newline), or the entire
 /// message if it contains no newlines.
 fn string_split_message(msg: &str) -> String {
-    // Find the first newline and return only the first line
-    match msg.find('\n') {
-        Some(pos) => msg[..pos].to_string(),
-        None => msg.to_string(),
+    // Rust equivalent of C `string_split_message()` in string.c lines 555–600.
+    //
+    // This is a **line-wrapping** function, NOT a truncation function.
+    // If the message is ≤75 characters total, return it unchanged.
+    // For longer messages, insert `\n` at word boundaries so no line exceeds
+    // ~75 columns. Existing `\n` characters are preserved as natural breaks.
+    //
+    // The C implementation walks the string, and for each segment between
+    // newlines, if a segment exceeds 75 chars it tries to break at a space
+    // (preferring after a colon) around column 35–75. The full message is
+    // always returned — nothing is truncated.
+
+    if msg.len() <= 75 {
+        return msg.to_string();
     }
+
+    let mut result = String::with_capacity(msg.len() + 16);
+    let bytes = msg.as_bytes();
+    let len = bytes.len();
+    let mut s = 0; // start of current line-search window
+
+    while s < len {
+        // Find end of current visual line (next \n or end of string)
+        let mut line_end = s;
+        while line_end < len && bytes[line_end] != b'\n' {
+            line_end += 1;
+        }
+
+        let line_len = line_end - s;
+        if line_len <= 75 {
+            // Short enough — emit as-is
+            result.push_str(&msg[s..line_end]);
+            if line_end < len {
+                result.push('\n');
+                s = line_end + 1;
+            } else {
+                break;
+            }
+        } else {
+            // Line is too long — find a suitable break point
+            // Prefer a space near column 75, ideally after a colon
+            let search_end = s + 75;
+            let search_start = s + 35;
+            let mut best: Option<usize> = None;
+
+            // Search backwards from column 75 to column 35
+            let mut t = search_end;
+            while t > search_start {
+                if bytes[t] == b' ' {
+                    if t > 0 && bytes[t - 1] == b':' {
+                        best = Some(t);
+                        break;
+                    }
+                    if best.is_none() {
+                        best = Some(t);
+                    }
+                }
+                t -= 1;
+            }
+
+            // If no break found behind, try ahead
+            if best.is_none() {
+                let mut t2 = search_end + 1;
+                while t2 < line_end {
+                    if bytes[t2] == b' ' || bytes[t2] == b'\n' {
+                        best = Some(t2);
+                        break;
+                    }
+                    t2 += 1;
+                }
+            }
+
+            if let Some(bp) = best {
+                result.push_str(&msg[s..bp]);
+                result.push('\n');
+                s = bp + 1;
+            } else {
+                // Can't find anywhere to split — emit remainder
+                result.push_str(&msg[s..line_end]);
+                if line_end < len {
+                    result.push('\n');
+                    s = line_end + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    result
 }
 
 /// Helper: checks if `where_phase` matches `AclWhere::Prdr` when the `prdr`
@@ -956,9 +1041,13 @@ mod tests {
 
     #[test]
     fn test_string_split_message_with_newline() {
+        // string_split_message does NOT truncate — it returns the
+        // full message, only inserting wraps at word boundaries for
+        // lines exceeding 75 chars. Short multi-line messages are
+        // returned as-is.
         assert_eq!(
             string_split_message("first line\nsecond line\nthird"),
-            "first line"
+            "first line\nsecond line\nthird"
         );
     }
 
@@ -969,7 +1058,8 @@ mod tests {
 
     #[test]
     fn test_string_split_message_only_newline() {
-        assert_eq!(string_split_message("\nrest"), "");
+        // A message starting with \n: the full string is preserved.
+        assert_eq!(string_split_message("\nrest"), "\nrest");
     }
 
     // ── Re-export Verification Tests ─────────────────────────────────────

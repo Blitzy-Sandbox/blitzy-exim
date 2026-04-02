@@ -55,6 +55,11 @@ exim-drivers = { path = "../exim-drivers" }
 # Replaces the C store.c 5-pool allocator for transport-local allocations.
 exim-store = { path = "../exim-store" }
 
+# Spool file I/O for reading -H header files during delivery.
+# The appendfile transport needs to reconstruct the full message by reading
+# the -H file (headers including Received:) and the -D file (body).
+exim-spool = { path = "../exim-spool" }
+
 # FFI bindings for C libraries without viable Rust replacements.
 # Optional: only needed if specific transports require direct C library access
 # (e.g., system-level file operations not covered by nix/libc safe wrappers).

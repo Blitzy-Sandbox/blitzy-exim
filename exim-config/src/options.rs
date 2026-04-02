@@ -1623,6 +1623,13 @@ fn parse_gid_list(input: &str) -> Result<ExpandableIdList, ConfigError> {
 /// and processes C-style escape sequences (`\\`, `\"`, `\n`, `\t`, `\r`).
 /// Otherwise, returns the input verbatim.
 fn dequote_string(input: &str) -> Result<String, ConfigError> {
+    dequote_string_for(input, None)
+}
+
+/// Dequote a string value.  When `opt_name` is `Some(name)` the check for
+/// trailing characters after a closing `"` is enabled and will produce the
+/// same error as C Exim: "extra characters follow string value for <name>".
+fn dequote_string_for(input: &str, opt_name: Option<&str>) -> Result<String, ConfigError> {
     let s = input;
     if !s.starts_with('"') {
         return Ok(s.to_string());
@@ -1663,6 +1670,25 @@ fn dequote_string(input: &str) -> Result<String, ConfigError> {
             Some(c) => result.push(c),
         }
     }
+
+    // After the closing `"`, check for trailing characters.
+    let remainder: String = chars.collect();
+    let trimmed = remainder.trim();
+    if !trimmed.is_empty() {
+        if let Some(name) = opt_name {
+            let comment = if trimmed.starts_with('#') {
+                " (# is comment only at line start)"
+            } else {
+                ""
+            };
+            return Err(ConfigError::ParseError {
+                file: String::new(),
+                line: 0,
+                message: format!("extra characters follow string value for {name}{comment}"),
+            });
+        }
+    }
+
     Ok(result)
 }
 
@@ -1680,6 +1706,10 @@ pub enum OptionValue {
     Str(String),
     /// A boolean value (from `opt_bool`, `opt_bool_verify`, `opt_bool_set`).
     Bool(bool),
+    /// An expandable boolean (from `opt_expand_bool`) — the value is an
+    /// expansion string like `${if eq {0}{0}{yes}{no}}` that will be
+    /// evaluated at runtime to determine the boolean result.
+    ExpandBool(String),
     /// An integer value (from `opt_int`, `opt_mkint`, `opt_octint`).
     Int(i64),
     /// A time value in seconds (from `opt_time`).
@@ -1865,43 +1895,81 @@ pub fn handle_option(
     match option_type {
         OptionType::Bool | OptionType::BoolVerify | OptionType::BoolSet => {
             // Boolean processing.
-            let bool_value = if s.is_empty() || s.starts_with('#') {
+            //
+            // C Exim treats many booleans as `opt_expand_bool`: the
+            // value after `=` may be a string expansion like
+            // `${if eq {0}{0}{yes}{no}}`.  In that case we store the
+            // raw string as `expand_<name>` and set the static boolean
+            // to `true` (the expansion decides the real value at
+            // runtime).  For bare booleans and literal true/false/yes/no
+            // we set the boolean directly.
+            if s.is_empty() || s.starts_with('#') {
                 // Bare option — value is true (or false if negated).
-                !is_negated
+                let bool_value = !is_negated;
+                trace!(option = %lookup_name, value = %bool_value, "parsed boolean option (bare)");
+                Ok(Some(HandleOptionResult {
+                    name: lookup_name,
+                    value: OptionValue::Bool(bool_value),
+                    is_secure,
+                    is_negated,
+                }))
             } else if let Some(after_eq) = s.strip_prefix('=') {
                 let val_str = after_eq.trim();
-                let (val_name, _) = read_name(val_str);
-                match val_name.to_ascii_lowercase().as_str() {
-                    "true" | "yes" => !is_negated,
-                    "false" | "no" => is_negated,
-                    _ => {
-                        return Err(ConfigError::ParseError {
-                            file: String::new(),
-                            line: 0,
-                            message: format!(
-                                "'{val_name}' is not a valid value for boolean option '{full_name}'"
-                            ),
-                        });
-                    }
+                // Check for expansion string (starts with $ or contains $)
+                if val_str.starts_with('$') || val_str.starts_with('"') {
+                    // Expansion boolean — store as the expand_<name> string.
+                    // The boolean itself defaults to true; the expansion
+                    // will be evaluated at runtime to determine the real value.
+                    trace!(
+                        option = %lookup_name,
+                        expand = %val_str,
+                        "parsed boolean option with expansion string"
+                    );
+                    Ok(Some(HandleOptionResult {
+                        name: lookup_name,
+                        value: OptionValue::ExpandBool(val_str.to_string()),
+                        is_secure,
+                        is_negated,
+                    }))
+                } else {
+                    let (val_name, _) = read_name(val_str);
+                    let bool_value = match val_name.to_ascii_lowercase().as_str() {
+                        "true" | "yes" => !is_negated,
+                        "false" | "no" => is_negated,
+                        _ => {
+                            return Err(ConfigError::ParseError {
+                                file: String::new(),
+                                line: 0,
+                                message: format!(
+                                    "'{val_name}' is not a valid value for boolean option '{full_name}'"
+                                ),
+                            });
+                        }
+                    };
+                    trace!(option = %lookup_name, value = %bool_value, "parsed boolean option");
+                    Ok(Some(HandleOptionResult {
+                        name: lookup_name,
+                        value: OptionValue::Bool(bool_value),
+                        is_secure,
+                        is_negated,
+                    }))
                 }
             } else if is_negated {
                 // Negated boolean with no `=` — just the name.
-                false
+                trace!(option = %lookup_name, value = false, "parsed negated boolean option");
+                Ok(Some(HandleOptionResult {
+                    name: lookup_name,
+                    value: OptionValue::Bool(false),
+                    is_secure,
+                    is_negated,
+                }))
             } else {
-                return Err(ConfigError::ParseError {
+                Err(ConfigError::ParseError {
                     file: String::new(),
                     line: 0,
                     message: format!("extra characters after boolean option '{full_name}'"),
-                });
-            };
-
-            trace!(option = %lookup_name, value = %bool_value, "parsed boolean option");
-            Ok(Some(HandleOptionResult {
-                name: lookup_name,
-                value: OptionValue::Bool(bool_value),
-                is_secure,
-                is_negated,
-            }))
+                })
+            }
         }
 
         OptionType::StringPtr => {
@@ -1914,7 +1982,7 @@ pub fn handle_option(
                 });
             }
             let after_eq = require_equals(s, &full_name)?;
-            let raw_value = dequote_string(after_eq.trim())?;
+            let raw_value = dequote_string_for(after_eq.trim(), Some(&full_name))?;
 
             // Handle opt_rep_con and opt_rep_str in the calling layer.
             trace!(option = %lookup_name, value = %raw_value, "parsed string option");

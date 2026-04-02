@@ -1530,6 +1530,8 @@ fn handle_smtp_child(
         atrn_mode: false,
         interface_address: None,
         interface_port: 0,
+        is_local_session: false,
+        smtp_batched_input: false,
     };
 
     // Build the exim-smtp ConfigContext from our Arc<Config> using the
@@ -1550,8 +1552,13 @@ fn handle_smtp_child(
         )
     };
 
-    // Initialize a MessageContext for this SMTP session.
-    let mut smtp_msg_ctx = exim_smtp::inbound::command_loop::MessageContext::default();
+    // Initialize a MessageContext for this SMTP session, installing the
+    // verify=recipient callback so the ACL engine can route recipient
+    // addresses through the router chain during RCPT TO.
+    let mut smtp_msg_ctx = exim_smtp::inbound::command_loop::MessageContext {
+        verify_recipient_cb: super::make_verify_recipient_callback(config),
+        ..Default::default()
+    };
 
     // Write connection log to mainlog (AAP §0.7.1 — C Exim format).
     let spool_dir = config.spool_directory.clone();
@@ -1646,6 +1653,7 @@ fn protocol_name(proto: exim_smtp::SmtpProtocol) -> &'static str {
         exim_smtp::SmtpProtocol::LocalSsmtp => "local-ssmtp",
         exim_smtp::SmtpProtocol::LocalEssmtp => "local-essmtp",
         exim_smtp::SmtpProtocol::LocalEssmtpa => "local-essmtpa",
+        exim_smtp::SmtpProtocol::LocalBsmtp => "local-bsmtp",
     }
 }
 
@@ -1877,6 +1885,11 @@ fn receive_and_spool_message(
             }],
             recipients,
             non_recipients_tree: None,
+            host_address: msg_ctx.sender_host_address.clone(),
+            host_name: msg_ctx.sender_host_name.clone(),
+            interface_address: None,
+            received_protocol: Some(protocol_name(msg_ctx.received_protocol).to_string()),
+            sender_ident: None,
         };
 
         match std::fs::File::create(&header_path) {

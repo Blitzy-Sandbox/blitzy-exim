@@ -814,7 +814,7 @@ impl PipeTransport {
 
         // Exit code 0 means success
         if exit_code == 0 {
-            return TransportResult::Ok;
+            return TransportResult::ok();
         }
 
         // Timeout case: child timed out
@@ -872,7 +872,7 @@ impl PipeTransport {
                 return TransportResult::Failed { message: Some(msg) };
             }
             // ignore_status: fall through to Ok
-            return TransportResult::Ok;
+            return TransportResult::ok();
         }
 
         // Positive exit code: process completed with non-zero status
@@ -901,7 +901,7 @@ impl PipeTransport {
                 exit_code,
                 "non-zero exit status ignored"
             );
-            return TransportResult::Ok;
+            return TransportResult::ok();
         }
 
         // Check against temp_errors list

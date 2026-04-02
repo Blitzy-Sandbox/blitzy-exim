@@ -1184,6 +1184,9 @@ fn build_router_generic_options() -> Vec<OptionEntry> {
         OptionEntry::simple("errors_to", OptionType::StringPtr),
         OptionEntry::simple("expn", OptionType::Bool),
         OptionEntry::simple("extra_headers", OptionType::StringPtr),
+        // "headers_add" is the user-facing config option name that maps to
+        // the internal extra_headers field (C Exim readconf.c optionlist_routers).
+        OptionEntry::simple("headers_add", OptionType::StringPtr),
         OptionEntry::simple("fallback_hosts", OptionType::StringPtr),
         OptionEntry::simple("group", OptionType::Gid),
         OptionEntry::simple("home_directory", OptionType::StringPtr),
@@ -1194,8 +1197,8 @@ fn build_router_generic_options() -> Vec<OptionEntry> {
         OptionEntry::simple("more", OptionType::Bool),
         OptionEntry::simple("pass_on_timeout", OptionType::Bool),
         OptionEntry::simple("pass_router", OptionType::StringPtr),
-        OptionEntry::simple("prefix", OptionType::StringPtr),
-        OptionEntry::simple("prefix_optional", OptionType::Bool),
+        OptionEntry::simple("local_part_prefix", OptionType::StringPtr),
+        OptionEntry::simple("local_part_prefix_optional", OptionType::Bool),
         OptionEntry::simple("redirect_router", OptionType::StringPtr),
         OptionEntry::simple("remove_headers", OptionType::StringPtr),
         OptionEntry::simple("repeat_use", OptionType::Bool),
@@ -1206,8 +1209,8 @@ fn build_router_generic_options() -> Vec<OptionEntry> {
         OptionEntry::simple("self", OptionType::StringPtr),
         OptionEntry::simple("self_rewrite", OptionType::Bool),
         OptionEntry::simple("senders", OptionType::StringPtr),
-        OptionEntry::simple("suffix", OptionType::StringPtr),
-        OptionEntry::simple("suffix_optional", OptionType::Bool),
+        OptionEntry::simple("local_part_suffix", OptionType::StringPtr),
+        OptionEntry::simple("local_part_suffix_optional", OptionType::Bool),
         OptionEntry::simple("translate_ip_address", OptionType::StringPtr),
         OptionEntry::simple("transport", OptionType::StringPtr),
         OptionEntry::simple("unseen", OptionType::Bool),
@@ -1297,11 +1300,33 @@ fn extract_string_option(options: &[HandleOptionResult], name: &str) -> Option<S
 }
 
 /// Extract a boolean option value from a list of option results by name.
+/// Extract the expansion string from an `ExpandBool` option, if present.
+///
+/// In C Exim, expandable boolean options (e.g. `unseen = ${if ...}`)
+/// store the expansion string in the `expand_<name>` slot. This helper
+/// retrieves that string when an `ExpandBool` variant was parsed.
+fn extract_expand_bool_string(options: &[HandleOptionResult], name: &str) -> Option<String> {
+    for opt in options {
+        if opt.name == name {
+            if let OptionValue::ExpandBool(ref s) = opt.value {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
+}
+
 fn extract_bool_option(options: &[HandleOptionResult], name: &str, default: bool) -> bool {
     for opt in options {
         if opt.name == name {
-            if let OptionValue::Bool(v) = opt.value {
-                return v;
+            match &opt.value {
+                OptionValue::Bool(v) => return *v,
+                // ExpandBool: the expansion decides the runtime value;
+                // the static bool defaults to true so that the option is
+                // "set" and the expansion string will be consulted via
+                // `expand_<name>` at runtime.
+                OptionValue::ExpandBool(_) => return true,
+                _ => {}
             }
         }
     }
@@ -1408,15 +1433,20 @@ fn build_router_instance_config(
         expand_gid: extract_string_option(&state.generic_options, "expand_gid"),
         expand_uid: extract_string_option(&state.generic_options, "expand_uid"),
         expand_more: extract_string_option(&state.generic_options, "expand_more"),
-        expand_unseen: extract_string_option(&state.generic_options, "expand_unseen"),
-        extra_headers: extract_string_option(&state.generic_options, "extra_headers"),
+        expand_unseen: extract_expand_bool_string(&state.generic_options, "unseen")
+            .or_else(|| extract_string_option(&state.generic_options, "expand_unseen")),
+        // C Exim: "headers_add" is the user-facing config option name that
+        // populates the router's extra_headers field.  Check both keys so that
+        // `headers_add = ...` in a router block is correctly handled.
+        extra_headers: extract_string_option(&state.generic_options, "extra_headers")
+            .or_else(|| extract_string_option(&state.generic_options, "headers_add")),
         fallback_hosts: extract_string_option(&state.generic_options, "fallback_hosts"),
         fallback_hostlist: Vec::new(),
         home_directory: extract_string_option(&state.generic_options, "home_directory"),
         ignore_target_hosts: extract_string_option(&state.generic_options, "ignore_target_hosts"),
         local_parts: extract_string_option(&state.generic_options, "local_parts"),
         pass_router_name: extract_string_option(&state.generic_options, "pass_router"),
-        prefix: extract_string_option(&state.generic_options, "prefix"),
+        prefix: extract_string_option(&state.generic_options, "local_part_prefix"),
         redirect_router_name: extract_string_option(&state.generic_options, "redirect_router"),
         remove_headers: extract_string_option(&state.generic_options, "remove_headers"),
         require_files: extract_string_option(&state.generic_options, "require_files"),
@@ -1427,7 +1457,7 @@ fn build_router_instance_config(
         self_config: extract_string_option(&state.generic_options, "self"),
         senders: extract_string_option(&state.generic_options, "senders"),
         set: extract_string_option(&state.generic_options, "set"),
-        suffix: extract_string_option(&state.generic_options, "suffix"),
+        suffix: extract_string_option(&state.generic_options, "local_part_suffix"),
         translate_ip_address: extract_string_option(&state.generic_options, "translate_ip_address"),
         transport_name: extract_string_option(&state.generic_options, "transport"),
         address_test: extract_bool_option(&state.generic_options, "address_test", true),
@@ -1446,7 +1476,11 @@ fn build_router_instance_config(
         log_as_local: extract_bool_option(&state.generic_options, "log_as_local", false),
         more: extract_bool_option(&state.generic_options, "more", true),
         pass_on_timeout: extract_bool_option(&state.generic_options, "pass_on_timeout", false),
-        prefix_optional: extract_bool_option(&state.generic_options, "prefix_optional", false),
+        prefix_optional: extract_bool_option(
+            &state.generic_options,
+            "local_part_prefix_optional",
+            false,
+        ),
         repeat_use: extract_bool_option(&state.generic_options, "repeat_use", true),
         retry_use_local_part: extract_bool_option(
             &state.generic_options,
@@ -1459,7 +1493,11 @@ fn build_router_instance_config(
             false,
         ),
         self_rewrite: extract_bool_option(&state.generic_options, "self_rewrite", false),
-        suffix_optional: extract_bool_option(&state.generic_options, "suffix_optional", false),
+        suffix_optional: extract_bool_option(
+            &state.generic_options,
+            "local_part_suffix_optional",
+            false,
+        ),
         verify_only: extract_bool_option(&state.generic_options, "verify_only", false),
         verify_recipient: extract_bool_option(&state.generic_options, "verify_recipient", true),
         verify_sender: extract_bool_option(&state.generic_options, "verify_sender", true),
@@ -1470,9 +1508,80 @@ fn build_router_instance_config(
         uid: extract_uid_option(&state.generic_options, "user", 0),
         gid: extract_gid_option(&state.generic_options, "group", 0),
         options: Box::new(state.private_options.clone()),
+        private_options_map: {
+            let mut map = std::collections::HashMap::new();
+            for opt in &state.private_options {
+                // Extract the value part from the raw line stored in the
+                // OptionValue::Str. The raw line is "name = value", so we
+                // split on '=' and take everything after.
+                if let OptionValue::Str(ref raw_line) = opt.value {
+                    if let Some(eq_pos) = raw_line.find('=') {
+                        let val = raw_line[eq_pos + 1..].trim();
+                        // Strip surrounding double-quotes from Exim config
+                        // syntax (e.g. `data = "..."` → value without quotes).
+                        let val = strip_config_quotes(val);
+                        map.insert(opt.name.clone(), val);
+                    } else {
+                        // Boolean-style option without '=' — store empty value
+                        map.insert(opt.name.clone(), String::new());
+                    }
+                }
+            }
+            map
+        },
     };
 
     Ok(config)
+}
+
+/// Strip surrounding Exim config double-quotes from a value string.
+///
+/// In Exim configuration files, string values may be quoted with `"..."`.
+/// This function removes those outer quotes and processes basic escape
+/// sequences (`\\` → `\`, `\"` → `"`, `\n` → newline).
+/// Backslash-newline continuation is collapsed (the `\` + newline are
+/// removed, and leading whitespace on the next line is preserved as-is
+/// since the config parser already joined continuation lines).
+fn strip_config_quotes(s: &str) -> String {
+    let trimmed = s.trim();
+
+    // Check for outer double-quotes
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let mut result = String::with_capacity(inner.len());
+        let mut chars = inner.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.peek() {
+                    Some(&'n') => {
+                        chars.next();
+                        result.push('\n');
+                    }
+                    Some(&'\\') => {
+                        chars.next();
+                        result.push('\\');
+                    }
+                    Some(&'"') => {
+                        chars.next();
+                        result.push('"');
+                    }
+                    Some(&'t') => {
+                        chars.next();
+                        result.push('\t');
+                    }
+                    _ => {
+                        // Unknown escape — keep the backslash
+                        result.push('\\');
+                    }
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+        result
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Build a `TransportInstanceConfig` from a `DriverParseState`.
@@ -1556,7 +1665,8 @@ fn build_transport_instance_config(
                 // split on '=' and take everything after.
                 if let OptionValue::Str(ref raw_line) = opt.value {
                     if let Some(eq_pos) = raw_line.find('=') {
-                        let val = raw_line[eq_pos + 1..].trim().to_string();
+                        let val = raw_line[eq_pos + 1..].trim();
+                        let val = strip_config_quotes(val);
                         map.insert(opt.name.clone(), val);
                     } else {
                         // Boolean-style option without '=' — store empty value

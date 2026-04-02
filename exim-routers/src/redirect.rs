@@ -136,8 +136,13 @@ pub const RDO_EACCES: u32 = 1 << 17;
 /// Allow ENOTDIR on file open to be non-fatal.
 pub const RDO_ENOTDIR: u32 = 1 << 18;
 
-/// Default bit_options value (RDO_REWRITE | RDO_PREPEND_HOME).
-pub const RDO_DEFAULT: u32 = RDO_REWRITE | RDO_PREPEND_HOME;
+/// Default bit_options value.
+///
+/// In C Exim, `:blackhole:` is **permitted by default** — the
+/// `forbid_blackhole` option removes the permission.  The same applies to
+/// `:include:`.  `RDO_REWRITE` and `RDO_PREPEND_HOME` are the remaining
+/// unconditional defaults.
+pub const RDO_DEFAULT: u32 = RDO_REWRITE | RDO_PREPEND_HOME | RDO_BLACKHOLE | RDO_INCLUDE;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Address Flag Constants
@@ -605,6 +610,99 @@ struct RedirectInterpretResult {
 pub struct RedirectRouter;
 
 impl RedirectRouter {
+    // ── Build options from private_options_map ──────────────────────────
+
+    /// Build a `RedirectRouterOptions` from the config parser's
+    /// `private_options_map` (HashMap<String, String>).
+    ///
+    /// This is used when the `options` box does not contain a typed
+    /// `RedirectRouterOptions` (i.e., the config parser stored raw
+    /// key-value pairs rather than the typed struct).
+    fn build_options_from_map(
+        map: &std::collections::HashMap<String, String>,
+    ) -> RedirectRouterOptions {
+        /// Helper: extract an optional string value from the map.
+        fn get_str(map: &std::collections::HashMap<String, String>, key: &str) -> Option<String> {
+            // Preserve empty strings — C Exim distinguishes `data =`
+            // (empty string, NOT NULL) from data being unset (NULL).
+            // This matters for the redirect router's validation logic
+            // where `(ob->file == NULL) == (ob->data == NULL)` requires
+            // the empty-string case to be `Some("")` not `None`.
+            map.get(key).cloned()
+        }
+
+        /// Helper: extract a boolean from the map (default false).
+        fn get_bool(
+            map: &std::collections::HashMap<String, String>,
+            key: &str,
+            default: bool,
+        ) -> bool {
+            match map.get(key).map(|s| s.as_str()) {
+                Some("true") | Some("yes") | Some("") => true,
+                Some("false") | Some("no") => false,
+                _ => default,
+            }
+        }
+
+        RedirectRouterOptions {
+            data: get_str(map, "data"),
+            file: get_str(map, "file"),
+            file_dir: get_str(map, "directory"),
+            include_directory: get_str(map, "include_directory"),
+            directory_transport_name: get_str(map, "directory_transport"),
+            file_transport_name: get_str(map, "file_transport"),
+            pipe_transport_name: get_str(map, "pipe_transport"),
+            reply_transport_name: get_str(map, "reply_transport"),
+            sieve_enotify_mailto_owner: get_str(map, "sieve_enotify_mailto_owner"),
+            sieve_inbox: get_str(map, "sieve_inbox"),
+            sieve_subaddress: get_str(map, "sieve_subaddress"),
+            sieve_useraddress: get_str(map, "sieve_useraddress"),
+            sieve_vacation_directory: get_str(map, "sieve_vacation_directory"),
+            syntax_errors_text: get_str(map, "syntax_errors_text"),
+            syntax_errors_to: get_str(map, "syntax_errors_to"),
+            qualify_domain: get_str(map, "qualify_domain"),
+            owners: Vec::new(),
+            owngroups: Vec::new(),
+            modemask: default_modemask(),
+            bit_options: {
+                let mut bits = RDO_DEFAULT;
+                if get_bool(map, "allow_filter", false) {
+                    bits |= RDO_EXIM_FILTER | RDO_SIEVE_FILTER;
+                }
+                if get_bool(map, "allow_freeze", false) {
+                    bits |= RDO_FREEZE;
+                }
+                if get_bool(map, "allow_fail", false) {
+                    bits |= RDO_FAIL;
+                }
+                if get_bool(map, "allow_defer", false) {
+                    bits |= RDO_DEFER;
+                }
+                if get_bool(map, "allow_lookup", false) {
+                    bits |= RDO_LOOKUP;
+                }
+                if get_bool(map, "allow_run", false) {
+                    bits |= RDO_RUN;
+                }
+                if get_bool(map, "forbid_blackhole", false) {
+                    bits &= !RDO_BLACKHOLE;
+                }
+                bits
+            },
+            check_ancestor: get_bool(map, "check_ancestor", false),
+            check_group: get_bool(map, "check_group", true),
+            check_owner: get_bool(map, "check_owner", true),
+            forbid_file: get_bool(map, "forbid_file", false),
+            forbid_filter_reply: get_bool(map, "forbid_filter_reply", false),
+            forbid_pipe: get_bool(map, "forbid_pipe", false),
+            forbid_smtp_code: get_bool(map, "forbid_smtp_code", false),
+            hide_child_in_errmsg: get_bool(map, "hide_child_in_errmsg", false),
+            one_time: get_bool(map, "one_time", false),
+            qualify_preserve_domain: get_bool(map, "qualify_preserve_domain", false),
+            skip_syntax_errors: get_bool(map, "skip_syntax_errors", false),
+        }
+    }
+
     // ── Configuration Validation ───────────────────────────────────────
 
     /// Validate redirect router configuration.
@@ -678,10 +776,19 @@ impl RedirectRouter {
         opts: &RedirectRouterOptions,
         router_name: &str,
     ) -> Result<(), RedirectError> {
-        // Stat the file to get ownership and permissions
+        // Stat the file to get ownership and permissions.
+        // If the file does not exist (ENOENT), return FileReadFailed
+        // instead of FileSecurityFailed — C Exim treats a missing file
+        // as "not found" (DECLINE) rather than a security error (DEFER).
         let stat_result = nix::sys::stat::stat(path);
         let file_stat = match stat_result {
             Ok(s) => s,
+            Err(nix::errno::Errno::ENOENT) => {
+                return Err(RedirectError::FileReadFailed {
+                    path: path.display().to_string(),
+                    reason: "file not found".to_string(),
+                });
+            }
             Err(e) => {
                 return Err(RedirectError::FileSecurityFailed {
                     path: path.display().to_string(),
@@ -779,7 +886,10 @@ impl RedirectRouter {
                     );
                     Ok(expanded)
                 }
-                Err(ExpandError::ForcedFail) => {
+                Err(ExpandError::ForcedFail) | Err(ExpandError::FailRequested { .. }) => {
+                    // In C Exim, both `expand_string_forcedfail` (ForcedFail)
+                    // and the `{fail}` keyword (FailRequested) cause the
+                    // redirect router to DECLINE to the next router.
                     tracing::debug!(
                         router = router_name,
                         "redirect data expansion: forced failure"
@@ -799,7 +909,7 @@ impl RedirectRouter {
             // Expand the file path (it may contain $variables)
             let expanded_path = match expand_string(file_path) {
                 Ok(p) => p,
-                Err(ExpandError::ForcedFail) => {
+                Err(ExpandError::ForcedFail) | Err(ExpandError::FailRequested { .. }) => {
                     tracing::debug!(
                         router = router_name,
                         "redirect file path expansion: forced failure"
@@ -962,6 +1072,49 @@ impl RedirectRouter {
                     address: Some(entry.to_string()),
                 });
                 continue;
+            }
+
+            // Handle :fail: directive — generate a routing failure
+            // C Exim: one_addr->special_action = SPECIAL_FAIL
+            if entry.starts_with(":fail:") {
+                if (opts.bit_options & RDO_FAIL) != 0 {
+                    let msg = entry.trim_start_matches(":fail:").trim().to_string();
+                    tracing::debug!(message = %msg, "alias list: :fail: directive");
+                    return RedirectInterpretResult {
+                        filter_code: FF_FAIL,
+                        generated_addresses: generated,
+                        syntax_errors,
+                        error_message: Some(if msg.is_empty() {
+                            "redirect failed".to_string()
+                        } else {
+                            msg
+                        }),
+                        is_filter: false,
+                    };
+                }
+                syntax_errors.push(SyntaxErrorEntry {
+                    message: ":fail: not permitted".to_string(),
+                    address: Some(entry.to_string()),
+                });
+                continue;
+            }
+
+            // Handle :defer: directive — generate a routing deferral
+            // C Exim: one_addr->special_action = SPECIAL_DEFER
+            if entry.starts_with(":defer:") {
+                let msg = entry.trim_start_matches(":defer:").trim().to_string();
+                tracing::debug!(message = %msg, "alias list: :defer: directive");
+                return RedirectInterpretResult {
+                    filter_code: FF_DEFER,
+                    generated_addresses: generated,
+                    syntax_errors,
+                    error_message: Some(if msg.is_empty() {
+                        "redirect deferred".to_string()
+                    } else {
+                        msg
+                    }),
+                    is_filter: false,
+                };
             }
 
             // Handle :include:/path directive
@@ -1700,11 +1853,14 @@ impl RouterDriver for RedirectRouter {
         );
 
         // ── Step 1: Extract driver-specific options ────────────────────
-        let opts = config
-            .options
-            .downcast_ref::<RedirectRouterOptions>()
-            .cloned()
-            .unwrap_or_default();
+        // First try direct downcast (when options are already typed).
+        // If that fails, build from the private_options_map populated
+        // by the config parser (HashMap<String, String>).
+        let opts = if let Some(typed) = config.options.downcast_ref::<RedirectRouterOptions>() {
+            typed.clone()
+        } else {
+            Self::build_options_from_map(&config.private_options_map)
+        };
 
         // ── Step 2: Validate configuration ─────────────────────────────
         Self::validate_config(config, &opts).map_err(DriverError::from)?;
@@ -1732,7 +1888,7 @@ impl RouterDriver for RedirectRouter {
         } else if let Some(ref qd) = opts.qualify_domain {
             match expand_string(qd) {
                 Ok(expanded) => Some(expanded),
-                Err(ExpandError::ForcedFail) => {
+                Err(ExpandError::ForcedFail) | Err(ExpandError::FailRequested { .. }) => {
                     tracing::debug!(
                         router = router_name,
                         "qualify_domain expansion: forced failure"
@@ -1774,8 +1930,8 @@ impl RouterDriver for RedirectRouter {
                 );
                 return Ok(RouterResult::Decline);
             }
-            Err(RedirectError::FileReadFailed { ref path, .. }) if opts.file.is_some() => {
-                // File not found → DECLINE (like FF_NONEXIST)
+            Err(RedirectError::FileReadFailed { ref path, .. }) => {
+                // File not found → DECLINE (like FF_NONEXIST in C Exim)
                 tracing::debug!(
                     router = router_name,
                     path = path.as_str(),
@@ -1883,28 +2039,18 @@ impl RouterDriver for RedirectRouter {
         let was_filter = interpret_result.is_filter;
 
         if generated.is_empty() {
-            if interpret_result.filter_code == FF_NOTDELIVERED && was_filter {
-                // Filter didn't produce any output — for filters this
-                // means the filter didn't produce any delivery actions,
-                // so we treat it as DECLINE (pass to next router).
-                tracing::debug!(
-                    router = router_name,
-                    is_filter = was_filter,
-                    "filter produced no addresses (FF_NOTDELIVERED) → DECLINE"
-                );
-                return Ok(RouterResult::Decline);
-            } else if interpret_result.filter_code == FF_NOTDELIVERED {
-                // Alias list produced no addresses but didn't error —
-                // create a base address for further routing.
-                tracing::debug!(
-                    router = router_name,
-                    "no addresses generated (FF_NOTDELIVERED) → creating base address"
-                );
-                generated.push(AddressItem::new(address.to_string()));
-            } else {
-                tracing::debug!(router = router_name, "no generated addresses → DECLINE");
-                return Ok(RouterResult::Decline);
-            }
+            // When no addresses are generated, DECLINE — pass to the
+            // next router.  For alias-style data (not a filter) an empty
+            // result means the redirect data produced nothing useful, so
+            // routing should continue.  If no subsequent router accepts
+            // the address, the caller will report "Unrouteable address".
+            tracing::debug!(
+                router = router_name,
+                is_filter = was_filter,
+                filter_code = interpret_result.filter_code,
+                "no addresses generated → DECLINE"
+            );
+            return Ok(RouterResult::Decline);
         }
 
         // Build ancestor set for loop detection
@@ -2080,7 +2226,7 @@ mod tests {
         assert!(opts.data.is_none());
         assert!(opts.file.is_none());
         assert_eq!(opts.modemask, 0o022);
-        assert_eq!(opts.bit_options, RDO_REWRITE | RDO_PREPEND_HOME);
+        assert_eq!(opts.bit_options, RDO_DEFAULT);
         assert!(!opts.check_ancestor);
         assert!(opts.check_group);
         assert!(opts.check_owner);

@@ -502,6 +502,37 @@ pub fn parse_main_config(
     trusted_config_list: Option<&[String]>,
     command_line_macros: &[(String, String)],
 ) -> Result<(ConfigContext, ParserState), ConfigError> {
+    parse_main_config_inner(
+        config_file_list,
+        trusted_config_list,
+        command_line_macros,
+        false,
+    )
+}
+
+/// Extended entry point that optionally enables macro expansion debug output
+/// to stdout (matching C Exim `readconf.c:984` behaviour when both `D_any`
+/// and `f.expansion_test` are active).
+pub fn parse_main_config_with_debug(
+    config_file_list: &str,
+    trusted_config_list: Option<&[String]>,
+    command_line_macros: &[(String, String)],
+    expansion_test_debug: bool,
+) -> Result<(ConfigContext, ParserState), ConfigError> {
+    parse_main_config_inner(
+        config_file_list,
+        trusted_config_list,
+        command_line_macros,
+        expansion_test_debug,
+    )
+}
+
+fn parse_main_config_inner(
+    config_file_list: &str,
+    trusted_config_list: Option<&[String]>,
+    command_line_macros: &[(String, String)],
+    expansion_test_debug: bool,
+) -> Result<(ConfigContext, ParserState), ConfigError> {
     tracing::info!(
         config_file_list = %config_file_list,
         "beginning main configuration parse"
@@ -531,6 +562,7 @@ pub fn parse_main_config(
 
     // ── Open parser state ───────────────────────────────────────────────
     let mut state = ParserState::new(&config_path)?;
+    macro_store.expansion_test_debug = expansion_test_debug;
     state.macro_store_inner = macro_store;
 
     // Initialize config line store with version header.
@@ -564,8 +596,22 @@ pub fn parse_main_config(
         }
 
         // Check for named list directive.
-        if try_read_named_list(trimmed, &mut ctx.named_lists)? {
-            continue;
+        match try_read_named_list(trimmed, &mut ctx.named_lists) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(ConfigError::ParseError {
+                file: _,
+                line: _,
+                message,
+            }) => {
+                // Enrich with the current file/line context.
+                return Err(ConfigError::ParseError {
+                    file: state.current_filename.clone(),
+                    line: state.current_lineno,
+                    message,
+                });
+            }
+            Err(e) => return Err(e),
         }
 
         // Handle as a regular config option via handle_option().
@@ -852,6 +898,10 @@ pub fn parse_acl_section(
 
     let mut current_acl_name: Option<String> = None;
     let mut current_acl_body = String::new();
+    // Track config file and starting line for HDEBUG source references
+    let mut current_acl_file = String::new();
+    let mut current_acl_start_line: i32 = 0;
+    let mut body_started = false;
 
     loop {
         let line = match state.get_config_line() {
@@ -865,6 +915,8 @@ pub fn parse_acl_section(
                             name.clone(),
                             AclBlock {
                                 raw_definition: body,
+                                source_file: current_acl_file.clone(),
+                                start_line: current_acl_start_line,
                             },
                         );
                         tracing::debug!(acl_name = %name, "stored ACL definition");
@@ -888,6 +940,8 @@ pub fn parse_acl_section(
                         prev_name.clone(),
                         AclBlock {
                             raw_definition: body,
+                            source_file: current_acl_file.clone(),
+                            start_line: current_acl_start_line,
                         },
                     );
                     tracing::debug!(acl_name = %prev_name, "stored ACL definition");
@@ -899,7 +953,14 @@ pub fn parse_acl_section(
             let acl_name = trimmed[..trimmed.len() - 1].trim().to_string();
             tracing::debug!(acl_name = %acl_name, "found ACL definition header");
             current_acl_name = Some(acl_name);
+            body_started = false;
         } else if current_acl_name.is_some() {
+            // Capture the file and line number of the first body line.
+            if !body_started {
+                current_acl_file = state.current_filename.clone();
+                current_acl_start_line = state.current_lineno as i32;
+                body_started = true;
+            }
             // Append to the current ACL body.
             if !current_acl_body.is_empty() {
                 current_acl_body.push('\n');
@@ -1299,7 +1360,14 @@ fn try_read_named_list(line: &str, named_lists: &mut NamedLists) -> Result<bool,
         // Skip whitespace and expect '='.
         let after_name = after_name.trim_start();
         let value = if let Some(stripped) = after_name.strip_prefix('=') {
-            stripped.trim_start().to_string()
+            let raw = stripped.trim_start();
+            // If the value starts with `"`, dequote and check for trailing
+            // characters — matching C Exim's read_string() / extra_chars_error().
+            if raw.starts_with('"') {
+                read_string_value(raw, name)?
+            } else {
+                raw.to_string()
+            }
         } else {
             return Err(ConfigError::ParseError {
                 file: String::new(),
@@ -1346,6 +1414,64 @@ fn try_read_named_list(line: &str, named_lists: &mut NamedLists) -> Result<bool,
 // =============================================================================
 // Private helper functions
 // =============================================================================
+
+/// Dequote a quoted string value (`"..."`) and error if there are extra
+/// characters after the closing quote.  Mirrors C Exim's `read_string()`
+/// which calls `string_dequote()` and then `extra_chars_error()`.
+fn read_string_value(input: &str, name: &str) -> Result<String, ConfigError> {
+    debug_assert!(input.starts_with('"'));
+    let inner = &input[1..];
+    let mut result = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    loop {
+        match chars.next() {
+            None => {
+                return Err(ConfigError::ParseError {
+                    file: String::new(),
+                    line: 0,
+                    message: format!("missing quote at end of string value for {name}"),
+                });
+            }
+            Some('"') => break,
+            Some('\\') => match chars.next() {
+                Some('\\') => result.push('\\'),
+                Some('"') => result.push('"'),
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some('0') => result.push('\0'),
+                Some(c) => {
+                    result.push('\\');
+                    result.push(c);
+                }
+                None => {
+                    return Err(ConfigError::ParseError {
+                        file: String::new(),
+                        line: 0,
+                        message: format!("missing quote at end of string value for {name}"),
+                    });
+                }
+            },
+            Some(c) => result.push(c),
+        }
+    }
+    // Check for extra characters after the closing quote.
+    let remainder: String = chars.collect();
+    let trimmed = remainder.trim();
+    if !trimmed.is_empty() {
+        let comment = if trimmed.starts_with('#') {
+            " (# is comment only at line start)"
+        } else {
+            ""
+        };
+        return Err(ConfigError::ParseError {
+            file: String::new(),
+            line: 0,
+            message: format!("extra characters follow string value for {name}{comment}"),
+        });
+    }
+    Ok(result)
+}
 
 /// Resolves the configuration file path from a colon-separated candidate list.
 ///
@@ -1841,6 +1967,12 @@ fn apply_option_to_ctx(result: &HandleOptionResult, ctx: &mut ConfigContext) {
         // ── Boolean options ─────────────────────────────────────────
         OptionValue::Bool(v) => apply_bool_option(name, *v, ctx),
 
+        // ── Expandable boolean options (stored as expansion strings) ──
+        // These are handled at the driver level (stored in the driver's
+        // expand_<name> field), not as global config booleans.  At the
+        // global config level, treat them the same as `Bool(true)`.
+        OptionValue::ExpandBool(_) => apply_bool_option(name, true, ctx),
+
         // ── String options ──────────────────────────────────────────
         OptionValue::Str(v) => apply_string_option(name, v, ctx),
 
@@ -2115,11 +2247,12 @@ fn apply_bool_option(name: &str, value: bool, ctx: &mut ConfigContext) {
 ///
 /// The mapping mirrors `resolve_string_option()` in `validate.rs`.
 fn apply_string_option(name: &str, value: &str, ctx: &mut ConfigContext) {
-    // C Exim calls expand_string() on most string option values after reading
-    // them from the config file (readconf.c). Perform lightweight expansion
-    // here so that ${readfile{...}}, ${if ...}, etc. are resolved at parse time.
-    let expanded = expand_config_string(value);
-    let value = expanded.as_str();
+    // C Exim stores opt_stringptr values RAW without expansion at config
+    // parse time (readconf.c readconf_handle_option).  Expansion happens
+    // at runtime when the value is actually used.  We therefore do NOT
+    // call expand_config_string() here — the raw value is stored verbatim
+    // so that runtime expansion can evaluate ${if ...}, ${lookup ...},
+    // $variable references, etc.
 
     // Helper: set an Option<String> field. Empty strings become None
     // to match the C behavior where empty string pointers are treated

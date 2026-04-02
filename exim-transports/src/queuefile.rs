@@ -289,7 +289,7 @@ impl TransportDriver for QueuefileTransport {
             "queuefile transport: spool files copied successfully"
         );
 
-        Ok(TransportResult::Ok)
+        Ok(TransportResult::ok())
     }
 
     /// This is a local transport — no network I/O.

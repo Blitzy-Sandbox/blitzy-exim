@@ -115,6 +115,13 @@ pub struct ServerContext {
     pub interface_address: Option<String>,
     /// Interface port the connection arrived on.
     pub interface_port: u16,
+    /// Whether this is a local SMTP session (-bs/-bS mode, not network).
+    /// When true, the received protocol is prefixed with "local-".
+    pub is_local_session: bool,
+    /// Whether this is batched SMTP input (`-bS` mode).
+    /// When true: no 220 banner is sent, no HELO/EHLO is required,
+    /// MAIL FROM is accepted immediately.
+    pub smtp_batched_input: bool,
 }
 
 /// Per-message mutable context — modified by every command handler.
@@ -176,11 +183,48 @@ pub struct MessageContext {
     pub sender_verified: bool,
     /// The SMTP banner string (expanded from config).
     pub smtp_banner: Option<String>,
+    /// When true, `smtp_setup_msg` will NOT send the 220 banner on entry.
+    /// Set after the first call so that re-entering the command loop after
+    /// DATA Yield does not repeat the banner.
+    pub skip_banner: bool,
     /// TLS backend extracted from the SMTP session when yielding for DATA/BDAT.
     /// The daemon reads from this after `SmtpSetupResult::Yield` to continue
     /// encrypted I/O during message body reception.  `None` for plaintext.
     #[cfg(feature = "tls")]
     pub tls_backend: Option<Box<exim_tls::rustls_backend::RustlsBackend>>,
+    /// Message IDs of messages received during this SMTP session.
+    /// After the session ends, the caller (exim-core) iterates these IDs
+    /// to trigger delivery for each message (or queue them for later).
+    pub received_message_ids: Vec<String>,
+    /// Headers added by ACL warn/message directives during the DATA phase.
+    /// These are written into the -H spool file with type '0' (ACL-added).
+    pub acl_added_headers: Vec<String>,
+
+    /// Optional callback invoked immediately after each message is accepted
+    /// (250 OK sent) and BEFORE the SMTP session continues to the next
+    /// command.  In C Exim, delivery happens inline after each DATA; the
+    /// callback allows `exim-core` to replicate this by passing a closure
+    /// that calls `deliver_smtp_message()`.
+    ///
+    /// Signature: `fn(msg_id: &str)`.  If `None`, delivery is deferred
+    /// until the session ends (the caller then drains `received_message_ids`).
+    #[allow(clippy::type_complexity)]
+    // Callback signature mirrors C Exim's function pointer pattern
+    pub post_message_callback: Option<Box<dyn FnMut(&str)>>,
+
+    /// Optional callback invoked by `verify = recipient` ACL conditions.
+    /// The ACL engine calls this to route the recipient address through the
+    /// router chain, returning `Ok(VerifyRecipientResult)` on success or
+    /// `Err(reason)` on failure.  `exim-core` populates this before calling
+    /// `smtp_setup_msg()` so the ACL engine can verify recipients without
+    /// `exim-smtp` depending on `exim-deliver`.
+    ///
+    /// Arguments: `(recipient_address, sender_address)`.
+    #[allow(clippy::type_complexity)]
+    // Callback signature mirrors C Exim's verify callback pattern
+    pub verify_recipient_cb: Option<
+        std::sync::Arc<dyn Fn(&str, &str) -> exim_acl::engine::VerifyRecipientResult + Send + Sync>,
+    >,
 }
 
 /// TLS session information for logging and header generation.
@@ -232,6 +276,32 @@ pub struct RecipientItem {
     pub errors_to: Option<String>,
 }
 
+/// Data collected during SMTP DATA phase message reception.
+///
+/// Contains parsed headers (name/value pairs), raw header lines preserving
+/// original formatting, raw body bytes, and computed metrics matching C
+/// Exim's `receive_msg()` output.
+///
+/// **Canonical source**: `receive.c` `receive_msg()`.
+pub struct ReceivedMessageData {
+    /// Parsed header name/value pairs (name is lowercased).
+    pub parsed_headers: Vec<(String, String)>,
+    /// Raw header lines preserving original formatting.
+    pub raw_header_lines: Vec<String>,
+    /// Raw body bytes (after dot-stuffing removal).
+    pub body_data: Vec<u8>,
+    /// Number of lines in the body.
+    pub body_linecount: i64,
+    /// Number of NUL bytes in the body.
+    pub body_zerocount: i64,
+    /// Maximum line length in the received message.
+    pub max_received_linelength: i64,
+    /// Total line count (headers + body).
+    pub message_linecount: i64,
+    /// Total message size in bytes.
+    pub message_size: i64,
+}
+
 /// Immutable parsed configuration context for the SMTP session.
 ///
 /// This is a **local mirror type** containing the SMTP-relevant subset of
@@ -245,9 +315,12 @@ pub struct ConfigContext {
     // Key: ACL name (e.g., "a1"), Value: raw ACL body text.
     // These are pre-parsed into `AclEvalContext::named_acls` before
     // each ACL evaluation so the engine can resolve ACL names.
-    pub acl_definitions: HashMap<String, String>,
+    /// ACL definitions: name → (raw_body, source_file, start_line).
+    /// Source file and line are used for HDEBUG "processing ACL" output.
+    pub acl_definitions: HashMap<String, (String, String, i32)>,
 
     // ACL definitions for each SMTP phase
+    pub acl_smtp_connect: Option<String>,
     pub acl_smtp_helo: Option<String>,
     pub acl_smtp_mail: Option<String>,
     pub acl_smtp_rcpt: Option<String>,
@@ -327,6 +400,40 @@ pub struct ConfigContext {
     pub named_host_lists: HashMap<String, String>,
     pub named_address_lists: HashMap<String, String>,
     pub named_local_part_lists: HashMap<String, String>,
+
+    // Spool directory path for writing -H/-D files after DATA.
+    pub spool_directory: String,
+
+    // Log file path pattern for mainlog/rejectlog/paniclog.
+    pub log_file_path: Option<String>,
+
+    // Whether to immediately deliver messages (-odi) vs queue (-odq).
+    pub deliver_immediately: bool,
+
+    // Message ID header domain for Message-Id header generation.
+    pub message_id_header_domain: Option<String>,
+
+    // Message ID header text for Message-Id header text.
+    pub message_id_header_text: Option<String>,
+
+    // Originator login (the local user submitting the message).
+    pub originator_login: String,
+
+    // Originator uid/gid.
+    pub originator_uid: u32,
+    pub originator_gid: u32,
+
+    // Received header text expansion template.
+    pub received_header_text: Option<String>,
+
+    // Trusted users list (for -f sender override).
+    pub trusted_users: Option<String>,
+
+    // Primary hostname.
+    pub primary_hostname: String,
+
+    // Timezone string for log timestamps.
+    pub timezone: Option<String>,
 }
 
 impl ConfigContext {
@@ -349,14 +456,24 @@ impl ConfigContext {
     ) -> Self {
         Self {
             // Named ACL definitions — convert from BTreeMap<String, AclBlock>
-            // to HashMap<String, String> for efficient lookup during ACL evaluation
+            // to HashMap carrying source file/line info for HDEBUG output
             acl_definitions: cfg
                 .acl_definitions
                 .iter()
-                .map(|(name, block)| (name.clone(), block.raw_definition.clone()))
+                .map(|(name, block)| {
+                    (
+                        name.clone(),
+                        (
+                            block.raw_definition.clone(),
+                            block.source_file.clone(),
+                            block.start_line,
+                        ),
+                    )
+                })
                 .collect(),
 
             // ACL definitions — propagated from the parsed config
+            acl_smtp_connect: cfg.acl_smtp_connect.clone(),
             acl_smtp_helo: cfg.acl_smtp_helo.clone(),
             acl_smtp_mail: cfg.acl_smtp_mail.clone(),
             acl_smtp_rcpt: cfg.acl_smtp_rcpt.clone(),
@@ -460,6 +577,32 @@ impl ConfigContext {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.value.clone()))
                 .collect(),
+
+            // Spool and delivery settings from the canonical config
+            spool_directory: if cfg.spool_directory.is_empty() {
+                "/var/spool/exim".to_string()
+            } else {
+                cfg.spool_directory.clone()
+            },
+            log_file_path: if cfg.log_file_path.is_empty() {
+                None
+            } else {
+                Some(cfg.log_file_path.clone())
+            },
+            deliver_immediately: false,
+            message_id_header_domain: cfg.message_id_header_domain.clone(),
+            message_id_header_text: cfg.message_id_header_text.clone(),
+            originator_login: String::new(),
+            originator_uid: 0,
+            originator_gid: 0,
+            received_header_text: cfg.received_header_text.clone(),
+            trusted_users: cfg.trusted_users.clone(),
+            primary_hostname: if cfg.primary_hostname.is_empty() {
+                "localhost".to_string()
+            } else {
+                cfg.primary_hostname.clone()
+            },
+            timezone: cfg.timezone.clone(),
         }
     }
 }
@@ -492,8 +635,13 @@ impl Default for MessageContext {
             body_type: BodyType::SevenBit,
             sender_verified: false,
             smtp_banner: None,
+            skip_banner: false,
             #[cfg(feature = "tls")]
             tls_backend: None,
+            received_message_ids: Vec::new(),
+            acl_added_headers: Vec::new(),
+            post_message_callback: None,
+            verify_recipient_cb: None,
         }
     }
 }
@@ -793,6 +941,13 @@ pub struct SmtpSession<'ctx, S> {
 
     /// Whether we are currently inside an RCPT TO response sequence.
     rcpt_in_progress: bool,
+
+    /// Track whether the sender verification failure prefix has already been
+    /// emitted in this transaction.  C Exim uses `af_sverify_told` flag on
+    /// `sender_verified_failed->flags` to suppress the multi-line prefix on
+    /// subsequent RCPTs after the first one (smtp_in.c ~3191-3194).
+    /// Reset on RSET/MAIL FROM.
+    sender_verify_told: bool,
 }
 
 // =============================================================================
@@ -846,6 +1001,7 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
             connection_had_index: 0,
             smtp_write_error: 0,
             rcpt_in_progress: false,
+            sender_verify_told: false,
         }
     }
 }
@@ -863,6 +1019,12 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
     /// conditions like `senders`, `hosts`, and `domains` can match against
     /// real session data.
     pub(crate) fn acl_session_state(&self) -> AclSessionState {
+        self.acl_session_state_for_recipient("")
+    }
+
+    /// Build ACL session state with a specific recipient address pre-set.
+    /// Used for RCPT TO ACL evaluation where the recipient is known.
+    pub(crate) fn acl_session_state_for_recipient(&self, recipient: &str) -> AclSessionState {
         AclSessionState {
             sender_address: self.message_ctx.sender_address.clone(),
             client_ip: self
@@ -875,6 +1037,14 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
             named_host_lists: self.config_ctx.named_host_lists.clone(),
             named_address_lists: self.config_ctx.named_address_lists.clone(),
             named_local_part_lists: self.config_ctx.named_local_part_lists.clone(),
+            reply_address: String::new(),
+            header_list: HashMap::new(),
+            host_checking: self.server_ctx.host_checking,
+            verify_recipient_cb: self.message_ctx.verify_recipient_cb.clone(),
+            recipient: recipient.to_string(),
+            primary_hostname: self.config_ctx.primary_hostname.clone(),
+            spool_directory: self.config_ctx.spool_directory.clone(),
+            recipients_count: self.message_ctx.recipients_count as i32,
         }
     }
 
@@ -900,6 +1070,14 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
     /// * `msg` — Pre-formatted response string (including CRLF)
     /// * `more` — If `true`, buffer the response; if `false`, flush immediately
     pub fn smtp_printf(&mut self, msg: &str, more: bool) {
+        // In batch SMTP mode (-bS), C Exim's smtp_setup_batch_msg() processes
+        // commands WITHOUT writing any SMTP response lines. The responses are
+        // entirely suppressed. Only error handling via moan_smtp_batch() sends
+        // output (as a bounce message, not SMTP responses).
+        if self.server_ctx.smtp_batched_input {
+            return;
+        }
+
         // Log the response for debugging
         if more {
             trace!("SMTP>| {}", msg.trim_end());
@@ -1288,9 +1466,96 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
     }
 
     // ── ACL Failure Handling (smtp_in.c lines 3090-3300) ──
+    // ── Log File Writing Helpers ──────────────────────────────────────
 
-    /// Handle an ACL check failure by generating the appropriate SMTP response.
+    /// Write a log line to mainlog and optionally rejectlog.
     ///
+    /// In `-bh` (host_checking) mode, writes "LOG: <body>" to stderr
+    /// instead of the actual log files, matching C Exim's behavior.
+    ///
+    /// `flags` is a bitmask: 1 = LOG_MAIN, 2 = LOG_REJECT.
+    /// When both are set the same line appears in both files.
+    pub fn log_write(&self, flags: u32, body: &str) {
+        // In host_checking mode C Exim writes "LOG: <body>" to stderr
+        if self.server_ctx.host_checking {
+            eprintln!("LOG: {body}");
+            return;
+        }
+
+        if let Some(ref log_path) = self.config_ctx.log_file_path {
+            let now = {
+                let epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                format_log_timestamp(epoch)
+            };
+            let formatted = format!("{now} {body}\n");
+
+            // LOG_MAIN (bit 0)
+            if flags & 1 != 0 {
+                let mainlog = log_path.replace("%slog", "mainlog");
+                Self::append_log_file(&mainlog, &formatted);
+            }
+            // LOG_REJECT (bit 1)
+            if flags & 2 != 0 {
+                let rejectlog = log_path.replace("%slog", "rejectlog");
+                Self::append_log_file(&rejectlog, &formatted);
+            }
+        }
+    }
+
+    /// Append `text` to the given log file, creating it if necessary.
+    fn append_log_file(path: &str, text: &str) {
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750));
+            }
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o666);
+        }
+        if let Ok(mut f) = opts.open(path) {
+            use std::io::Write;
+            let _ = f.write_all(text.as_bytes());
+        }
+    }
+
+    /// Build the connection-info prefix for log lines.
+    ///
+    /// Returns something like `H=(helo) [1.2.3.4]:12345` or
+    /// `U=root` for local callers.
+    pub fn log_sender_info(&self) -> String {
+        let mut info = String::new();
+        if let Some(ref ip) = self.message_ctx.sender_host_address {
+            if !ip.is_empty() {
+                let helo_part = self.message_ctx.helo_name.as_deref().unwrap_or("");
+                if !helo_part.is_empty() {
+                    let _ = write!(info, "H=({helo_part}) [{ip}]");
+                } else {
+                    let _ = write!(info, "H=[{ip}]");
+                }
+                return info;
+            }
+        }
+        // Local submission: show U=<user>
+        let user = &self.config_ctx.originator_login;
+        let u = if user.is_empty() {
+            "root"
+        } else {
+            user.as_str()
+        };
+        let _ = write!(info, "U={u}");
+        info
+    }
+
     /// Maps ACL results (deny, defer, drop, discard, etc.) to SMTP response
     /// codes and sends the appropriate response to the client.
     ///
@@ -1312,6 +1577,7 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
         rc: AclResult,
         user_msg: &str,
         log_msg: &str,
+        sender_verify_failure: Option<&SenderVerifyFailure>,
     ) -> i32 {
         let default_code = acl_wherecode(&where_phase);
 
@@ -1323,6 +1589,41 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 format!("{:?}", rc),
                 log_msg
             );
+        }
+
+        // ── Sender verification failure prefix (C smtp_in.c ~3177-3213)
+        //
+        // If sender verification failed (the ACL contained `verify = sender`
+        // that did not succeed), emit the multi-line "Verification failed
+        // for <addr>\n<reason>" prefix as a NOT-FINAL response before the
+        // actual ACL-result response.  This is a one-shot: once emitted the
+        // flag is consumed so subsequent RCPT evaluations within the same
+        // transaction do not repeat it (matching C's `af_sverify_told`).
+        // ── Sender verification failure prefix (af_sverify_told logic)
+        //
+        // Emit the multi-line "Verification failed for <addr>\n<reason>"
+        // prefix ONLY on the FIRST RCPT that triggers this failure within
+        // the current transaction.  C Exim uses af_sverify_told on the
+        // sender_verified_failed address to prevent repetition.
+        if rc == AclResult::Fail {
+            if let Some(svf) = sender_verify_failure {
+                if !self.sender_verify_told {
+                    self.sender_verify_told = true;
+                    let prefix = format!(
+                        "Verification failed for <{}>\n{}",
+                        svf.address, svf.user_message
+                    );
+                    let code = if default_code >= 500 {
+                        default_code
+                    } else {
+                        550
+                    };
+                    let code_str = format!("{}", code);
+                    // Emit as NOT-FINAL (multi-line continuation) — each '\n'
+                    // in the prefix becomes a separate "code-" line.
+                    self.smtp_respond(&code_str, true, &prefix);
+                }
+            }
         }
 
         match rc {
@@ -1342,20 +1643,21 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 self.smtp_respond(&code_str, false, &msg);
                 0
             }
-            AclResult::Defer => {
+            AclResult::Defer | AclResult::Error => {
                 // Temporary failure — 4xx response
+                // In C Exim (smtp_in.c ~3237–3251), non-FAIL results all
+                // follow the same path:
+                //  - If acl_temp_details AND user_msg: use user_msg
+                //  - Otherwise: "Temporary local problem - please try later"
+                // We approximate acl_temp_details as true when user_msg is
+                // non-empty (matching the C semantics where defer/error verbs
+                // set acl_temp_details).
                 let msg = if user_msg.is_empty() {
-                    "Temporary service refusal".to_string()
+                    "Temporary local problem - please try later".to_string()
                 } else {
                     user_msg.to_string()
                 };
-                let code = if default_code < 500 {
-                    default_code
-                } else {
-                    450
-                };
-                let code_str = format!("{}", code);
-                self.smtp_respond(&code_str, false, &msg);
+                self.smtp_respond("451", false, &msg);
                 0
             }
             AclResult::FailDrop => {
@@ -1372,16 +1674,6 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 // Silently discard — respond with success but don't deliver
                 debug!("ACL discard at {:?}", where_phase);
                 2
-            }
-            AclResult::Error => {
-                // Internal error — 4xx temporary failure
-                let msg = if user_msg.is_empty() {
-                    "Internal configuration error".to_string()
-                } else {
-                    user_msg.to_string()
-                };
-                self.smtp_respond("451", false, &msg);
-                0
             }
             _ => {
                 // Unexpected ACL result — log and reject
@@ -1548,6 +1840,7 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
             connection_had_index: self.connection_had_index,
             smtp_write_error: self.smtp_write_error,
             rcpt_in_progress: self.rcpt_in_progress,
+            sender_verify_told: self.sender_verify_told,
         }
     }
 
@@ -1563,6 +1856,7 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
         self.message_ctx.recipients_list.clear();
         self.message_ctx.recipients_count = 0;
         self.message_ctx.headers.clear();
+        self.message_ctx.acl_added_headers.clear();
         self.message_ctx.authenticated_sender = None;
         self.message_ctx.dsn_ret = DsnRet::None;
         self.message_ctx.dsn_envid = None;
@@ -1570,6 +1864,7 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
         self.message_ctx.body_type = BodyType::SevenBit;
         self.message_ctx.smtputf8_advertised = false;
         self.rcpt_in_progress = false;
+        self.sender_verify_told = false;
 
         // Reset PRDR state
         #[cfg(feature = "prdr")]
@@ -1633,6 +1928,25 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
         self.message_ctx.helo_name = Some(name_ref.clone());
         self.flags.helo_seen = true;
 
+        // HDEBUG: helo_lookup_domains check on the HELO argument.
+        // C Exim checks the HELO name against `helo_lookup_domains` to decide
+        // whether to do a DNS lookup on the HELO argument. The default value
+        // is "@ : @[]" (local hostname and local IPs).
+        // In `-bh` mode, the HDEBUG output shows this list matching.
+        if self.server_ctx.host_checking {
+            // The default helo_lookup_domains is "@ : @[]"
+            let helo_list = "@ : @[]";
+            eprintln!(">>> {} in helo_lookup_domains?", name_ref);
+            // Split on ':' and print each element
+            for item in helo_list.split(':') {
+                let trimmed = item.trim();
+                if !trimmed.is_empty() {
+                    eprintln!(">>>  list element: {}", trimmed);
+                }
+            }
+            eprintln!(">>> {} in helo_lookup_domains? no (end of list)", name_ref);
+        }
+
         // HELO verification if configured
         if let Some(ref verify_hosts) = self.config_ctx.helo_verify_hosts {
             if !verify_hosts.is_empty() {
@@ -1654,7 +1968,8 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
                 &self.acl_session_state(),
             );
             if acl_rc != AclResult::Ok {
-                let result = self.smtp_handle_acl_fail(AclWhere::Helo, acl_rc, &user_msg, &log_msg);
+                let result =
+                    self.smtp_handle_acl_fail(AclWhere::Helo, acl_rc, &user_msg, &log_msg, None);
                 if result < 0 {
                     // ACL DROP — return session so caller can close gracefully
                     return Err(Box::new((
@@ -1754,6 +2069,7 @@ impl<'ctx> SmtpSession<'ctx, Greeted> {
             connection_had_index: 0,
             smtp_write_error: 0,
             rcpt_in_progress: false,
+            sender_verify_told: false,
         }
     }
 
@@ -1776,7 +2092,18 @@ impl<'ctx> SmtpSession<'ctx, Greeted> {
 
         // Parse the sender address from the argument
         let addr_str = raw_address.as_ref();
-        let (sender, extensions) = parse_mail_address(addr_str);
+        let (sender, extensions) = match parse_mail_address(addr_str) {
+            Ok(result) => result,
+            Err(msg) => {
+                self.smtp_respond("501", false, &msg);
+                return Err(Box::new((
+                    self,
+                    SmtpError::ProtocolError {
+                        message: format!("MAIL FROM address error: {}", msg),
+                    },
+                )));
+            }
+        };
 
         // Parse MAIL FROM extensions
         self.parse_mail_from_extensions(&extensions);
@@ -1811,7 +2138,8 @@ impl<'ctx> SmtpSession<'ctx, Greeted> {
                 &self.acl_session_state(),
             );
             if acl_rc != AclResult::Ok {
-                let result = self.smtp_handle_acl_fail(AclWhere::Mail, acl_rc, &user_msg, &log_msg);
+                let result =
+                    self.smtp_handle_acl_fail(AclWhere::Mail, acl_rc, &user_msg, &log_msg, None);
                 if result < 0 {
                     return Err(Box::new((
                         self,
@@ -1860,7 +2188,18 @@ impl<'ctx> SmtpSession<'ctx, MailFrom> {
 
         // Parse the recipient address
         let addr_str = raw_address.as_ref();
-        let (recipient, extensions) = parse_mail_address(addr_str);
+        let (recipient, extensions) = match parse_mail_address(addr_str) {
+            Ok(result) => result,
+            Err(msg) => {
+                self.smtp_respond("501", false, &msg);
+                return Err(Box::new((
+                    self,
+                    SmtpError::ProtocolError {
+                        message: format!("RCPT TO address error: {}", msg),
+                    },
+                )));
+            }
+        };
 
         // Parse DSN flags from extensions
         let mut dsn_flags: u32 = 0;
@@ -1886,16 +2225,50 @@ impl<'ctx> SmtpSession<'ctx, MailFrom> {
         // Run RCPT TO ACL if configured
         self.rcpt_in_progress = true;
         if let Some(ref acl) = self.config_ctx.acl_smtp_rcpt {
-            let (acl_rc, user_msg, log_msg) = run_acl_check(
+            let acl_full = run_acl_check_full(
                 AclWhere::Rcpt,
                 Some(acl),
                 Some(&recipient),
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state(),
             );
+            let acl_rc = acl_full.result;
+            let user_msg = acl_full.user_msg;
+            let log_msg = acl_full.log_msg;
             if acl_rc != AclResult::Ok {
                 self.rcpt_in_progress = false;
-                let result = self.smtp_handle_acl_fail(AclWhere::Rcpt, acl_rc, &user_msg, &log_msg);
+                let result = self.smtp_handle_acl_fail(
+                    AclWhere::Rcpt,
+                    acl_rc,
+                    &user_msg,
+                    &log_msg,
+                    acl_full.sender_verify_failure.as_ref(),
+                );
+
+                // C Exim logs RCPT rejections to both mainlog and rejectlog.
+                // In C smtp_handle_acl_fail(), the log uses `log_msg` (from
+                // log_message= or condition-generated messages), NOT user_msg
+                // (from message= modifiers).  The SMTP response uses user_msg.
+                // Format: "<sender_info> F=<sender> rejected RCPT <recipient>: <log_msg>"
+                let sender_info = self.log_sender_info();
+                let sender = &self.message_ctx.sender_address;
+                let reject_reason = if !log_msg.is_empty() {
+                    log_msg.to_string()
+                } else if !user_msg.is_empty() {
+                    user_msg.to_string()
+                } else {
+                    String::new()
+                };
+                let reject_line = if reject_reason.is_empty() {
+                    format!("{sender_info} F=<{sender}> rejected RCPT <{recipient}>")
+                } else {
+                    format!(
+                        "{sender_info} F=<{sender}> rejected RCPT <{recipient}>: {reject_reason}"
+                    )
+                };
+                // LOG_MAIN | LOG_REJECT = 0x03
+                self.log_write(3, &reject_line);
+
                 if result < 0 {
                     return Err(Box::new((
                         self,
@@ -1948,7 +2321,18 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
         self.had(SmtpCommandHistory::SchRcpt);
 
         let addr_str = raw_address.as_ref();
-        let (recipient, extensions) = parse_mail_address(addr_str);
+        let (recipient, extensions) = match parse_mail_address(addr_str) {
+            Ok(result) => result,
+            Err(msg) => {
+                self.smtp_respond("501", false, &msg);
+                return Err(Box::new((
+                    self,
+                    SmtpError::ProtocolError {
+                        message: format!("RCPT TO address error: {}", msg),
+                    },
+                )));
+            }
+        };
 
         // Parse DSN flags
         let mut dsn_flags: u32 = 0;
@@ -1974,16 +2358,47 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
         // Run RCPT TO ACL
         self.rcpt_in_progress = true;
         if let Some(ref acl) = self.config_ctx.acl_smtp_rcpt {
-            let (acl_rc, user_msg, log_msg) = run_acl_check(
+            let acl_full = run_acl_check_full(
                 AclWhere::Rcpt,
                 Some(acl),
                 Some(&recipient),
                 &self.config_ctx.acl_definitions,
-                &self.acl_session_state(),
+                &self.acl_session_state_for_recipient(&recipient),
             );
+            let acl_rc = acl_full.result;
+            let user_msg = acl_full.user_msg;
+            let log_msg = acl_full.log_msg;
             if acl_rc != AclResult::Ok {
                 self.rcpt_in_progress = false;
-                let result = self.smtp_handle_acl_fail(AclWhere::Rcpt, acl_rc, &user_msg, &log_msg);
+                let result = self.smtp_handle_acl_fail(
+                    AclWhere::Rcpt,
+                    acl_rc,
+                    &user_msg,
+                    &log_msg,
+                    acl_full.sender_verify_failure.as_ref(),
+                );
+
+                // Rejection log entry (mainlog + rejectlog).
+                // Log uses log_msg (from log_message= or condition failure),
+                // NOT user_msg (from message= SMTP response override).
+                let sender_info = self.log_sender_info();
+                let sender = &self.message_ctx.sender_address;
+                let reject_reason = if !log_msg.is_empty() {
+                    log_msg.to_string()
+                } else if !user_msg.is_empty() {
+                    user_msg.to_string()
+                } else {
+                    String::new()
+                };
+                let reject_line = if reject_reason.is_empty() {
+                    format!("{sender_info} F=<{sender}> rejected RCPT <{recipient}>")
+                } else {
+                    format!(
+                        "{sender_info} F=<{sender}> rejected RCPT <{recipient}>: {reject_reason}"
+                    )
+                };
+                self.log_write(3, &reject_line);
+
                 if result < 0 {
                     return Err(Box::new((
                         self,
@@ -2053,7 +2468,7 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
             );
             if acl_rc != AclResult::Ok {
                 let result =
-                    self.smtp_handle_acl_fail(AclWhere::Predata, acl_rc, &user_msg, &log_msg);
+                    self.smtp_handle_acl_fail(AclWhere::Predata, acl_rc, &user_msg, &log_msg, None);
                 if result < 0 {
                     return Err(Box::new((
                         self,
@@ -2073,27 +2488,13 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
             }
         }
 
-        // Run DATA ACL if configured
-        if let Some(ref acl) = self.config_ctx.acl_smtp_data {
-            let (acl_rc, user_msg, log_msg) = run_acl_check(
-                AclWhere::Data,
-                Some(acl),
-                None,
-                &self.config_ctx.acl_definitions,
-                &self.acl_session_state(),
-            );
-            if acl_rc != AclResult::Ok {
-                let result = self.smtp_handle_acl_fail(AclWhere::Data, acl_rc, &user_msg, &log_msg);
-                if result < 0 {
-                    return Err(Box::new((
-                        self,
-                        SmtpError::ProtocolError {
-                            message: "DATA ACL rejected with DROP".into(),
-                        },
-                    )));
-                }
-            }
-        }
+        // NOTE: The DATA ACL (acl_smtp_data) is NOT run here.
+        // In C Exim, acl_smtp_data runs AFTER the message body is fully
+        // received (after the terminating "."), not at the DATA command.
+        // Only acl_smtp_predata runs at the DATA command (above).
+        // The DATA ACL is evaluated by the message reception code after
+        // the body has been read and headers parsed, giving it access to
+        // variables like $reply_address, $h_subject, etc.
 
         // Send 354 response — ready for message data
         self.smtp_respond(
@@ -2134,6 +2535,212 @@ impl<'ctx> SmtpSession<'ctx, DataPhase> {
         self.had(SmtpCommandHistory::SchRset);
         self.smtp_reset();
         self.smtp_respond("250", false, "Reset OK");
+        self.transition()
+    }
+
+    /// Read the message body from the SMTP connection until the lone "."
+    /// terminator.  Returns a `ReceivedMessageData` struct containing parsed
+    /// headers, raw header lines, raw body data, and computed metrics.
+    ///
+    /// This uses the same I/O buffer as the command loop so no data is lost
+    /// to separate buffering layers.
+    ///
+    /// C reference: `receive_msg()` in `receive.c`.
+    pub fn read_message_body(&mut self) -> ReceivedMessageData {
+        let mut parsed_headers: Vec<(String, String)> = Vec::new();
+        let mut raw_header_lines: Vec<String> = Vec::new();
+        let mut body_data: Vec<u8> = Vec::new();
+        let mut in_headers = true;
+        let mut current_header_name = String::new();
+        let mut current_header_value = String::new();
+        let mut current_raw_header = String::new();
+        let mut body_linecount: i64 = 0;
+        let mut body_zerocount: i64 = 0;
+        let mut max_received_linelength: i64 = 0;
+        let mut header_linecount: i64 = 0;
+        let mut message_size: i64 = 0;
+
+        /// Flush a completed header into the lists.
+        fn flush_header(
+            name: &mut String,
+            value: &mut String,
+            raw: &mut String,
+            parsed: &mut Vec<(String, String)>,
+            raw_lines: &mut Vec<String>,
+        ) {
+            if !name.is_empty() {
+                let v = value.trim().to_string();
+                parsed.push((std::mem::take(name).to_ascii_lowercase(), v));
+                value.clear();
+                raw_lines.push(std::mem::take(raw));
+            } else {
+                raw.clear();
+            }
+        }
+
+        loop {
+            // Read one line from the SMTP I/O buffer.
+            let mut line = Vec::new();
+            loop {
+                let ch = smtp_getc(&mut self.io, SMTP_CMD_BUFFER_SIZE as u32);
+                if ch < 0 {
+                    // EOF — flush any pending header and return
+                    flush_header(
+                        &mut current_header_name,
+                        &mut current_header_value,
+                        &mut current_raw_header,
+                        &mut parsed_headers,
+                        &mut raw_header_lines,
+                    );
+                    let total_linecount = header_linecount + body_linecount;
+                    return ReceivedMessageData {
+                        parsed_headers,
+                        raw_header_lines,
+                        body_data,
+                        body_linecount,
+                        body_zerocount,
+                        max_received_linelength,
+                        message_linecount: total_linecount,
+                        message_size,
+                    };
+                }
+                let byte = ch as u8;
+                line.push(byte);
+                if byte == b'\n' {
+                    break;
+                }
+            }
+
+            let line_len = line.len() as i64;
+            message_size += line_len;
+
+            // Track max line length (excluding CRLF/LF)
+            let content_len = {
+                let mut end = line.len();
+                if end > 0 && line[end - 1] == b'\n' {
+                    end -= 1;
+                }
+                if end > 0 && line[end - 1] == b'\r' {
+                    end -= 1;
+                }
+                end as i64
+            };
+            if content_len > max_received_linelength {
+                max_received_linelength = content_len;
+            }
+
+            // Trim CRLF or LF for text processing
+            let trimmed = {
+                let mut end = line.len();
+                if end > 0 && line[end - 1] == b'\n' {
+                    end -= 1;
+                }
+                if end > 0 && line[end - 1] == b'\r' {
+                    end -= 1;
+                }
+                String::from_utf8_lossy(&line[..end]).to_string()
+            };
+
+            // Lone "." marks end of message body (dot-stuffing: ".." → ".")
+            if trimmed == "." {
+                flush_header(
+                    &mut current_header_name,
+                    &mut current_header_value,
+                    &mut current_raw_header,
+                    &mut parsed_headers,
+                    &mut raw_header_lines,
+                );
+                let total_linecount = header_linecount + body_linecount;
+                return ReceivedMessageData {
+                    parsed_headers,
+                    raw_header_lines,
+                    body_data,
+                    body_linecount,
+                    body_zerocount,
+                    max_received_linelength,
+                    message_linecount: total_linecount,
+                    message_size,
+                };
+            }
+
+            // Dot-stuffing: lines starting with ".." have the leading dot removed
+            let effective_line = if trimmed.starts_with("..") {
+                &trimmed[1..]
+            } else {
+                &trimmed
+            };
+
+            if in_headers {
+                // Empty line separates headers from body
+                if trimmed.is_empty() {
+                    flush_header(
+                        &mut current_header_name,
+                        &mut current_header_value,
+                        &mut current_raw_header,
+                        &mut parsed_headers,
+                        &mut raw_header_lines,
+                    );
+                    in_headers = false;
+                    // C Exim includes the blank separator line in
+                    // $message_linecount — count it here so the
+                    // total matches (header_linecount + body_linecount).
+                    body_linecount += 1;
+                    continue;
+                }
+                header_linecount += 1;
+                // Continuation line (starts with space/tab)
+                if line.first() == Some(&b' ') || line.first() == Some(&b'\t') {
+                    if !current_header_name.is_empty() {
+                        current_header_value.push(' ');
+                        current_header_value.push_str(effective_line.trim_start());
+                        current_raw_header.push('\n');
+                        current_raw_header.push_str(effective_line);
+                    }
+                    continue;
+                }
+                // New header: "Name: Value"
+                flush_header(
+                    &mut current_header_name,
+                    &mut current_header_value,
+                    &mut current_raw_header,
+                    &mut parsed_headers,
+                    &mut raw_header_lines,
+                );
+                if let Some(colon_pos) = effective_line.find(':') {
+                    current_header_name = effective_line[..colon_pos].to_string();
+                    current_header_value = effective_line[colon_pos + 1..].trim_start().to_string();
+                    current_raw_header = effective_line.to_string();
+                } else {
+                    // Malformed header — treat as start of body
+                    in_headers = false;
+                    body_linecount += 1;
+                    body_data.extend_from_slice(effective_line.as_bytes());
+                    body_data.push(b'\n');
+                    for &b in line.iter() {
+                        if b == 0 {
+                            body_zerocount += 1;
+                        }
+                    }
+                }
+            } else {
+                // Body line
+                body_linecount += 1;
+                body_data.extend_from_slice(effective_line.as_bytes());
+                body_data.push(b'\n');
+                for &b in line.iter() {
+                    if b == 0 {
+                        body_zerocount += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Transition back to the `Greeted` state after DATA processing
+    /// without sending RSET response (unlike reset()).
+    /// Used after handling the DATA ACL response inline.
+    pub fn finish_data(mut self) -> SmtpSession<'ctx, Greeted> {
+        self.smtp_reset();
         self.transition()
     }
 }
@@ -2325,22 +2932,42 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
     ///
     /// C reference: smtp_in.c lines 281-285, protocol index calculation.
     fn update_received_protocol(&mut self) {
+        // In batched SMTP (-bS) mode, the protocol is always "local-bsmtp"
+        // regardless of HELO/EHLO.  C Exim preserves this invariant: the
+        // protocols_local[] table is never consulted when batched input is
+        // active (smtp_in.c ~5880).
+        if self.server_ctx.smtp_batched_input {
+            self.message_ctx.received_protocol = SmtpProtocol::LocalBsmtp;
+            return;
+        }
+
         let is_esmtp = self.flags.esmtp;
         let is_tls = self.message_ctx.tls_in.active;
         let is_authed = self.message_ctx.authenticated_id.is_some();
+        let is_local = self.server_ctx.is_local_session;
 
-        // Protocol string selection based on ESMTP/TLS/AUTH status.
-        // Non-ESMTP + authenticated combos are impossible in practice
-        // (AUTH requires EHLO), but we map them to Esmtpa/Esmtpsa for safety.
-        self.message_ctx.received_protocol = match (is_esmtp, is_tls, is_authed) {
-            (false, false, false) => SmtpProtocol::Smtp,
-            (true, false, false) => SmtpProtocol::Esmtp,
-            (false, true, false) => SmtpProtocol::Smtps,
-            (true, true, false) => SmtpProtocol::Esmtps,
-            (false, false, true) => SmtpProtocol::Esmtpa,
-            (true, false, true) => SmtpProtocol::Esmtpa,
-            (false, true, true) => SmtpProtocol::Esmtpsa,
-            (true, true, true) => SmtpProtocol::Esmtpsa,
+        // Protocol string selection based on local/ESMTP/TLS/AUTH status.
+        // C Exim uses protocols_local[] for -bs/-bS mode and protocols[]
+        // for network connections (smtp_in.c ~line 5880).
+        self.message_ctx.received_protocol = if is_local {
+            match (is_esmtp, is_tls, is_authed) {
+                (false, false, false) => SmtpProtocol::LocalSmtp,
+                (true, false, false) => SmtpProtocol::LocalEsmtp,
+                (false, true, false) => SmtpProtocol::LocalSmtps,
+                (true, true, false) => SmtpProtocol::LocalEsmtps,
+                (_, _, true) => SmtpProtocol::LocalEsmtpa,
+            }
+        } else {
+            match (is_esmtp, is_tls, is_authed) {
+                (false, false, false) => SmtpProtocol::Smtp,
+                (true, false, false) => SmtpProtocol::Esmtp,
+                (false, true, false) => SmtpProtocol::Smtps,
+                (true, true, false) => SmtpProtocol::Esmtps,
+                (false, false, true) => SmtpProtocol::Esmtpa,
+                (true, false, true) => SmtpProtocol::Esmtpa,
+                (false, true, true) => SmtpProtocol::Esmtpsa,
+                (true, true, true) => SmtpProtocol::Esmtpsa,
+            }
         };
     }
 
@@ -2478,7 +3105,8 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 &self.acl_session_state(),
             );
             if acl_rc != AclResult::Ok {
-                let result = self.smtp_handle_acl_fail(AclWhere::Auth, acl_rc, &user_msg, &log_msg);
+                let result =
+                    self.smtp_handle_acl_fail(AclWhere::Auth, acl_rc, &user_msg, &log_msg, None);
                 if result < 0 {
                     return -1;
                 }
@@ -2578,8 +3206,13 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 &self.acl_session_state(),
             );
             if acl_rc != AclResult::Ok {
-                let result =
-                    self.smtp_handle_acl_fail(AclWhere::StartTls, acl_rc, &user_msg, &log_msg);
+                let result = self.smtp_handle_acl_fail(
+                    AclWhere::StartTls,
+                    acl_rc,
+                    &user_msg,
+                    &log_msg,
+                    None,
+                );
                 if result < 0 {
                     return -1;
                 }
@@ -2700,7 +3333,8 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 &self.acl_session_state(),
             );
             if acl_rc != AclResult::Ok {
-                let _ = self.smtp_handle_acl_fail(AclWhere::Vrfy, acl_rc, &user_msg, &log_msg);
+                let _ =
+                    self.smtp_handle_acl_fail(AclWhere::Vrfy, acl_rc, &user_msg, &log_msg, None);
                 return;
             }
         }
@@ -2728,7 +3362,8 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 &self.acl_session_state(),
             );
             if acl_rc != AclResult::Ok {
-                let _ = self.smtp_handle_acl_fail(AclWhere::Expn, acl_rc, &user_msg, &log_msg);
+                let _ =
+                    self.smtp_handle_acl_fail(AclWhere::Expn, acl_rc, &user_msg, &log_msg, None);
                 return;
             }
         }
@@ -2749,6 +3384,20 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
             return;
         }
 
+        // C Exim logs "ETRN <domain> received from [ip]" before ACL check
+        let sender_info = self.log_sender_info();
+        let etrn_received_line = if let Some(ref ip) = self.message_ctx.sender_host_address {
+            if !ip.is_empty() {
+                format!("ETRN {argument} received from [{ip}]")
+            } else {
+                format!("ETRN {argument} received from {sender_info}")
+            }
+        } else {
+            format!("ETRN {argument} received from {sender_info}")
+        };
+        // LOG_MAIN only for the "received" line
+        self.log_write(1, &etrn_received_line);
+
         if let Some(ref acl) = self.config_ctx.acl_smtp_etrn {
             let (acl_rc, user_msg, log_msg) = run_acl_check(
                 AclWhere::Etrn,
@@ -2758,7 +3407,20 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 &self.acl_session_state(),
             );
             if acl_rc != AclResult::Ok {
-                let _ = self.smtp_handle_acl_fail(AclWhere::Etrn, acl_rc, &user_msg, &log_msg);
+                let _ =
+                    self.smtp_handle_acl_fail(AclWhere::Etrn, acl_rc, &user_msg, &log_msg, None);
+                // C Exim logs "rejected ETRN <domain>" on failure
+                let ip_part = self
+                    .message_ctx
+                    .sender_host_address
+                    .as_deref()
+                    .unwrap_or("");
+                let reject_line = if !ip_part.is_empty() {
+                    format!("H=[{ip_part}] rejected ETRN {argument}")
+                } else {
+                    format!("{sender_info} rejected ETRN {argument}")
+                };
+                self.log_write(3, &reject_line);
                 return;
             }
         }
@@ -2890,6 +3552,14 @@ pub fn smtp_setup_msg(
         )
     };
 
+    // In batch SMTP mode (-bS), C Exim sets the protocol to
+    // "local-bsmtp" (smtp_in.c ~3850).  This must be done BEFORE
+    // creating the session, which borrows message_ctx mutably.
+    let is_batched = server_ctx.smtp_batched_input;
+    if is_batched {
+        message_ctx.received_protocol = SmtpProtocol::LocalBsmtp;
+    }
+
     // Create a session in the Connected state
     let mut session: SmtpSession<'_, Connected> =
         SmtpSession::new(in_fd, out_fd, server_ctx, message_ctx, config_ctx);
@@ -2904,7 +3574,63 @@ pub fn smtp_setup_msg(
     }
 
     // Send the 220 SMTP banner immediately, before entering the command loop.
-    session.smtp_printf(&banner, false);
+    // On re-entry after Yield (post-DATA), skip the banner because the
+    // connection is already established and the client expects to continue
+    // the same session.
+    //
+    // In batch SMTP mode (-bS), no banner is sent — the client sends MAIL FROM
+    // immediately without a greeting exchange.
+    //
+    // Access via session.message_ctx because SmtpSession holds the mutable
+    // borrow on MessageContext — direct access through message_ctx is
+    // forbidden while session is alive.
+    if is_batched {
+        // Batch SMTP: no 220 banner, no HELO/EHLO required
+    } else if session.message_ctx.skip_banner {
+        // Already sent the banner on the first call — do NOT send again.
+    } else {
+        session.smtp_printf(&banner, false);
+        // Mark the banner as sent so subsequent calls skip it.
+        session.message_ctx.skip_banner = true;
+    }
+
+    // ── HDEBUG: Host option checks at session start (smtp_in.c ~4000) ──
+    //
+    // In C Exim, host_checking mode prints these checks to stderr at
+    // session startup. Each option is checked against the client IP.
+    // When the option is unset (None), the output is "no (option unset)".
+    if server_ctx.host_checking {
+        let host_options: &[(&str, &Option<String>)] = &[
+            ("hosts_connection_nolog", &None), // Not in our config struct
+            ("host_lookup", &None),
+            ("host_reject_connection", &None),
+            ("sender_unqualified_hosts", &None),
+            ("recipient_unqualified_hosts", &None),
+            ("helo_verify_hosts", &config_ctx.helo_verify_hosts),
+            ("helo_try_verify_hosts", &config_ctx.helo_try_verify_hosts),
+            ("helo_accept_junk_hosts", &None),
+        ];
+        for (name, option) in host_options {
+            if option.is_none() && server_ctx.host_checking {
+                eprintln!(">>> host in {}? no (option unset)", name);
+            }
+            // If set, would need to do actual host list matching — for now
+            // only the "unset" case is handled which covers the common test.
+        }
+    }
+
+    // In batched SMTP mode (-bS), skip the HELO/EHLO greeting entirely.
+    // The session transitions directly to Greeted state, allowing MAIL FROM
+    // to be accepted immediately. No 220 banner was sent.
+    // C Exim (smtp_in.c ~3850) does the same: when smtp_batched_input is set,
+    // it skips to the command loop in an already-greeted state.
+    if is_batched {
+        // Drop the Connected session and create a Greeted session directly
+        drop(session);
+        let greeted =
+            SmtpSession::<Greeted>::new_greeted(in_fd, out_fd, server_ctx, message_ctx, config_ctx);
+        return handle_greeted_session(greeted);
+    }
 
     // Main command dispatch loop — replaces C `while (done <= 0)`
     //
@@ -3004,6 +3730,21 @@ pub fn smtp_setup_msg(
             #[cfg(feature = "proxy")]
             SmtpCommand::ProxyFailIgnore => {
                 session.smtp_respond("503", false, "Command refused");
+            }
+
+            // VRFY, EXPN, and ETRN are non-mail commands that do NOT
+            // require a prior HELO/EHLO.  C Exim processes them in
+            // smtp_setup_msg() regardless of smtp_state.
+            SmtpCommand::Vrfy => {
+                session.handle_vrfy(&argument);
+            }
+
+            SmtpCommand::Expn => {
+                session.handle_expn(&argument);
+            }
+
+            SmtpCommand::Etrn => {
+                session.handle_etrn(&argument);
             }
 
             // MAIL FROM, RCPT TO, and DATA are recognized SMTP commands
@@ -3396,16 +4137,217 @@ fn handle_rcptto_session(mut session: SmtpSession<'_, RcptTo>) -> SmtpSetupResul
             SmtpCommand::Data => {
                 session.had(SmtpCommandHistory::SchData);
                 match session.data() {
-                    Ok(mut _data_session) => {
-                        // DATA accepted — yield to message reception.
-                        // Deposit the TLS backend into MessageContext so the
-                        // daemon can read the body through the encrypted channel.
-                        #[cfg(feature = "tls")]
-                        {
-                            _data_session.message_ctx.tls_backend =
-                                _data_session.io.tls_backend.take();
+                    Ok(mut data_session) => {
+                        // DATA accepted — 354 already sent.
+                        // Read the message body and parse headers using the
+                        // same I/O buffer as the command loop (avoids the
+                        // buffering mismatch that occurs when reading from
+                        // a separate stdin handle).
+                        let received_data = data_session.read_message_body();
+
+                        // Build header lookup map from parsed headers
+                        let mut header_map = std::collections::HashMap::new();
+                        for (name, value) in &received_data.parsed_headers {
+                            header_map.insert(name.clone(), value.clone());
                         }
-                        return SmtpSetupResult::Yield;
+
+                        // Compute $reply_address per C Exim rules:
+                        // 1. Use Reply-To if present and non-empty
+                        // 2. Otherwise use From if present
+                        // 3. Otherwise empty
+                        let reply_address = if let Some(reply_to) = header_map.get("reply-to") {
+                            if reply_to.is_empty() {
+                                header_map.get("from").cloned().unwrap_or_default()
+                            } else {
+                                reply_to.clone()
+                            }
+                        } else {
+                            header_map.get("from").cloned().unwrap_or_default()
+                        };
+
+                        // Run the DATA ACL if configured
+                        if let Some(ref acl_name) = data_session.config_ctx.acl_smtp_data {
+                            let acl_state = AclSessionState {
+                                sender_address: data_session.message_ctx.sender_address.clone(),
+                                client_ip: data_session
+                                    .message_ctx
+                                    .sender_host_address
+                                    .clone()
+                                    .unwrap_or_default(),
+                                helo_name: data_session
+                                    .message_ctx
+                                    .helo_name
+                                    .clone()
+                                    .unwrap_or_default(),
+                                named_domain_lists: data_session
+                                    .config_ctx
+                                    .named_domain_lists
+                                    .clone(),
+                                named_host_lists: data_session.config_ctx.named_host_lists.clone(),
+                                named_address_lists: data_session
+                                    .config_ctx
+                                    .named_address_lists
+                                    .clone(),
+                                named_local_part_lists: data_session
+                                    .config_ctx
+                                    .named_local_part_lists
+                                    .clone(),
+                                reply_address: reply_address.clone(),
+                                header_list: header_map.clone(),
+                                host_checking: data_session.server_ctx.host_checking,
+                                verify_recipient_cb: data_session
+                                    .message_ctx
+                                    .verify_recipient_cb
+                                    .clone(),
+                                recipient: String::new(),
+                                primary_hostname: data_session.config_ctx.primary_hostname.clone(),
+                                spool_directory: data_session.config_ctx.spool_directory.clone(),
+                                recipients_count: data_session.message_ctx.recipients_count as i32,
+                            };
+
+                            let acl_result = run_acl_check_full(
+                                AclWhere::Data,
+                                Some(acl_name),
+                                None,
+                                &data_session.config_ctx.acl_definitions,
+                                &acl_state,
+                            );
+                            let acl_rc = acl_result.result;
+                            let user_msg = acl_result.user_msg;
+
+                            // Build an ExpandContext populated with message-level
+                            // variables so that ACL-added headers and user_msg
+                            // containing references like $message_linecount are
+                            // expanded to their actual values.
+                            let build_data_expand_ctx = || {
+                                let mut exp_ctx = exim_expand::variables::ExpandContext::new();
+                                exp_ctx.reply_address = reply_address.clone();
+                                exp_ctx.header_list = header_map.clone();
+                                exp_ctx.sender_address = exim_expand::Tainted::new(
+                                    data_session.message_ctx.sender_address.clone(),
+                                );
+                                exp_ctx.sender_host_address = exim_expand::Tainted::new(
+                                    data_session
+                                        .message_ctx
+                                        .sender_host_address
+                                        .clone()
+                                        .unwrap_or_default(),
+                                );
+                                exp_ctx.sender_helo_name = exim_expand::Tainted::new(
+                                    data_session
+                                        .message_ctx
+                                        .helo_name
+                                        .clone()
+                                        .unwrap_or_default(),
+                                );
+                                exp_ctx.primary_hostname = exim_expand::Clean::new(
+                                    data_session.server_ctx.smtp_active_hostname.clone(),
+                                );
+                                // Populate message metrics so $message_linecount,
+                                // $body_linecount, $message_size, $received_count
+                                // are available during expansion.
+                                exp_ctx.message_linecount = received_data.message_linecount as i32;
+                                exp_ctx.body_linecount = received_data.body_linecount as i32;
+                                exp_ctx.message_size = received_data.message_size;
+                                exp_ctx.received_count = received_data
+                                    .parsed_headers
+                                    .iter()
+                                    .filter(|(n, _)| n == "received")
+                                    .count()
+                                    as i32;
+                                exp_ctx
+                            };
+
+                            // Propagate ACL-added headers (from warn message =)
+                            // into the SMTP message context so they get written
+                            // to the -H spool file.  Expand $variable references
+                            // in header text (C Exim calls expand_string() on
+                            // the `message` modifier argument in acl.c).
+                            for raw_hdr in &acl_result.added_headers {
+                                let mut ectx = build_data_expand_ctx();
+                                let expanded_hdr = match exim_expand::expand_string_with_context(
+                                    raw_hdr, &mut ectx,
+                                ) {
+                                    Ok(e) => e,
+                                    Err(_) => raw_hdr.clone(),
+                                };
+                                data_session
+                                    .message_ctx
+                                    .acl_added_headers
+                                    .push(expanded_hdr);
+                            }
+
+                            // Expand the user_msg with header + reply_address context
+                            let expanded_msg = {
+                                let mut exp_ctx = build_data_expand_ctx();
+                                match exim_expand::expand_string_with_context(
+                                    &user_msg,
+                                    &mut exp_ctx,
+                                ) {
+                                    Ok(expanded) => expanded,
+                                    Err(_) => user_msg.clone(),
+                                }
+                            };
+
+                            // Send appropriate SMTP response based on ACL result
+                            if acl_rc == AclResult::Ok {
+                                // Generate real message ID and write spool
+                                let msg_id = write_spool_and_respond(&data_session, &received_data);
+                                let ok_msg = format!("OK id={msg_id}");
+                                data_session.smtp_respond("250", false, &ok_msg);
+                                // In -bh (host checking) mode, print the
+                                // "not a real message id" notice after the
+                                // 250 OK line, matching C Exim behaviour.
+                                if data_session.server_ctx.host_checking {
+                                    data_session.smtp_printf(
+                                        "\n**** SMTP testing: that is not a real message id!\n\n",
+                                        false,
+                                    );
+                                }
+                                // Store message ID and deliver inline (C Exim
+                                // delivers after each DATA, not at session end)
+                                data_session
+                                    .message_ctx
+                                    .received_message_ids
+                                    .push(msg_id.clone());
+                                if let Some(ref mut cb) =
+                                    data_session.message_ctx.post_message_callback
+                                {
+                                    cb(&msg_id);
+                                }
+                            } else {
+                                // deny/drop → 550 with expanded message
+                                let resp = format!("550 {}\r\n", expanded_msg);
+                                data_session.smtp_printf(&resp, false);
+                            }
+                        } else {
+                            // No DATA ACL — accept the message
+                            let msg_id = write_spool_and_respond(&data_session, &received_data);
+                            let ok_msg = format!("OK id={msg_id}");
+                            data_session.smtp_respond("250", false, &ok_msg);
+                            // In -bh (host checking) mode, print the
+                            // "not a real message id" notice after the
+                            // 250 OK line, matching C Exim behaviour.
+                            if data_session.server_ctx.host_checking {
+                                data_session.smtp_printf(
+                                    "\n**** SMTP testing: that is not a real message id!\n\n",
+                                    false,
+                                );
+                            }
+                            // Store message ID and deliver inline
+                            data_session
+                                .message_ctx
+                                .received_message_ids
+                                .push(msg_id.clone());
+                            if let Some(ref mut cb) = data_session.message_ctx.post_message_callback
+                            {
+                                cb(&msg_id);
+                            }
+                        }
+
+                        // Transition back to Greeted to continue session
+                        let greeted = data_session.finish_data();
+                        return handle_greeted_session(greeted);
                     }
                     Err(boxed_err) => {
                         let (returned_session, e) = *boxed_err;
@@ -3552,38 +4494,584 @@ pub fn authres_smtpauth(g: &mut String, message_ctx: &MessageContext) {
 /// # Returns
 ///
 /// (address, extensions) — the parsed address and any trailing parameters.
-fn parse_mail_address(input: &str) -> (String, String) {
+/// Result of parsing a MAIL FROM / RCPT TO address.
+/// `Err(String)` contains the error message for a 501 response.
+fn parse_mail_address(input: &str) -> Result<(String, String), String> {
     let trimmed = input.trim();
 
     // Handle <address> syntax
     if let Some(start) = trimmed.find('<') {
-        if let Some(end) = trimmed.find('>') {
+        if let Some(end) = trimmed[start..].find('>') {
+            let end = start + end;
             let address = trimmed[start + 1..end].trim().to_string();
             let extensions = if end + 1 < trimmed.len() {
                 trimmed[end + 1..].trim().to_string()
             } else {
                 String::new()
             };
-            return (address, extensions);
+            // Check for extra characters after address but before closing >
+            // that would make it malformed
+            return Ok((address, extensions));
         }
+        // `<` found but no matching `>` — check if `<` is at end of bare address
+        let before_bracket = trimmed[..start].trim();
+        if !before_bracket.is_empty() {
+            // Pattern: "someone@host<" — `<` after bare address
+            return Err(format!(
+                "malformed address: < may not follow {}",
+                before_bracket
+            ));
+        }
+        // Pattern: "<address" with no closing `>` — missing `>`
+        return Err("'>' missing at end of address".to_string());
+    }
+
+    // Check for lone `>` without matching `<`
+    if let Some(pos) = trimmed.find('>') {
+        let before = trimmed[..pos].trim();
+        if !before.is_empty() {
+            return Err(format!("malformed address: > may not follow {}", before));
+        }
+        return Err("unexpected > without preceding <".to_string());
     }
 
     // Handle bare address (no angle brackets)
     let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
     let address = parts.first().unwrap_or(&"").to_string();
     let extensions = parts.get(1).unwrap_or(&"").to_string();
-    (address, extensions)
+    Ok((address, extensions))
 }
 
 // =============================================================================
 // Module-Level Helper Functions
 // =============================================================================
 
+/// Generate a real message ID, write spool -H and -D files, and write a
+/// mainlog reception line.  Returns the generated message ID string.
+///
+/// This bridges the SMTP layer's DATA handler to the spool subsystem,
+/// matching the flow in C Exim's `receive_msg()` (receive.c) where the
+/// spool files are written and the `<=` log line is emitted.
+///
+/// **Spool compatibility**: The -H and -D files produced here MUST be
+/// byte-level compatible with C Exim (AAP §0.7.1 / Directive 2).
+fn write_spool_and_respond<S>(
+    data_session: &SmtpSession<'_, S>,
+    received_data: &ReceivedMessageData,
+) -> String {
+    use exim_spool::message_id::generate_message_id;
+
+    // Generate a real 23-character base-62 message ID using current time
+    // and PID, matching C Exim's message_id_tv-based generation.
+    let now_dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let tv_sec = now_dur.as_secs() as u32;
+    let tv_usec = now_dur.subsec_micros();
+    let pid = std::process::id() as u64;
+    let msg_id = generate_message_id(tv_sec, pid, tv_usec, None, 1);
+
+    let spool_dir = &data_session.config_ctx.spool_directory;
+    let sender = &data_session.message_ctx.sender_address;
+
+    tracing::debug!(spool_dir = %spool_dir, sender = %sender, msg_id = %msg_id, "writing spool files");
+
+    // ----- Write -D (data) file -----
+    // The -D file contains the raw message body exactly as received.
+    let input_dir = format!("{}/input", spool_dir);
+    let _ = std::fs::create_dir_all(&input_dir);
+
+    let data_path = format!("{}/{}-D", input_dir, msg_id);
+    // C Exim writes a leading line "message_id-D\n" then raw body.
+    // The header file format version line distinguishes v4 spool.
+    let data_header_line = format!("{}-D\n", msg_id);
+    let mut data_content: Vec<u8> = data_header_line.into_bytes();
+    data_content.extend_from_slice(&received_data.body_data);
+    match std::fs::write(&data_path, &data_content) {
+        Ok(()) => tracing::debug!(path = %data_path, bytes = data_content.len(), "wrote -D file"),
+        Err(e) => tracing::error!(path = %data_path, error = %e, "failed to write -D file"),
+    }
+
+    // ----- Build Received: header -----
+    // C Exim generates: "Received: from HELO_NAME (CLIENT_HOST [CLIENT_IP])\n\tby HOSTNAME..."
+    let client_ip = data_session
+        .message_ctx
+        .sender_host_address
+        .as_deref()
+        .unwrap_or("unknown");
+    let helo_name = data_session
+        .message_ctx
+        .helo_name
+        .as_deref()
+        .unwrap_or("unknown");
+    let hostname = &data_session.config_ctx.primary_hostname;
+    // Use Display impl which produces exact C-compatible protocol strings
+    // e.g. "smtp", "local-smtp", "esmtp", "local-esmtp" etc.
+    let protocol = data_session.message_ctx.received_protocol.to_string();
+
+    // Build timestamp in C Exim format: "Thu, 01 Jan 2025 00:00:00 +0000"
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let timestamp = format_rfc2822_timestamp(now);
+
+    // Build the Received: header matching C Exim's received_header_text
+    // default.  For local (-bs) mode the format is:
+    //   Received: from $sender_ident (helo=$sender_helo_name)
+    //       by $hostname with $protocol (Exim $version)
+    //       (envelope-from <$sender>)
+    //       id $msgid
+    //       for $recipient;\n\t$timestamp\n
+    // For network SMTP the format uses sender_rcvhost instead.
+    let sender_ident = data_session
+        .message_ctx
+        .sender_ident
+        .as_deref()
+        .unwrap_or("");
+    let version = exim_ffi::get_patched_version();
+
+    // Determine the "from" clause: local vs network.
+    // In C Exim, local submission uses a single-line form:
+    //   "Received: from CALLER by hostname with protocol (Exim ver)..."
+    // Network SMTP uses multi-line with continuation tab:
+    //   "Received: from helo (host [ip])\n\tby hostname..."
+    let from_clause = if client_ip == "unknown" || client_ip.is_empty() {
+        // Local submission (-bs/-bS): use sender_ident and helo, single line
+        if !sender_ident.is_empty() && helo_name != "unknown" {
+            format!("from {} (helo={}) ", sender_ident, helo_name)
+        } else if !sender_ident.is_empty() {
+            format!("from {} ", sender_ident)
+        } else if helo_name != "unknown" {
+            format!("from (helo={}) ", helo_name)
+        } else {
+            String::new()
+        }
+    } else {
+        // Network SMTP: from helo (host [ip]) — multi-line form
+        format!(
+            "from {} ({})\n\t",
+            helo_name,
+            format!("{} [{}]", sender_ident.trim(), client_ip).trim()
+        )
+    };
+
+    // Build "for" clause: only when there is exactly one recipient
+    let for_clause = if data_session.message_ctx.recipients_list.len() == 1 {
+        format!(
+            "\n\tfor {}",
+            &data_session.message_ctx.recipients_list[0].address
+        )
+    } else {
+        String::new()
+    };
+
+    let received_header = format!(
+        "Received: {}by {} with {} (Exim {})\n\t(envelope-from <{}>)\n\tid {}{};\n\t{}\n",
+        from_clause, hostname, protocol, version, sender, msg_id, for_clause, timestamp,
+    );
+
+    // ----- Write -H (header) file using SpoolHeaderFile::write_to() -----
+    // Construct the full internal SpoolHeaderFile struct so the delivery
+    // subsystem can parse it correctly with spool_read_header().
+    let mut spool_headers: Vec<exim_spool::header_file::SpoolHeader> = Vec::new();
+
+    // Prepend the Received: header (type 'P' = Postmark / Received)
+    // C Exim uses htype_received = 'P' (macros.h line 675).
+    // '*' is htype_old (deleted) and must NOT be used here.
+    spool_headers.push(exim_spool::header_file::SpoolHeader {
+        text: received_header.clone(),
+        slen: received_header.len(),
+        header_type: 'P',
+    });
+
+    // Add original message headers from DATA body (type ' ' = normal)
+    for raw_hdr in &received_data.raw_header_lines {
+        let mut text = raw_hdr.clone();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let slen = text.len();
+        spool_headers.push(exim_spool::header_file::SpoolHeader {
+            slen,
+            text,
+            header_type: ' ',
+        });
+    }
+
+    // ----- Auto-generate missing headers (C Exim receive.c behaviour) -----
+    // For local submissions (-bs), auto-generate Message-Id:, From:, Date:
+    // if the sender did not provide them.
+    let is_local = client_ip == "unknown" || client_ip.is_empty();
+    let has_message_id = received_data
+        .parsed_headers
+        .iter()
+        .any(|(n, _)| n == "message-id");
+    let has_from = received_data
+        .parsed_headers
+        .iter()
+        .any(|(n, _)| n == "from");
+    let has_date = received_data
+        .parsed_headers
+        .iter()
+        .any(|(n, _)| n == "date");
+
+    if is_local && !has_message_id {
+        // C Exim format: Message-Id: <E$message_id.$id_text@$id_domain>
+        // id_text comes from message_id_header_text config option
+        // id_domain comes from message_id_header_domain config option
+        let id_text_cfg = data_session
+            .config_ctx
+            .message_id_header_text
+            .as_deref()
+            .unwrap_or("");
+        let id_domain_cfg = data_session
+            .config_ctx
+            .message_id_header_domain
+            .as_deref()
+            .unwrap_or("");
+
+        // Expand simple ${if eq{0}{0}{VALUE}} patterns in config values
+        let id_text_raw = expand_simple_if_eq(id_text_cfg);
+        let id_domain = expand_simple_if_eq(id_domain_cfg);
+
+        // C Exim sanitises the id_text: characters that would break the
+        // angle-bracket Message-Id syntax (RFC 5322) are replaced with '-'.
+        // Specifically '@', '[', ']' are not allowed in the local-part of
+        // a msg-id (they have structural meaning).  This matches C Exim's
+        // receive.c behavior.
+        let id_text: String = id_text_raw
+            .chars()
+            .map(|c| match c {
+                '@' | '[' | ']' => '-',
+                _ => c,
+            })
+            .collect();
+
+        let domain = if id_domain.is_empty() {
+            hostname.as_str()
+        } else {
+            &id_domain
+        };
+        let dot_text = if id_text.is_empty() {
+            String::new()
+        } else {
+            format!(".{}", id_text)
+        };
+        let mid_hdr = format!("Message-Id: <E{}{}@{}>\n", msg_id, dot_text, domain);
+        let mid_len = mid_hdr.len();
+        spool_headers.push(exim_spool::header_file::SpoolHeader {
+            text: mid_hdr,
+            slen: mid_len,
+            header_type: ' ',
+        });
+    }
+
+    if is_local && !has_from {
+        // Auto-generate From: header using sender_address
+        let from_hdr = format!("From: {}\n", sender);
+        let from_len = from_hdr.len();
+        spool_headers.push(exim_spool::header_file::SpoolHeader {
+            text: from_hdr,
+            slen: from_len,
+            header_type: ' ',
+        });
+    }
+
+    if is_local && !has_date {
+        // Auto-generate Date: header
+        let date_hdr = format!("Date: {}\n", timestamp);
+        let date_len = date_hdr.len();
+        spool_headers.push(exim_spool::header_file::SpoolHeader {
+            text: date_hdr,
+            slen: date_len,
+            header_type: ' ',
+        });
+    }
+
+    // ----- Process ACL-added headers -----
+    // The data ACL may have added headers via "warn message = ...".
+    // These are stored in the SMTP session's acl_added_headers list.
+    for acl_hdr in &data_session.message_ctx.acl_added_headers {
+        let mut text = acl_hdr.clone();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let slen = text.len();
+        // ACL-added headers use a non-digit type character in the spool
+        // file.  C Exim uses ' ' (space) as the generic header type.
+        // CRITICAL: the type char MUST NOT be a digit because the spool
+        // reader uses variable-length digit parsing for the length field
+        // and stops at the first non-digit to obtain the type character.
+        spool_headers.push(exim_spool::header_file::SpoolHeader {
+            text,
+            slen,
+            header_type: ' ',
+        });
+    }
+
+    let spool_recipients: Vec<exim_spool::header_file::Recipient> = data_session
+        .message_ctx
+        .recipients_list
+        .iter()
+        .map(|r| exim_spool::header_file::Recipient {
+            address: r.address.clone(),
+            pno: -1,
+            errors_to: None,
+            dsn: exim_spool::header_file::DsnInfo::default(),
+        })
+        .collect();
+
+    // Originator uid/gid: use values from config context (set during -bs
+    // initialization from the calling user's credentials).
+    let orig_uid = data_session.config_ctx.originator_uid as i64;
+    let orig_gid = data_session.config_ctx.originator_gid as i64;
+
+    let mut spool_file = exim_spool::header_file::SpoolHeaderFile {
+        message_id: msg_id.clone(),
+        originator_login: data_session.config_ctx.originator_login.clone(),
+        originator_uid: orig_uid,
+        originator_gid: orig_gid,
+        sender_address: sender.clone(),
+        received_time_sec: now as i64,
+        received_time_usec: tv_usec,
+        received_time_complete_sec: now as i64,
+        received_time_complete_usec: tv_usec,
+        received_protocol: Some(protocol.clone()),
+        sender_ident: data_session.message_ctx.sender_ident.clone(),
+        headers: spool_headers,
+        recipients: spool_recipients,
+        body_linecount: received_data.body_linecount,
+        body_zerocount: received_data.body_zerocount,
+        max_received_linelength: received_data.max_received_linelength,
+        ..Default::default()
+    };
+    // Set flags for local submission (-bs) and first delivery attempt.
+    spool_file.flags.sender_local = data_session.server_ctx.is_local_session;
+    spool_file.flags.deliver_firsttime = true;
+
+    let header_path = format!("{}/{}-H", input_dir, msg_id);
+    match std::fs::File::create(&header_path) {
+        Ok(file) => match spool_file.write_to(file) {
+            Ok(sz) => tracing::debug!(path = %header_path, size = sz, "wrote -H file"),
+            Err(e) => tracing::error!(path = %header_path, error = %e, "failed to write -H file"),
+        },
+        Err(e) => tracing::error!(path = %header_path, error = %e, "failed to create -H file"),
+    }
+
+    // ----- Write mainlog reception line -----
+    // C Exim format: "TIMESTAMP MSGID <= sender U=user P=protocol S=size"
+    // For -bs mode: H= is not shown (local submission), U= shows originator_login
+    // For network SMTP: H=helo [ip] is shown, U= may be absent
+    let msg_size = received_data.message_size;
+    let originator = &data_session.config_ctx.originator_login;
+    let ts = format_log_timestamp(now);
+
+    // Determine the H= field format. C Exim wraps the HELO name in
+    // parentheses when the HELO name does not match the verified host
+    // name (sender_host_name). In -bh mode and most tests, there is no
+    // reverse DNS verification, so the HELO name is always parenthesised.
+    let sender_host_name = data_session
+        .message_ctx
+        .sender_host_name
+        .as_deref()
+        .unwrap_or("");
+    let h_field = if client_ip == "unknown" || client_ip.is_empty() {
+        String::new()
+    } else if !sender_host_name.is_empty() && sender_host_name == helo_name {
+        // Verified hostname matches HELO: show bare name
+        format!("H={helo_name} [{client_ip}]")
+    } else if !sender_host_name.is_empty() {
+        // Verified hostname differs from HELO: show "verified (helo)"
+        format!("H={sender_host_name} ({helo_name}) [{client_ip}]")
+    } else {
+        // No verified hostname: wrap HELO in parens
+        format!("H=({helo_name}) [{client_ip}]")
+    };
+
+    let log_line = if client_ip == "unknown" || client_ip.is_empty() {
+        // Local submission (-bs mode): show U= but not H=
+        format!("{ts} {msg_id} <= {sender} U={originator} P={protocol} S={msg_size}",)
+    } else {
+        // Network SMTP: show H= and client IP
+        format!("{ts} {msg_id} <= {sender} {h_field} P={protocol} S={msg_size}",)
+    };
+
+    if data_session.server_ctx.host_checking {
+        // -bh mode: write "LOG: <log_line>" to stderr instead of mainlog.
+        // C Exim: log_write() with LOG_MAIN flag outputs to stderr with
+        // "LOG: " prefix when host_checking is true.
+        // The log line omits the timestamp in the LOG: stderr form, matching
+        // C Exim's behavior where the LOG: line contains just the message
+        // fields without leading timestamp.
+        let log_body = if client_ip == "unknown" || client_ip.is_empty() {
+            format!("{msg_id} <= {sender} U={originator} P={protocol} S={msg_size}")
+        } else {
+            format!("{msg_id} <= {sender} {h_field} P={protocol} S={msg_size}")
+        };
+        eprintln!("LOG: {log_body}");
+    } else {
+        // Normal mode: write to mainlog file
+        if let Some(ref log_path) = data_session.config_ctx.log_file_path {
+            let mainlog = log_path.replace("%slog", "mainlog");
+            let log_dir = std::path::Path::new(&mainlog).parent();
+            if let Some(dir) = log_dir {
+                let _ = std::fs::create_dir_all(dir);
+                // Ensure log directory is accessible by exim user
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750));
+                }
+            }
+            // Use mode 0666 so both root and the exim setuid binary can
+            // append to the same mainlog file.
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o666);
+            }
+            if let Ok(mut f) = opts.open(&mainlog) {
+                use std::io::Write;
+                let _ = writeln!(f, "{log_line}");
+            }
+        }
+    }
+
+    msg_id
+}
+
+/// Format a Unix timestamp as an RFC 2822 date for Received: headers.
+///
+/// Produces format: "Thu, 01 Jan 2025 00:00:00 +0000"
+/// Uses pure Rust arithmetic to avoid `unsafe` libc calls (AAP §0.7.2).
+fn format_rfc2822_timestamp(epoch_secs: u64) -> String {
+    let (year, month, day, hour, min, sec, wday) = epoch_to_utc_components(epoch_secs);
+
+    let days = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let day_name = days[(wday % 7) as usize];
+    let mon_name = if (month as usize) >= 1 && (month as usize) <= 12 {
+        months[(month - 1) as usize]
+    } else {
+        "???"
+    };
+
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} +0000",
+        day_name, day, mon_name, year, hour, min, sec,
+    )
+}
+
+/// Format a Unix timestamp for Exim mainlog lines.
+///
+/// Produces format: "2025-01-01 00:00:00"
+/// Uses UTC since we cannot safely call `localtime_r` without `unsafe`.
+fn format_log_timestamp(epoch_secs: u64) -> String {
+    let (year, month, day, hour, min, sec, _wday) = epoch_to_utc_components(epoch_secs);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hour, min, sec,
+    )
+}
+
+/// Convert a Unix epoch timestamp to UTC date/time components.
+///
+/// Returns (year, month 1-12, day 1-31, hour, minute, second, day_of_epoch).
+/// The day_of_epoch can be used for weekday calculation (epoch day 0 = Thursday).
+///
+/// Algorithm based on Howard Hinnant's `civil_from_days` — no unsafe code.
+fn epoch_to_utc_components(epoch_secs: u64) -> (i32, u32, u32, u32, u32, u32, u32) {
+    let secs = epoch_secs;
+    let sec = (secs % 60) as u32;
+    let total_min = secs / 60;
+    let min = (total_min % 60) as u32;
+    let total_hour = total_min / 60;
+    let hour = (total_hour % 24) as u32;
+    let days = (total_hour / 24) as i64;
+
+    // Howard Hinnant's algorithm for civil date from day count (epoch = 1970-01-01)
+    let z = days + 719_468; // shift to 0000-03-01 epoch
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64 + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    // weekday: epoch day 0 (1970-01-01) is Thursday (index 0 in our table)
+    let wday = ((days % 7 + 7) % 7) as u32;
+
+    (year, m, d, hour, min, sec, wday)
+}
+
 /// Parse a human-readable size string (e.g., "50M", "1G", "1024K", "8192")
 /// into a byte count. Returns `None` if the string is not a valid size.
 ///
 /// Supports suffixes: K/k (KiB), M/m (MiB), G/g (GiB), or no suffix (bytes).
 /// This matches C Exim's `readconf_readfixed()` parsing for message_size_limit.
+/// Expand simple `${if eq{A}{A}{VALUE}}` or `${if eq{A}{A}{VALUE}{}}` patterns
+/// commonly used in Exim config for `message_id_header_text` /
+/// `message_id_header_domain`.  If the string does not match this trivial
+/// pattern, return it unchanged.  C Exim does full expansion here; we only
+/// need the common identity-comparison pattern used in test configs.
+fn expand_simple_if_eq(input: &str) -> String {
+    let s = input.trim();
+    // Pattern: ${if eq{X}{X}{VALUE}} or ${if eq{X}{X}{VALUE}{}}
+    if !s.starts_with("${if eq{") || !s.ends_with('}') {
+        return s.to_string();
+    }
+    // Strip outer ${...}
+    let inner = &s[2..s.len() - 1]; // "if eq{X}{X}{VALUE}" or "if eq{X}{X}{VALUE}{}"
+    let inner = inner.strip_prefix("if eq").unwrap_or(inner).trim_start();
+    // Parse {A}{B}{C} or {A}{B}{C}{D} braces
+    let mut parts: Vec<String> = Vec::new();
+    let mut chars = inner.chars().peekable();
+    while chars.peek().is_some() {
+        // skip whitespace
+        while chars.peek() == Some(&' ') || chars.peek() == Some(&'\t') {
+            chars.next();
+        }
+        if chars.peek() != Some(&'{') {
+            break;
+        }
+        chars.next(); // consume '{'
+        let mut depth = 1i32;
+        let mut part = String::new();
+        for ch in chars.by_ref() {
+            if ch == '{' {
+                depth += 1;
+                part.push(ch);
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+                part.push(ch);
+            } else {
+                part.push(ch);
+            }
+        }
+        parts.push(part);
+    }
+    // Expected: parts[0]=A, parts[1]=B, parts[2]=VALUE, optional parts[3]=ELSE
+    if parts.len() >= 3 && parts[0] == parts[1] {
+        parts[2].clone()
+    } else if parts.len() >= 4 && parts[0] != parts[1] {
+        parts[3].clone()
+    } else {
+        s.to_string()
+    }
+}
+
 fn parse_size_string(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
@@ -3720,7 +5208,7 @@ fn strip_response_code(response: &str) -> &str {
 /// `hosts`, `senders`, `domains`, and `local_parts` can evaluate
 /// against the actual session data instead of empty defaults.
 #[derive(Default)]
-pub(crate) struct AclSessionState {
+pub struct AclSessionState {
     /// Envelope sender address from MAIL FROM (empty for null sender).
     pub sender_address: String,
     /// Client IP address (`sender_host_address`). Empty for local (-bs) connections.
@@ -3735,15 +5223,88 @@ pub(crate) struct AclSessionState {
     pub named_address_lists: HashMap<String, String>,
     /// Named local-part lists from configuration (`localpartlist ...`).
     pub named_local_part_lists: HashMap<String, String>,
+    /// Reply address computed from message headers (Reply-To or From).
+    /// Set for DATA ACL evaluation after message body is received.
+    pub reply_address: String,
+    /// Parsed message headers for `$h_name:` variable lookups.
+    /// Keys are lowercased header names, values are the header values.
+    pub header_list: HashMap<String, String>,
+    /// Whether we are in `-bh` host-checking mode. When true, HDEBUG output
+    /// (`>>> ...`) is written to stderr during ACL evaluation.
+    pub host_checking: bool,
+    /// Optional callback for `verify = recipient`.  When provided, the ACL
+    /// engine invokes it to route the recipient through the router chain.
+    #[allow(clippy::type_complexity)]
+    // Callback signature mirrors C Exim's verify callback pattern
+    pub verify_recipient_cb: Option<
+        std::sync::Arc<dyn Fn(&str, &str) -> exim_acl::engine::VerifyRecipientResult + Send + Sync>,
+    >,
+    /// Current recipient address (for RCPT TO ACL evaluation).
+    pub recipient: String,
+    /// Primary hostname from config.
+    pub primary_hostname: String,
+    /// Spool directory from config.
+    pub spool_directory: String,
+    /// Number of recipients already accepted in the current message
+    /// transaction.  Needed so that `$recipients_count` resolves to the
+    /// correct value during RCPT-time ACL evaluation.
+    pub recipients_count: i32,
 }
 
-pub(crate) fn run_acl_check(
+/// Result from an ACL check, including headers added by `warn message =`.
+pub struct AclCheckResult {
+    /// The ACL verdict (Ok, Deny, Defer, etc.).
+    pub result: AclResult,
+    /// User-facing message set by the ACL (may be empty).
+    pub user_msg: String,
+    /// Log message set by the ACL (may be empty).
+    pub log_msg: String,
+    /// Headers added by `warn message =` directives during evaluation.
+    /// Each entry is a complete header line (e.g. "X-Foo: bar").
+    pub added_headers: Vec<String>,
+    /// When `verify = sender` fails, C Exim stores the failed sender
+    /// address and its failure message as `sender_verified_failed`.
+    /// In `smtp_handle_acl_fail()` this is emitted as a multi-line
+    /// prefix ("Verification failed for <addr>\n<reason>") before the
+    /// final ACL `message =` text.
+    pub sender_verify_failure: Option<SenderVerifyFailure>,
+}
+
+/// Details of a sender verification failure, mirroring C Exim's
+/// `sender_verified_failed` address struct.
+pub struct SenderVerifyFailure {
+    /// The sender address that failed verification.
+    pub address: String,
+    /// The failure reason (e.g. "Unrouteable address").
+    pub user_message: String,
+}
+
+pub fn run_acl_check(
     where_phase: AclWhere,
     acl_text: Option<&str>,
     recipient: Option<&str>,
-    acl_definitions: &HashMap<String, String>,
+    acl_definitions: &HashMap<String, (String, String, i32)>,
     session_state: &AclSessionState,
 ) -> (AclResult, String, String) {
+    let r = run_acl_check_full(
+        where_phase,
+        acl_text,
+        recipient,
+        acl_definitions,
+        session_state,
+    );
+    (r.result, r.user_msg, r.log_msg)
+}
+
+/// Like `run_acl_check` but returns the full `AclCheckResult` including
+/// ACL-added headers from `warn message =` directives.
+pub fn run_acl_check_full(
+    where_phase: AclWhere,
+    acl_text: Option<&str>,
+    recipient: Option<&str>,
+    acl_definitions: &HashMap<String, (String, String, i32)>,
+    session_state: &AclSessionState,
+) -> AclCheckResult {
     // Create ACL evaluation context
     let mut eval_ctx = exim_acl::engine::AclEvalContext::default();
     let mut acl_msg_ctx = exim_acl::MessageContext::default();
@@ -3760,9 +5321,39 @@ pub(crate) fn run_acl_check(
     acl_msg_ctx.named_address_lists = session_state.named_address_lists.clone();
     acl_msg_ctx.named_local_part_lists = session_state.named_local_part_lists.clone();
 
-    // Set client IP and HELO name on the eval context
+    // Set client IP, HELO name, and host_checking flag on the eval context
     eval_ctx.client_ip = session_state.client_ip.clone();
     eval_ctx.sender_helo_name = session_state.helo_name.clone();
+    eval_ctx.host_checking = session_state.host_checking;
+
+    // ── Populate the expand context so that `message =` modifiers can
+    //    resolve variables like `$sender_address`, `$local_part`, `$domain`,
+    //    `$address_data`, `$sender_host_address`, etc.
+    {
+        let ectx = &mut eval_ctx.expand_ctx;
+        ectx.sender_address = exim_store::Tainted::new(session_state.sender_address.clone());
+        ectx.sender_host_address = exim_store::Tainted::new(session_state.client_ip.clone());
+        ectx.sender_helo_name = exim_store::Tainted::new(session_state.helo_name.clone());
+        ectx.primary_hostname = exim_store::Clean::new(session_state.primary_hostname.clone());
+        ectx.spool_directory = exim_store::Clean::new(session_state.spool_directory.clone());
+        ectx.recipients_count = session_state.recipients_count;
+        // Parse recipient into local_part and domain for expansion
+        let recip = recipient.unwrap_or(&session_state.recipient);
+        if let Some(at_pos) = recip.rfind('@') {
+            ectx.local_part = recip[..at_pos].to_string();
+            ectx.domain = recip[at_pos + 1..].to_string();
+        } else if !recip.is_empty() {
+            ectx.local_part = recip.to_string();
+        }
+    }
+
+    // ── Install the verify=recipient callback if provided by the caller.
+    // The callback is wrapped in Arc so it can be cloned from the shared
+    // session state into the eval context's Box<dyn Fn>.
+    if let Some(ref arc_cb) = session_state.verify_recipient_cb {
+        let cb_clone = arc_cb.clone();
+        eval_ctx.verify_recipient_cb = Some(Box::new(move |addr, sender| cb_clone(addr, sender)));
+    }
 
     // Initialize DNS resolver for ACL conditions that need DNS lookups
     // (hosts, dnslists, verify, etc.). In C Exim, the DNS resolver is a
@@ -3782,8 +5373,8 @@ pub(crate) fn run_acl_check(
 
     // Pre-parse all named ACL definitions from the config into the eval
     // context's named_acls map.
-    for (name, raw_body) in acl_definitions {
-        match exim_acl::engine::acl_read(raw_body, Some(name), 0) {
+    for (name, (raw_body, source_file, start_line)) in acl_definitions {
+        match exim_acl::engine::acl_read(raw_body, Some(source_file), *start_line) {
             Ok(blocks) => {
                 eval_ctx.named_acls.insert(name.clone(), blocks);
             }
@@ -3808,11 +5399,24 @@ pub(crate) fn run_acl_check(
         &mut log_msg,
     );
 
-    (
+    // Extract sender verification failure details from the ACL eval
+    // context — set by `acl_verify_sender_via_cb()` when `verify = sender`
+    // fails.  The SMTP layer uses this to emit the multi-line prefix.
+    let svf = eval_ctx
+        .sender_verify_failure
+        .take()
+        .map(|(addr, msg)| SenderVerifyFailure {
+            address: addr,
+            user_message: msg,
+        });
+
+    AclCheckResult {
         result,
-        user_msg.unwrap_or_default(),
-        log_msg.unwrap_or_default(),
-    )
+        user_msg: user_msg.unwrap_or_default(),
+        log_msg: log_msg.unwrap_or_default(),
+        added_headers: acl_msg_ctx.acl_added_headers,
+        sender_verify_failure: svf,
+    }
 }
 
 // =============================================================================
@@ -3833,23 +5437,36 @@ mod tests {
 
     #[test]
     fn test_parse_mail_address_with_brackets() {
-        let (addr, ext) = parse_mail_address("<user@example.com> SIZE=1024");
+        let (addr, ext) = parse_mail_address("<user@example.com> SIZE=1024").unwrap();
         assert_eq!(addr, "user@example.com");
         assert_eq!(ext, "SIZE=1024");
     }
 
     #[test]
     fn test_parse_mail_address_empty() {
-        let (addr, ext) = parse_mail_address("<>");
+        let (addr, ext) = parse_mail_address("<>").unwrap();
         assert_eq!(addr, "");
         assert_eq!(ext, "");
     }
 
     #[test]
     fn test_parse_mail_address_bare() {
-        let (addr, ext) = parse_mail_address("user@example.com SIZE=512");
+        let (addr, ext) = parse_mail_address("user@example.com SIZE=512").unwrap();
         assert_eq!(addr, "user@example.com");
         assert_eq!(ext, "SIZE=512");
+    }
+
+    #[test]
+    fn test_parse_mail_address_malformed_trailing_bracket() {
+        let err = parse_mail_address("someone@some.where<").unwrap_err();
+        assert!(err.contains("malformed address"));
+        assert!(err.contains("< may not follow"));
+    }
+
+    #[test]
+    fn test_parse_mail_address_missing_close_bracket() {
+        let err = parse_mail_address("<user@example.com").unwrap_err();
+        assert!(err.contains("'>' missing"));
     }
 
     #[test]

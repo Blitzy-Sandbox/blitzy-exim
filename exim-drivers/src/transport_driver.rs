@@ -50,7 +50,7 @@ use std::fmt;
 /// ```
 /// use exim_drivers::transport_driver::TransportResult;
 ///
-/// let result = TransportResult::Ok;
+/// let result = TransportResult::ok();
 /// assert!(result.is_ok());
 ///
 /// let deferred = TransportResult::Deferred {
@@ -65,7 +65,21 @@ pub enum TransportResult {
     ///
     /// C equivalent: `code()` returns `TRUE` in `transport_info` (structs.h
     /// line 253). The message has been accepted by the downstream system.
-    Ok,
+    ///
+    /// Optional fields carry metadata that remote transports (SMTP/LMTP)
+    /// populate for delivery logging — matching C Exim's `addr->host_used`
+    /// and `addr->message` fields set during transport execution.
+    Ok {
+        /// Hostname of the server that accepted the message.
+        /// C: `addr->host_used->name` — used for the `H=` log field.
+        host_name: Option<String>,
+        /// IP address of the server that accepted the message.
+        /// C: `addr->host_used->address` — used for the `[ip]` part of `H=`.
+        host_address: Option<String>,
+        /// SMTP confirmation message (e.g. "250 OK").
+        /// C: `addr->message` when `LOGGING(smtp_confirmation)` — used for `C="..."`.
+        smtp_confirmation: Option<String>,
+    },
 
     /// Delivery deferred — the message should be retried later.
     ///
@@ -112,10 +126,32 @@ impl TransportResult {
     ///
     /// ```
     /// use exim_drivers::transport_driver::TransportResult;
-    /// assert!(TransportResult::Ok.is_ok());
+    /// assert!(TransportResult::ok().is_ok());
     /// ```
     pub fn is_ok(&self) -> bool {
-        matches!(self, Self::Ok)
+        matches!(self, Self::Ok { .. })
+    }
+
+    /// Convenience constructor for a simple success with no metadata.
+    pub fn ok() -> Self {
+        Self::Ok {
+            host_name: None,
+            host_address: None,
+            smtp_confirmation: None,
+        }
+    }
+
+    /// Convenience constructor for success with host/response metadata.
+    pub fn ok_with_host(
+        host_name: impl Into<String>,
+        host_address: impl Into<String>,
+        smtp_confirmation: impl Into<String>,
+    ) -> Self {
+        Self::Ok {
+            host_name: Some(host_name.into()),
+            host_address: Some(host_address.into()),
+            smtp_confirmation: Some(smtp_confirmation.into()),
+        }
     }
 
     /// Returns `true` if delivery was deferred (temporary failure).
@@ -163,7 +199,7 @@ impl TransportResult {
     /// - `Deferred`, `Failed`, and `Error` return their respective messages.
     pub fn message(&self) -> Option<&str> {
         match self {
-            Self::Ok => None,
+            Self::Ok { .. } => None,
             Self::Deferred { message, .. } => message.as_deref(),
             Self::Failed { message } => message.as_deref(),
             Self::Error { message } => Some(message.as_str()),
@@ -187,7 +223,7 @@ impl TransportResult {
 impl fmt::Display for TransportResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ok => write!(f, "OK"),
+            Self::Ok { .. } => write!(f, "OK"),
             Self::Deferred { message, errno } => {
                 write!(f, "DEFERRED")?;
                 if let Some(msg) = message {
@@ -775,7 +811,7 @@ pub trait TransportDriver: Send + Sync + fmt::Debug {
     ///
     /// # Returns
     ///
-    /// - `Ok(TransportResult::Ok)` — Delivery succeeded
+    /// - `Ok(TransportResult::ok())` — Delivery succeeded
     /// - `Ok(TransportResult::Deferred { .. })` — Temporary failure, retry
     /// - `Ok(TransportResult::Failed { .. })` — Permanent failure
     /// - `Ok(TransportResult::Error { .. })` — Internal error
@@ -904,7 +940,7 @@ pub trait TransportDriver: Send + Sync + fmt::Debug {
 ///         _config: &TransportInstanceConfig,
 ///         _address: &str,
 ///     ) -> Result<TransportResult, DriverError> {
-///         Ok(TransportResult::Ok)
+///         Ok(TransportResult::ok())
 ///     }
 ///     fn is_local(&self) -> bool { true }
 ///     fn driver_name(&self) -> &str { "my_transport" }
@@ -988,7 +1024,7 @@ mod tests {
 
     #[test]
     fn transport_result_ok_properties() {
-        let result = TransportResult::Ok;
+        let result = TransportResult::ok();
         assert!(result.is_ok());
         assert!(result.is_success());
         assert!(!result.is_failure());
@@ -1058,7 +1094,7 @@ mod tests {
 
     #[test]
     fn transport_result_display() {
-        assert_eq!(format!("{}", TransportResult::Ok), "OK");
+        assert_eq!(format!("{}", TransportResult::ok()), "OK");
 
         let deferred = TransportResult::Deferred {
             message: Some("timeout".to_string()),
@@ -1085,9 +1121,9 @@ mod tests {
 
     #[test]
     fn transport_result_equality() {
-        assert_eq!(TransportResult::Ok, TransportResult::Ok);
+        assert_eq!(TransportResult::ok(), TransportResult::ok());
         assert_ne!(
-            TransportResult::Ok,
+            TransportResult::ok(),
             TransportResult::Failed { message: None }
         );
 
@@ -1239,7 +1275,7 @@ mod tests {
             _config: &TransportInstanceConfig,
             _address: &str,
         ) -> Result<TransportResult, DriverError> {
-            Result::Ok(TransportResult::Ok)
+            Result::Ok(TransportResult::ok())
         }
 
         fn is_local(&self) -> bool {
@@ -1264,7 +1300,7 @@ mod tests {
         let config = TransportInstanceConfig::new("test", "test_transport");
         let result = transport.transport_entry(&config, "user@example.com");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), TransportResult::Ok);
+        assert_eq!(result.unwrap(), TransportResult::ok());
     }
 
     #[test]

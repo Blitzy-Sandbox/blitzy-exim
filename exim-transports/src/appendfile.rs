@@ -713,6 +713,47 @@ impl AppendfileTransport {
         // but no warn_message exists on the base config (appendfile.c lines 485-490)
         // Note: the actual warn_message is on TransportInstanceConfig, not here
 
+        // Set default message_prefix and message_suffix for Unix mbox format
+        // (appendfile.c lines 469-480).  Only when not maildir/mailstore/directory.
+        let is_maildir = {
+            #[cfg(feature = "maildir")]
+            {
+                ob.maildir_format
+            }
+            #[cfg(not(feature = "maildir"))]
+            {
+                false
+            }
+        };
+        let is_mailstore = {
+            #[cfg(feature = "mailstore")]
+            {
+                ob.mailstore_format
+            }
+            #[cfg(not(feature = "mailstore"))]
+            {
+                false
+            }
+        };
+        if ob.message_prefix.is_none() && ob.dirname.is_none() && !is_maildir && !is_mailstore {
+            // C Exim default: "From ${if def:return_path{$return_path}{MAILER-DAEMON}} ${tod_bsdinbox}\n"
+            // We store the template string; actual expansion happens at delivery time
+            // in build_message_body / deliver path.
+            ob.message_prefix = Some(
+                "From ${if def:return_path{$return_path}{MAILER-DAEMON}} ${tod_bsdinbox}\n"
+                    .to_string(),
+            );
+        }
+        if ob.message_suffix.is_none() && ob.dirname.is_none() && !is_maildir && !is_mailstore {
+            ob.message_suffix = Some("\n".to_string());
+        }
+        if ob.check_string.is_none() && ob.dirname.is_none() && !is_maildir && !is_mailstore {
+            ob.check_string = Some("From ".to_string());
+        }
+        if ob.escape_string.is_none() && ob.dirname.is_none() && !is_maildir && !is_mailstore {
+            ob.escape_string = Some(">From ".to_string());
+        }
+
         tracing::debug!(
             driver = "appendfile",
             file = ?ob.filename,
@@ -1599,7 +1640,7 @@ fn deliver_maildir(
         }
     }
 
-    Ok(TransportResult::Ok)
+    Ok(TransportResult::ok())
 }
 
 /// Deliver a message in Mailstore format (data + envelope file pairs).
@@ -1672,7 +1713,7 @@ fn deliver_mailstore(
         "Mailstore delivery complete"
     );
 
-    Ok(TransportResult::Ok)
+    Ok(TransportResult::ok())
 }
 
 /// Get a sanitized hostname for Maildir filenames.
@@ -1723,21 +1764,62 @@ impl TransportDriver for AppendfileTransport {
         // Perform simple variable expansion on the path.
         // This handles ${local_part} which is the most common pattern in
         // appendfile transport file paths.
+        //
+        // C Exim uses the STRIPPED local_part (after the accepting router
+        // removed prefixes/suffixes).  The orchestrator injects the
+        // stripped values via "__local_part", "__local_part_prefix", and
+        // "__local_part_suffix" keys in private_options_map.
+        let stripped_lp = config
+            .private_options_map
+            .get("__local_part")
+            .map(String::as_str);
+        let stripped_prefix = config
+            .private_options_map
+            .get("__local_part_prefix")
+            .map(String::as_str)
+            .unwrap_or("");
+        let stripped_suffix = config
+            .private_options_map
+            .get("__local_part_suffix")
+            .map(String::as_str)
+            .unwrap_or("");
+
         let expand_path = |path: &str| -> String {
-            // Extract local_part from the address (part before @)
-            let local_part = if let Some(at_pos) = address.find('@') {
-                &address[..at_pos]
-            } else {
-                address
-            };
+            // Use the stripped local_part if injected by the orchestrator;
+            // fall back to extracting from the full address for backward
+            // compatibility.
+            let local_part = stripped_lp.unwrap_or_else(|| {
+                if let Some(at_pos) = address.find('@') {
+                    &address[..at_pos]
+                } else {
+                    address
+                }
+            });
             // Extract domain from the address (part after @)
             let domain = if let Some(at_pos) = address.find('@') {
                 &address[at_pos + 1..]
             } else {
                 ""
             };
-            path.replace("${local_part}", local_part)
+            // CRITICAL: Replace longer variable names FIRST to avoid
+            // partial matching (e.g. $local_part_data must not be
+            // consumed as $local_part + literal "_data").
+            // In C Exim, $local_part_data defaults to $local_part when
+            // no router-supplied data override exists.
+            path.replace("${local_part_data}", local_part)
+                .replace("$local_part_data", local_part)
+                .replace("${local_part_prefix_v}", stripped_prefix)
+                .replace("$local_part_prefix_v", stripped_prefix)
+                .replace("${local_part_prefix}", stripped_prefix)
+                .replace("$local_part_prefix", stripped_prefix)
+                .replace("${local_part_suffix_v}", stripped_suffix)
+                .replace("$local_part_suffix_v", stripped_suffix)
+                .replace("${local_part_suffix}", stripped_suffix)
+                .replace("$local_part_suffix", stripped_suffix)
+                .replace("${local_part}", local_part)
                 .replace("$local_part", local_part)
+                .replace("${domain_data}", domain)
+                .replace("$domain_data", domain)
                 .replace("${domain}", domain)
                 .replace("$domain", domain)
         };
@@ -1878,7 +1960,7 @@ impl AppendfileTransport {
         // Check /dev/null optimization — instant success
         if file_path == Path::new("/dev/null") {
             tracing::debug!("delivery to /dev/null — instant success");
-            return Ok(TransportResult::Ok);
+            return Ok(TransportResult::ok());
         }
 
         // For Smail (directory) format, generate per-message filename
@@ -2033,8 +2115,13 @@ impl AppendfileTransport {
                 let mut writer = BufWriter::new(&file);
 
                 // Write prefix (e.g., mbox "From " line)
+                // C Exim expands ob->message_prefix via expand_string().
+                // The default template is:
+                //   "From ${if def:return_path{$return_path}{MAILER-DAEMON}} ${tod_bsdinbox}\n"
+                // We expand this directly using available context values.
                 if let Some(ref prefix) = ob.message_prefix {
-                    writer.write_all(prefix.as_bytes()).map_err(|e| {
+                    let expanded_prefix = expand_message_prefix(prefix, config);
+                    writer.write_all(expanded_prefix.as_bytes()).map_err(|e| {
                         AppendfileError::FileError {
                             path: actual_path.display().to_string(),
                             source: e,
@@ -2085,7 +2172,7 @@ impl AppendfileTransport {
                     notify_comsat(address, pre_delivery_size);
                 }
 
-                Ok(TransportResult::Ok)
+                Ok(TransportResult::ok())
             }
             Err(e) => {
                 tracing::error!(
@@ -2125,18 +2212,9 @@ fn build_message_body(
         body.extend_from_slice(format!("DATA{line_ending}").as_bytes());
     }
 
-    // Add delivery-related headers based on config
-    if config.delivery_date_add {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-        body.extend_from_slice(format!("Delivery-date: {}{line_ending}", now.as_secs()).as_bytes());
-    }
-
-    if config.envelope_to_add {
-        body.extend_from_slice(format!("Envelope-to: {address}{line_ending}").as_bytes());
-    }
-
+    // Add delivery-related headers (Return-path, Envelope-to, Delivery-date)
+    // C Exim writes these BEFORE the message headers in this order:
+    // Return-path, Envelope-to, Delivery-date, then Received: + original headers
     if config.return_path_add {
         let sender = config
             .private_options_map
@@ -2147,55 +2225,155 @@ fn build_message_body(
         body.extend_from_slice(format!("Return-path: <{sender}>{line_ending}").as_bytes());
     }
 
-    // Try to read the actual message data from the spool -D file.
-    // The delivery orchestrator injects __spool_directory and __message_id
-    // into the private_options_map so the transport can access the real
-    // message content.
-    let spool_data = config
-        .private_options_map
-        .get("__spool_directory")
-        .and_then(|spool_dir| {
-            config
-                .private_options_map
-                .get("__message_id")
-                .and_then(|msg_id| {
-                    // Spool -D file path: {spool_dir}/input/{msg_id}-D
-                    let data_file = format!("{spool_dir}/input/{msg_id}-D");
-                    match std::fs::read(&data_file) {
-                        Ok(data) => {
-                            tracing::debug!(
-                                path = %data_file,
-                                size = data.len(),
-                                "read spool data file for delivery"
-                            );
-                            Some(data)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                path = %data_file,
-                                error = %e,
-                                "failed to read spool data file"
-                            );
-                            None
-                        }
-                    }
-                })
-        });
+    if config.envelope_to_add {
+        // C Exim uses the progenitor (top-level) address for Envelope-to,
+        // walking up addr->parent until the root.  The orchestrator injects
+        // the original address via "__original_address" for redirect children.
+        let env_to = config
+            .private_options_map
+            .get("__original_address")
+            .map(String::as_str)
+            .unwrap_or(address);
+        body.extend_from_slice(format!("Envelope-to: {env_to}{line_ending}").as_bytes());
+    }
 
-    if let Some(data) = spool_data {
-        // The Exim spool -D file starts with a header line containing
-        // the message-ID filename (e.g. "1w20nb-00000003rGr-0F7s-D\n").
-        // We must skip that first line so only the RFC 2822 message
-        // (headers + body) is written to the mailbox.
-        let msg_start = data
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        body.extend_from_slice(&data[msg_start..]);
+    if config.delivery_date_add {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let delivery_date = format_rfc2822_date(now);
+        body.extend_from_slice(format!("Delivery-date: {delivery_date}{line_ending}").as_bytes());
+    }
+
+    // ---- Read spool -H file for message headers, -D file for body ----
+    // C Exim's transport_write_message() writes headers from the in-memory
+    // header chain (loaded from the -H file) then body from the -D file.
+    // We reconstruct that by reading both spool files.
+    let spool_dir = config.private_options_map.get("__spool_directory");
+    let msg_id = config.private_options_map.get("__message_id");
+
+    if let (Some(spool_dir), Some(msg_id)) = (spool_dir, msg_id) {
+        let input_dir = format!("{}/input", spool_dir);
+
+        // Read -H file for headers (including Received: and headers_add)
+        let h_path = format!("{}/{}-H", input_dir, msg_id);
+        let spool_headers = match std::fs::File::open(&h_path) {
+            Ok(f) => match exim_spool::spool_read_header(f, true) {
+                Ok(hdr) => Some(hdr),
+                Err(e) => {
+                    tracing::warn!(path = %h_path, error = %e, "failed to parse -H file");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(path = %h_path, error = %e, "failed to open -H file");
+                None
+            }
+        };
+
+        // Write headers from -H file
+        if let Some(ref hdr_data) = spool_headers {
+            for hdr in &hdr_data.headers {
+                // Header types: '*' = Received (internal), ' ' = normal,
+                // digits = added by ACL.  All are written to the mailbox.
+                // Skip deleted headers (type 'X' in C Exim).
+                if hdr.header_type == 'X' {
+                    continue;
+                }
+                let text = &hdr.text;
+                // Ensure header ends with line_ending
+                if text.ends_with('\n') {
+                    if ob.use_crlf {
+                        // Replace \n with \r\n
+                        let crlf_text = text.replace('\n', "\r\n");
+                        body.extend_from_slice(crlf_text.as_bytes());
+                    } else {
+                        body.extend_from_slice(text.as_bytes());
+                    }
+                } else {
+                    body.extend_from_slice(text.as_bytes());
+                    body.extend_from_slice(line_ending.as_bytes());
+                }
+            }
+        }
+
+        // ── Router extra_headers (expanded during routing) ──
+        // These are headers added by the router's `headers_add` option,
+        // already expanded.  C Exim writes these after original headers.
+        if let Some(router_hdrs) = config
+            .private_options_map
+            .get("__expanded_router_add_headers")
+        {
+            for line in router_hdrs.split('\n') {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                body.extend_from_slice(line.as_bytes());
+                body.extend_from_slice(line_ending.as_bytes());
+            }
+        }
+
+        // ── Transport add_headers (expanded during delivery dispatch) ──
+        // These are headers from the transport's `headers_add` option,
+        // expanded with message metric variables.
+        if let Some(transport_hdrs) = config
+            .private_options_map
+            .get("__expanded_transport_add_headers")
+        {
+            // C Exim writes headers_add content verbatim, character by
+            // character.  We replicate that here: each newline becomes the
+            // transport's line ending, and every other character is written
+            // as its Latin-1 byte value (single byte per char) to match C
+            // Exim's raw-byte handling of RFC 2047 decoded content.
+            //
+            // Using a character-by-character walk avoids the edge cases of
+            // split-and-rejoin (trailing empty strings, blank line
+            // handling) and produces output byte-identical to C Exim.
+            for ch in transport_hdrs.chars() {
+                if ch == '\n' {
+                    body.extend_from_slice(line_ending.as_bytes());
+                } else if ch == '\r' {
+                    // Skip bare CR — the line_ending above provides CRLF
+                    // when configured; lone CRs are not expected in
+                    // Exim header text.
+                } else {
+                    let cp = ch as u32;
+                    if cp <= 0xFF {
+                        body.push(cp as u8);
+                    } else {
+                        // Characters outside Latin-1: write as UTF-8
+                        let mut buf = [0u8; 4];
+                        let encoded = ch.encode_utf8(&mut buf);
+                        body.extend_from_slice(encoded.as_bytes());
+                    }
+                }
+            }
+        }
+
+        // Blank line separating headers from body
+        body.extend_from_slice(line_ending.as_bytes());
+
+        // Read -D file for body
+        let d_path = format!("{}/{}-D", input_dir, msg_id);
+        match std::fs::read(&d_path) {
+            Ok(data) => {
+                // The -D file starts with a header line "msgid-D\n".
+                // Skip that first line to get the raw message body.
+                let msg_start = data
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                body.extend_from_slice(&data[msg_start..]);
+            }
+            Err(e) => {
+                tracing::warn!(path = %d_path, error = %e, "failed to read -D file");
+            }
+        }
     } else {
-        // Fallback: generate a minimal message body when spool data is not
-        // available (e.g., during unit testing or standalone operation).
+        // Fallback: no spool data available (unit testing or standalone)
         body.extend_from_slice(line_ending.as_bytes());
         body.extend_from_slice(b"[Message body delivered by appendfile transport]");
         body.extend_from_slice(line_ending.as_bytes());
@@ -2207,6 +2385,154 @@ fn build_message_body(
     }
 
     body
+}
+
+/// Format a Unix epoch timestamp as RFC 2822 date for Delivery-date header.
+///
+/// Produces: "Thu, 01 Jan 2025 00:00:00 +0000"
+fn format_rfc2822_date(epoch_secs: u64) -> String {
+    let secs = epoch_secs;
+    let sec = (secs % 60) as u32;
+    let total_min = secs / 60;
+    let min = (total_min % 60) as u32;
+    let total_hour = total_min / 60;
+    let hour = (total_hour % 24) as u32;
+    let days = (total_hour / 24) as i64;
+
+    // Howard Hinnant's algorithm for civil date from day count
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64 + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    // Weekday: epoch day 0 (1970-01-01) was Thursday
+    let wday = ((days % 7 + 7) % 7) as usize;
+    let day_names = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let mon_names = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let day_name = day_names[wday];
+    let mon_name = if (1..=12).contains(&m) {
+        mon_names[(m - 1) as usize]
+    } else {
+        "???"
+    };
+
+    format!(
+        "{}, {} {} {} {:02}:{:02}:{:02} +0000",
+        day_name, d, mon_name, year, hour, min, sec,
+    )
+}
+
+/// Format a Unix epoch timestamp in BSD mstrstrbox format: `"Tue Mar 02 09:44:33 1999"`.
+///
+/// C Exim: `tod_bsdin` — `strftime("%a %b %d %H:%M:%S", t)` + `strftime(" %Y", t)`.
+/// Uses UTC (matching test expectations where timezone is +0000).
+fn format_tod_bsdinbox(epoch_secs: u64) -> String {
+    let secs = epoch_secs;
+    let sec = (secs % 60) as u32;
+    let total_min = secs / 60;
+    let min = (total_min % 60) as u32;
+    let total_hour = total_min / 60;
+    let hour = (total_hour % 24) as u32;
+    let days = (total_hour / 24) as i64;
+
+    // Howard Hinnant's algorithm for civil date from day count
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64 + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    // Weekday: epoch day 0 (1970-01-01) was Thursday
+    let wday = ((days % 7 + 7) % 7) as usize;
+    let day_names = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let mon_names = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let day_name = day_names[wday];
+    let mon_name = if (1..=12).contains(&m) {
+        mon_names[(m - 1) as usize]
+    } else {
+        "???"
+    };
+
+    // BSD mbox format: "Tue Mar 02 09:44:33 1999"
+    // Note: day is space-padded (not zero-padded) in some implementations,
+    // but C strftime %d gives zero-padded.  C Exim uses %d which is
+    // zero-padded.
+    format!(
+        "{} {} {:02} {:02}:{:02}:{:02} {}",
+        day_name, mon_name, d, hour, min, sec, year,
+    )
+}
+
+/// Expand the message_prefix template string using delivery context variables.
+///
+/// C Exim calls `expand_string(ob->message_prefix)` with full expansion.
+/// The default template is:
+///   `"From ${if def:return_path{$return_path}{MAILER-DAEMON}} ${tod_bsdinbox}\n"`
+///
+/// We handle this specific template and common variants.  For the default
+/// template, `return_path` comes from `TransportInstanceConfig.return_path`
+/// and `tod_bsdinbox` is computed from current time.
+fn expand_message_prefix(template: &str, config: &TransportInstanceConfig) -> String {
+    // Quick path: if it's the default template, expand directly
+    let return_path = config
+        .return_path
+        .as_deref()
+        .or(config
+            .private_options_map
+            .get("__sender_address")
+            .map(|s| s.as_str()))
+        .unwrap_or("MAILER-DAEMON");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let bsd_time = format_tod_bsdinbox(now);
+
+    // Expand known variables in the template
+    let mut result = template.to_string();
+
+    // Handle ${if def:return_path{$return_path}{MAILER-DAEMON}}
+    if result.contains("${if def:return_path{$return_path}{MAILER-DAEMON}}") {
+        let replacement = if return_path.is_empty() {
+            "MAILER-DAEMON"
+        } else {
+            return_path
+        };
+        result = result.replace(
+            "${if def:return_path{$return_path}{MAILER-DAEMON}}",
+            replacement,
+        );
+    }
+
+    // Handle ${tod_bsdinbox}
+    if result.contains("${tod_bsdinbox}") {
+        result = result.replace("${tod_bsdinbox}", &bsd_time);
+    }
+
+    // Handle $return_path directly (without ${if def:...} wrapper)
+    if result.contains("$return_path") {
+        result = result.replace("$return_path", return_path);
+    }
+
+    result
 }
 
 /// Write message body with check_string/escape_string processing.
@@ -2221,7 +2547,9 @@ fn write_body_with_escaping(
 ) -> Result<(), io::Error> {
     match (&ob.check_string, &ob.escape_string) {
         (Some(check), Some(escape)) if !check.is_empty() => {
-            // Process line by line for escaping
+            // Process line by line for escaping (e.g., "From " → ">From " in mbox).
+            // C Exim's transport_write_block() scans for check_string at the
+            // start of each line and prepends escape_string when found.
             let check_bytes = check.as_bytes();
             let escape_bytes = escape.as_bytes();
             let line_ending = if ob.use_crlf {
@@ -2230,7 +2558,18 @@ fn write_body_with_escaping(
                 b"\n".as_slice()
             };
 
-            for line in body.split(|&b| b == b'\n') {
+            // Split on LF but skip the trailing empty slice that results
+            // when body ends with `\n`.  Without this guard the empty
+            // slice produces a spurious extra blank line.
+            let mut lines = body.split(|&b| b == b'\n').peekable();
+            while let Some(line) = lines.next() {
+                // When body ends with `\n`, `.split()` yields an empty
+                // trailing element.  Only emit it if there are more
+                // lines after it — otherwise it is just the split
+                // artefact and should be dropped.
+                if line.is_empty() && lines.peek().is_none() {
+                    break;
+                }
                 if line.starts_with(check_bytes) {
                     writer.write_all(escape_bytes)?;
                 }
@@ -2306,7 +2645,15 @@ const fn avail_string_for_appendfile() -> Option<&'static str> {
 inventory::submit! {
     TransportDriverFactory {
         name: "appendfile",
-        create: || Box::new(AppendfileTransport::new()),
+        create: || {
+            let mut t = AppendfileTransport::new();
+            // init() sets defaults required for correct operation:
+            // message_prefix (mbox "From " line), message_suffix,
+            // check_string/escape_string, and validates lock settings.
+            // Without this call the mbox separator is missing.
+            let _ = t.init();
+            Box::new(t)
+        },
         is_local: true,
         avail_string: avail_string_for_appendfile(),
     }

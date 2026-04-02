@@ -275,8 +275,14 @@ pub struct ExpandContext {
     pub exim_version: Clean<String>,
 
     // ── ACL and Auth variable stores ────────────────────────────────────
+    /// ACL verify message (`$acl_verify_message`), set during verify
+    /// condition evaluation so that `message =` / `log_message =`
+    /// expansion can reference it.
+    pub acl_verify_message: String,
     /// ACL argument count.
     pub acl_narg: i32,
+    /// Positional ACL arguments (`$acl_arg1` .. `$acl_arg9`), set by `${if acl ...}`.
+    pub acl_args: Vec<String>,
 
     /// Connection-scoped ACL variables (acl_c*).
     pub acl_var_c: HashMap<String, String>,
@@ -340,6 +346,11 @@ pub struct ExpandContext {
     pub bounce_recipient: String,
     /// Bounce return size limit.
     pub bounce_return_size_limit: i32,
+    /// Headers charset (from config `headers_charset`, default "UTF-8").
+    /// Used by RFC 2047 encoding to select the charset label in encoded words.
+    pub headers_charset: String,
+    /// When true, escape operator shows top-bit chars as M-x instead of \NNN.
+    pub print_topbitchars: bool,
     /// Real GID of the calling process.
     pub caller_gid: u32,
     /// Real UID of the calling process.
@@ -442,6 +453,13 @@ pub struct ExpandContext {
     pub recipient_data: String,
     /// Recipient verify failure reason.
     pub recipient_verify_failure: String,
+    /// Reply address — computed from Reply-To or From header.
+    /// Set by post-DATA ACL evaluation after message headers are parsed.
+    pub reply_address: String,
+    /// Parsed message headers for `$h_name:` variable lookups.
+    /// Keys are lowercased header names (e.g. "subject", "from", "reply-to").
+    /// Values are the header values (trimmed, concatenated for duplicates).
+    pub header_list: std::collections::HashMap<String, String>,
     /// Regex cache size (internal diagnostic).
     pub regex_cachesize: i32,
     /// Return path for bounces.
@@ -504,6 +522,9 @@ pub struct ExpandContext {
     pub filter_thisaddress: String,
     /// Strict ACL variable mode (non-existent → error instead of empty).
     pub strict_acl_vars: bool,
+    /// Raw ACL definitions from config, keyed by ACL name.
+    /// Used by the `${if acl {...}}` expansion condition.
+    pub acl_definitions: HashMap<String, String>,
     /// Maximum expand_nstring index.
     pub expand_nmax: i32,
     /// Return size limit for bounces.
@@ -664,6 +685,13 @@ pub struct ExpandContext {
     /// Router-scoped variables (r_*).
     pub router_var: HashMap<String, String>,
 
+    /// Named lists from configuration (domain_list, host_list, etc.).
+    pub named_lists: HashMap<String, String>,
+
+    /// Named list types — maps list name to its type ("domain", "host",
+    /// "address", or "local_part") for typed listnamed_d/h/a/l validation.
+    pub named_list_types: HashMap<String, String>,
+
     // ── Regex variables (for content scan) ─────────────────────────────
     /// Regex capture variables ($regex1..$regex9).
     pub regex_vars: Vec<String>,
@@ -680,6 +708,16 @@ pub struct ExpandContext {
 
     /// Recipients list (multi-line format).
     pub recipients_list: String,
+
+    // ── Debug / tracing fields ─────────────────────────────────────────
+    /// When true, the expansion engine emits debug trace output to stderr
+    /// using the C Exim–compatible box-drawing format.
+    pub debug_expand: bool,
+    /// When true, use ASCII box-drawing characters instead of Unicode
+    /// (corresponding to C Exim's `+noutf8` debug selector).
+    pub debug_noutf8: bool,
+    /// Current expansion nesting depth (controls indentation in trace output).
+    pub expand_depth: usize,
 }
 
 impl ExpandContext {
@@ -724,7 +762,9 @@ impl ExpandContext {
             exim_gid: 0,
             exim_path: Clean::new(String::new()),
             exim_version: Clean::new(String::new()),
+            acl_verify_message: String::new(),
             acl_narg: 0,
+            acl_args: Vec::new(),
             acl_var_c: HashMap::new(),
             acl_var_m: HashMap::new(),
             auth_vars: Vec::new(),
@@ -751,6 +791,8 @@ impl ExpandContext {
             body_zerocount: 0,
             bounce_recipient: String::new(),
             bounce_return_size_limit: 0,
+            headers_charset: "UTF-8".to_string(),
+            print_topbitchars: false,
             caller_gid: 0,
             caller_uid: 0,
             callout_address: String::new(),
@@ -768,7 +810,7 @@ impl ExpandContext {
             initial_cwd: String::new(),
             inode: 0,
             interface_address: String::new(),
-            interface_port: 0,
+            interface_port: -1,
             item: String::new(),
             local_part_prefix: String::new(),
             local_part_prefix_v: String::new(),
@@ -802,6 +844,8 @@ impl ExpandContext {
             received_time: 0,
             recipient_data: String::new(),
             recipient_verify_failure: String::new(),
+            reply_address: String::new(),
+            header_list: std::collections::HashMap::new(),
             regex_cachesize: 0,
             return_path: String::new(),
             runrc: 0,
@@ -833,6 +877,7 @@ impl ExpandContext {
             filter_running: false,
             filter_thisaddress: String::new(),
             strict_acl_vars: false,
+            acl_definitions: HashMap::new(),
             expand_nmax: -1,
             return_size_limit: 0,
             warnmsg_delay: String::new(),
@@ -904,12 +949,17 @@ impl ExpandContext {
             xclient_name: String::new(),
             xclient_port: String::new(),
             router_var: HashMap::new(),
+            named_lists: HashMap::new(),
+            named_list_types: HashMap::new(),
             regex_vars: Vec::new(),
             recipient_prefix: String::new(),
             recipient_prefix_v: String::new(),
             recipient_suffix: String::new(),
             recipient_suffix_v: String::new(),
             recipients_list: String::new(),
+            debug_expand: false,
+            debug_noutf8: false,
+            expand_depth: 0,
         }
     }
 }
@@ -2661,7 +2711,40 @@ pub fn resolve_variable(
         }
     }
 
-    // ── 5. Table lookup via binary search ──────────────────────────────
+    // ── 5. Header variables ($h_name, $rh_name, $bh_name, $lh_name) ──
+    // Dynamic header references are not in the static VAR_TABLE because
+    // the header name part is user-defined.  Detect the well-known
+    // prefixes and delegate to resolve_header_lookup.
+    {
+        let lower = name.to_ascii_lowercase();
+        let header_prefixes: &[&str] = &[
+            "bheader_", "bh_", "header_", "h_", "lheader_", "lh_", "rheader_", "rh_",
+        ];
+        for prefix in header_prefixes {
+            if lower.starts_with(prefix) {
+                return resolve_header_lookup(name, ctx);
+            }
+        }
+    }
+
+    // ── 6. Numeric capture variables ($0..$9) ─────────────────────────
+    // In C Exim, $0 is the whole match and $1..$9 are captured groups
+    // from the most recent regex/match operation.  When no match is
+    // active, expand_nmax is -1 and all resolve to empty.
+    if name.len() == 1 {
+        if let Some(digit) = name.as_bytes().first() {
+            if digit.is_ascii_digit() {
+                let idx = (*digit - b'0') as usize;
+                if (idx as i32) <= ctx.expand_nmax && idx < ctx.expand_nstring.len() {
+                    return Ok((Some(ctx.expand_nstring[idx].clone()), TaintState::Tainted));
+                }
+                // No active match — return empty string (not an error).
+                return Ok((Some(String::new()), TaintState::Untainted));
+            }
+        }
+    }
+
+    // ── 7. Table lookup via binary search ──────────────────────────────
     match find_var_ent(name) {
         Some(entry) => resolve_var_entry(entry, ctx),
         None => {
@@ -2783,7 +2866,13 @@ fn resolve_var_entry(
         VarType::Todlogbare => Ok((Some(format_tod_logbare()), TaintState::Untainted)),
         VarType::Todzone => Ok((Some(format_tod_zone()), TaintState::Untainted)),
         VarType::Todzulu => Ok((Some(format_tod_zulu()), TaintState::Untainted)),
-        VarType::Reply => Ok((Some(String::new()), TaintState::Tainted)),
+        VarType::Reply => {
+            // In C Exim, $reply_address is computed from message headers
+            // (Reply-To > From > empty). The value is populated in
+            // ExpandContext by the post-DATA ACL handler.
+            let val = resolve_string_field(field_name, ctx);
+            Ok((Some(val), TaintState::Tainted))
+        }
         VarType::Cert => {
             let present = resolve_bool_field(field_name, ctx);
             Ok((
@@ -2843,6 +2932,8 @@ fn resolve_string_field(field: &str, ctx: &ExpandContext) -> String {
         "lookup_value" => ctx.lookup_value.clone(),
         "received_protocol" => ctx.received_protocol.clone(),
         "received_ip_address" => ctx.received_ip_address.clone(),
+        "reply_address" => ctx.reply_address.clone(),
+        "acl_verify_message" => ctx.acl_verify_message.clone(),
         "address_data" => ctx.address_data.clone(),
         "address_file" => ctx.address_file.clone(),
         "address_pipe" => ctx.address_pipe.clone(),
@@ -2950,6 +3041,18 @@ fn resolve_string_field(field: &str, ctx: &ExpandContext) -> String {
             format!("{secs}")
         }
         "tod_full" => format_tod_log(),
+        // Positional ACL arguments $acl_arg1 .. $acl_arg9
+        f if f.starts_with("acl_arg") => {
+            if let Ok(idx) = f[7..].parse::<usize>() {
+                if (1..=9).contains(&idx) {
+                    ctx.acl_args.get(idx - 1).cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        }
         _ => {
             tracing::trace!(field = field, "unrecognized string field, returning empty");
             String::new()
@@ -3166,10 +3269,41 @@ fn resolve_misc_module(
 
 /// Resolves a header-lookup variable ($h_*, $header_*, $rh_*, $bh_*, $lh_*).
 fn resolve_header_lookup(
-    _header_name: &str,
-    _ctx: &ExpandContext,
+    header_name: &str,
+    ctx: &ExpandContext,
 ) -> Result<(Option<String>, TaintState), ExpandError> {
-    Ok((Some(String::new()), TaintState::Tainted))
+    // Strip the prefix to get the raw header name.
+    // Prefixes: h_, header_, rh_, rheader_, bh_, bheader_, lh_, lheader_
+    let lower = header_name.to_ascii_lowercase();
+    let raw_name = if let Some(rest) = lower.strip_prefix("bheader_") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("rheader_") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("lheader_") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("header_") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("bh_") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("rh_") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("lh_") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("h_") {
+        rest
+    } else {
+        &lower
+    };
+
+    // Look up the header name in the parsed header list.
+    // C Exim's $h_subject: strips trailing whitespace and the colon is
+    // part of the variable syntax, not the header name.
+    let key = raw_name.trim_end_matches(':');
+    if let Some(val) = ctx.header_list.get(key) {
+        Ok((Some(val.clone()), TaintState::Tainted))
+    } else {
+        Ok((Some(String::new()), TaintState::Tainted))
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

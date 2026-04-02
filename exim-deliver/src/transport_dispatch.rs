@@ -1056,7 +1056,7 @@ fn encode_transport_result(result: &Result<TransportResult, String>) -> Vec<u8> 
     let mut buf = Vec::with_capacity(256);
 
     match result {
-        Ok(TransportResult::Ok) => {
+        Ok(TransportResult::Ok { .. }) => {
             buf.push(PIPE_RESULT_OK);
             buf.extend_from_slice(&0i32.to_be_bytes());
             buf.extend_from_slice(&0u16.to_be_bytes());
@@ -1118,7 +1118,7 @@ fn decode_transport_result(buf: &[u8]) -> TransportResult {
     };
 
     match result_code {
-        PIPE_RESULT_OK => TransportResult::Ok,
+        PIPE_RESULT_OK => TransportResult::ok(),
         PIPE_RESULT_DEFERRED => TransportResult::Deferred {
             message: if message_str.is_empty() {
                 None
@@ -1148,7 +1148,7 @@ fn decode_transport_result(buf: &[u8]) -> TransportResult {
 /// `message` and `basic_errno` fields.
 fn apply_transport_result(addr: &mut AddressItem, result: TransportResult) {
     match result {
-        TransportResult::Ok => {
+        TransportResult::Ok { .. } => {
             addr.message = None;
             addr.basic_errno = 0;
             tracing::debug!(address = %addr.address.as_ref(), "transport success");

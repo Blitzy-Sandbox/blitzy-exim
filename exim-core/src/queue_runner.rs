@@ -1051,6 +1051,10 @@ pub fn queue_run(
     );
     set_process_info("running queue");
 
+    // Write "Start queue run" to mainlog — matches C Exim format
+    let my_pid = nix::unistd::getpid().as_raw();
+    write_queue_mainlog(config, &format!("Start queue run: pid={}", my_pid));
+
     // Check system load if deliver_queue_load_max is set
     if cfg.deliver_queue_load_max >= 0 {
         // Read load average from /proc/loadavg (Linux) or equivalent
@@ -1266,9 +1270,78 @@ pub fn queue_run(
     let _ = close(pipe_read);
     let _ = close(pipe_write);
 
+    // Write "End queue run" to mainlog — matches C Exim format
+    write_queue_mainlog(config, &format!("End queue run: pid={}", my_pid));
+
     info!(delivered = total_delivered, "queue run complete");
 
     Ok(())
+}
+
+/// Write a line to the mainlog file for queue run logging.
+///
+/// Produces format: "YYYY-MM-DD HH:MM:SS message"
+fn write_queue_mainlog(config: &ConfigContext, message: &str) {
+    let cfg = config.get_config();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ts = format_queue_timestamp(now);
+    let line = format!("{} {}", ts, message);
+
+    if !cfg.log_file_path.is_empty() {
+        let mainlog = cfg.log_file_path.replace("%slog", "mainlog");
+        let log_dir = std::path::Path::new(&mainlog).parent();
+        if let Some(dir) = log_dir {
+            let _ = std::fs::create_dir_all(dir);
+            // Ensure log directory is accessible by exim user
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750));
+            }
+        }
+        // Use mode 0666 so both root and the exim setuid binary can
+        // append to the same mainlog file.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o666);
+        }
+        if let Ok(mut f) = opts.open(&mainlog) {
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+}
+
+/// Format a Unix epoch timestamp as "YYYY-MM-DD HH:MM:SS".
+fn format_queue_timestamp(epoch_secs: u64) -> String {
+    let secs = epoch_secs;
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+
+    // Civil date from Unix days (algorithm from Howard Hinnant)
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, m, d, hour, min, sec
+    )
 }
 
 /// Perform a one-time queue run, wrapping [`queue_run`] with the provided

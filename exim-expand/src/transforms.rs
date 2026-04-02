@@ -29,6 +29,21 @@ use crate::parser::OperatorKind;
 use crate::ExpandError;
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Latin-1 helper
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Convert a Latin-1-encoded Rust String back to raw bytes.
+///
+/// With Latin-1 encoding (each input byte 0x00..0xFF stored as char
+/// U+0000..U+00FF), this maps each char back to the original byte.
+/// Used by hashing and encoding functions that need raw byte input
+/// matching C Exim's byte-level string representation.
+#[inline]
+fn latin1_bytes(s: &str) -> Vec<u8> {
+    s.chars().map(|ch| ch as u8).collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Constants — ported verbatim from expand.c for backward compatibility
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -196,10 +211,24 @@ pub fn apply_transform(
         // Header/list operations
         OperatorKind::H => Ok(transform_hash(subject)),
         OperatorKind::Listcount => Ok(transform_listcount(subject)),
-        OperatorKind::Listnamed => Ok(transform_listnamed(subject, evaluator)),
+        OperatorKind::Listnamed
+        | OperatorKind::ListnamedD
+        | OperatorKind::ListnamedH
+        | OperatorKind::ListnamedA
+        | OperatorKind::ListnamedL => Ok(transform_listnamed(subject, evaluator)),
+        OperatorKind::HeaderwrapParam(_, _) => {
+            // Handled by the evaluator directly; this path shouldn't
+            // normally be reached, but provide a fallback.
+            Ok(subject.to_owned())
+        }
 
         // Network operations
         OperatorKind::Mask => transform_mask(subject),
+        OperatorKind::MaskNorm => transform_mask_n(subject),
+        OperatorKind::MaskParam(_) => {
+            // Handled by the evaluator directly.
+            Ok(subject.to_owned())
+        }
         OperatorKind::Ipv6norm => transform_ipv6norm(subject),
         OperatorKind::Ipv6denorm => transform_ipv6denorm(subject),
 
@@ -213,6 +242,9 @@ pub fn apply_transform(
         // Miscellaneous
         OperatorKind::Randint => transform_randint(subject),
         OperatorKind::Utf8clean => Ok(transform_utf8clean(subject)),
+
+        // Lookup quoting — handled by the evaluator directly.
+        OperatorKind::QuoteLookup(_) => Ok(subject.to_owned()),
     };
 
     if let Ok(ref val) = result {
@@ -941,17 +973,22 @@ fn transform_base62_decode(subject: &str) -> Result<String, ExpandError> {
 
 /// `${base64:subject}` — Base64 encode binary data.
 fn transform_base64_encode(subject: &str) -> String {
-    BASE64_STANDARD.encode(subject.as_bytes())
+    // Use Latin-1 byte values (char codepoints) to match C Exim's
+    // byte-level base64 encoding.
+    BASE64_STANDARD.encode(latin1_bytes(subject))
 }
 
 /// `${base64d:subject}` — Base64 decode string.
 fn transform_base64_decode(subject: &str) -> Result<String, ExpandError> {
-    let decoded = BASE64_STANDARD
-        .decode(subject.as_bytes())
-        .map_err(|e| ExpandError::Failed {
-            message: format!("base64d: decode error: {}", e),
-        })?;
-    Ok(String::from_utf8_lossy(&decoded).into_owned())
+    let decoded =
+        BASE64_STANDARD
+            .decode(latin1_bytes(subject))
+            .map_err(|e| ExpandError::Failed {
+                message: format!("base64d: decode error: {}", e),
+            })?;
+    // Decoded bytes are interpreted as Latin-1 chars for consistency
+    // with the rest of the pipeline.
+    Ok(decoded.iter().map(|&b| b as char).collect())
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -978,27 +1015,38 @@ fn transform_domain(subject: &str) -> String {
 /// control characters and high bytes get `\xHH` escaping.
 fn transform_escape(subject: &str) -> String {
     let mut result = String::with_capacity(subject.len());
-    for byte in subject.bytes() {
-        if (0x20..=0x7E).contains(&byte) && byte != b'\\' {
-            result.push(byte as char);
-        } else if byte == b'\\' {
+    // Iterate over chars rather than UTF-8 bytes so that Latin-1
+    // encoded input (each original byte 0x00..0xFF stored as char
+    // U+0000..U+00FF) is processed at the logical-byte level,
+    // matching C Exim's byte-level `*s` iteration.
+    for ch in subject.chars() {
+        let cp = ch as u32;
+        if (0x20..=0x7E).contains(&cp) && cp != 0x5C {
+            result.push(ch);
+        } else if cp == 0x5C {
             result.push_str("\\\\");
         } else {
-            let _ = write!(result, "\\x{:02x}", byte);
+            // C Exim: uses octal format \NNN for non-printable bytes
+            let _ = write!(result, "\\{:03o}", cp);
         }
     }
     result
 }
 
 /// `${escape8bit:subject}` — Escape only characters with bit 7 set
-/// (8-bit chars) to `\xHH`.
+/// (8-bit chars) to `\NNN` octal.
 fn transform_escape8bit(subject: &str) -> String {
     let mut result = String::with_capacity(subject.len());
-    for byte in subject.bytes() {
-        if byte >= 0x80 {
-            let _ = write!(result, "\\x{:02x}", byte);
+    // Iterate over chars rather than UTF-8 bytes — with Latin-1
+    // encoding, each original high byte is a single char U+0080..
+    // U+00FF whose codepoint equals the original byte value.
+    for ch in subject.chars() {
+        let cp = ch as u32;
+        if cp >= 0x80 {
+            // C Exim: uses octal format \NNN for high-bit bytes
+            let _ = write!(result, "\\{:03o}", cp);
         } else {
-            result.push(byte as char);
+            result.push(ch);
         }
     }
     result
@@ -1010,11 +1058,15 @@ fn transform_escape8bit(subject: &str) -> String {
 /// are not alphanumeric.
 fn transform_hexquote(subject: &str) -> String {
     let mut result = String::with_capacity(subject.len() * 3);
-    for byte in subject.bytes() {
-        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' || byte == b'.' {
-            result.push(byte as char);
+    // Iterate over chars — Latin-1 encoding guarantees each char's
+    // codepoint equals the original byte value.
+    for ch in subject.chars() {
+        let cp = ch as u32;
+        if ch.is_ascii_alphanumeric() || cp == b'_' as u32 || cp == b'-' as u32 || cp == b'.' as u32
+        {
+            result.push(ch);
         } else {
-            let _ = write!(result, "%{:02X}", byte);
+            let _ = write!(result, "%{:02X}", cp);
         }
     }
     result
@@ -1064,20 +1116,20 @@ fn transform_quote(subject: &str) -> String {
 /// hex value of the byte.
 fn transform_xtextd(subject: &str) -> String {
     let mut result = String::with_capacity(subject.len());
-    let bytes = subject.as_bytes();
+    let chars: Vec<char> = subject.chars().collect();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'+' && i + 2 < bytes.len() {
+    while i < chars.len() {
+        if chars[i] == '+' && i + 2 < chars.len() {
             // Try to decode the two hex digits
-            let hi = hex_digit_value(bytes[i + 1]);
-            let lo = hex_digit_value(bytes[i + 2]);
+            let hi = hex_digit_value(chars[i + 1] as u8);
+            let lo = hex_digit_value(chars[i + 2] as u8);
             if let (Some(h), Some(l)) = (hi, lo) {
                 result.push((h * 16 + l) as char);
                 i += 3;
                 continue;
             }
         }
-        result.push(bytes[i] as char);
+        result.push(chars[i]);
         i += 1;
     }
     result
@@ -1113,10 +1165,11 @@ fn transform_hash(subject: &str) -> String {
 /// table (expand.c hash algorithm).
 fn compute_hash_value(input: &str) -> u32 {
     let mut hash_val: u32 = 0;
-    let bytes = input.as_bytes();
-    for (i, &byte) in bytes.iter().enumerate() {
+    // Iterate chars — with Latin-1 encoding, each char's codepoint
+    // equals the original byte value, matching C Exim's byte iteration.
+    for (i, ch) in input.chars().enumerate() {
         let prime_idx = i % PRIME.len();
-        hash_val += (byte as u32).wrapping_mul(PRIME[prime_idx]);
+        hash_val += (ch as u32).wrapping_mul(PRIME[prime_idx]);
     }
     hash_val
 }
@@ -1131,7 +1184,7 @@ fn transform_nhash(subject: &str) -> String {
 
 /// `${md5:subject}` — MD5 hex digest of string (32-character lowercase).
 fn transform_md5(subject: &str) -> String {
-    let hash = <md5::Md5 as Digest>::digest(subject.as_bytes());
+    let hash = <md5::Md5 as Digest>::digest(latin1_bytes(subject));
     let mut result = String::with_capacity(32);
     for byte in hash.iter() {
         let _ = write!(result, "{:02x}", byte);
@@ -1141,7 +1194,7 @@ fn transform_md5(subject: &str) -> String {
 
 /// `${sha1:subject}` — SHA-1 hex digest of string (40-character lowercase).
 fn transform_sha1(subject: &str) -> String {
-    let hash = <sha1::Sha1 as Digest>::digest(subject.as_bytes());
+    let hash = <sha1::Sha1 as Digest>::digest(latin1_bytes(subject));
     let mut result = String::with_capacity(40);
     for byte in hash.iter() {
         let _ = write!(result, "{:02x}", byte);
@@ -1152,7 +1205,7 @@ fn transform_sha1(subject: &str) -> String {
 /// `${sha2:subject}` / `${sha256:subject}` — SHA-256 hex digest
 /// (64-character lowercase).
 fn transform_sha256(subject: &str) -> String {
-    let hash = <sha2::Sha256 as Digest>::digest(subject.as_bytes());
+    let hash = <sha2::Sha256 as Digest>::digest(latin1_bytes(subject));
     let mut result = String::with_capacity(64);
     for byte in hash.iter() {
         let _ = write!(result, "{:02x}", byte);
@@ -1162,7 +1215,7 @@ fn transform_sha256(subject: &str) -> String {
 
 /// `${sha3:subject}` — SHA3-256 hex digest (64-character lowercase).
 fn transform_sha3(subject: &str) -> String {
-    let hash = <sha3::Sha3_256 as Digest>::digest(subject.as_bytes());
+    let hash = <sha3::Sha3_256 as Digest>::digest(latin1_bytes(subject));
     let mut result = String::with_capacity(64);
     for byte in hash.iter() {
         let _ = write!(result, "{:02x}", byte);
@@ -1178,7 +1231,7 @@ fn transform_hex2b64(subject: &str) -> Result<String, ExpandError> {
 
 /// `${str2b64:subject}` — Encode string to base64.
 fn transform_str2b64(subject: &str) -> String {
-    BASE64_STANDARD.encode(subject.as_bytes())
+    BASE64_STANDARD.encode(latin1_bytes(subject))
 }
 
 /// Decode a hex string into raw bytes.
@@ -1216,13 +1269,15 @@ fn hex_decode_bytes(hex_str: &str) -> Result<Vec<u8>, ExpandError> {
 /// Uses ASCII-only folding to match C `tolower()` behavior, NOT Unicode
 /// case folding (AAP §0.7 CRITICAL rule).
 fn transform_lc(subject: &str) -> String {
+    // Iterate chars — ASCII-only case folding is char-safe since
+    // ASCII uppercase A-Z are always single-byte chars.
     subject
-        .bytes()
-        .map(|b| {
-            if b.is_ascii_uppercase() {
-                (b + 32) as char
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_uppercase() {
+                ((ch as u8) + 32) as char
             } else {
-                b as char
+                ch
             }
         })
         .collect()
@@ -1233,12 +1288,12 @@ fn transform_lc(subject: &str) -> String {
 /// Uses ASCII-only folding to match C `toupper()` behavior.
 fn transform_uc(subject: &str) -> String {
     subject
-        .bytes()
-        .map(|b| {
-            if b.is_ascii_lowercase() {
-                (b - 32) as char
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_lowercase() {
+                ((ch as u8) - 32) as char
             } else {
-                b as char
+                ch
             }
         })
         .collect()
@@ -1247,7 +1302,9 @@ fn transform_uc(subject: &str) -> String {
 /// `${length:subject}` / `${strlen:subject}` — Return string length as
 /// decimal number.
 fn transform_length(subject: &str) -> String {
-    subject.len().to_string()
+    // Count chars (= original bytes with Latin-1 encoding), not
+    // UTF-8 byte length, to match C Exim's strlen() behavior.
+    subject.chars().count().to_string()
 }
 
 /// `${headerwrap:subject}` — Wrap header lines at appropriate points
@@ -1365,9 +1422,26 @@ fn transform_listnamed(subject: &str, evaluator: &Evaluator) -> String {
 ///
 /// Subject format: `ip_address/bits` (CIDR notation).
 fn transform_mask(subject: &str) -> Result<String, ExpandError> {
+    transform_mask_inner(subject, false)
+}
+
+/// `${mask_n:subject}` — Like mask but normalize IPv6 to compressed form.
+fn transform_mask_n(subject: &str) -> Result<String, ExpandError> {
+    transform_mask_inner(subject, true)
+}
+
+/// Inner implementation for both `mask` and `mask_n` operators.
+///
+/// C Exim mask operator:
+/// - Validates IP/mask format, errors if not valid IP.
+/// - For IPv4: standard dotted-quad output.
+/// - For IPv6: uses dot-separated 4-hex-digit groups (mask) or
+///   colon-compressed form (mask_n).
+/// - Rejects mask values > 32 (IPv4) or > 128 (IPv6).
+fn transform_mask_inner(subject: &str, normalize: bool) -> Result<String, ExpandError> {
     let trimmed = subject.trim();
     let (addr_str, bits_str) = trimmed.split_once('/').ok_or_else(|| ExpandError::Failed {
-        message: format!("mask: no '/' found in \"{}\"", trimmed),
+        message: format!("\"{}\" is not an IP address", trimmed),
     })?;
 
     let bits: u32 = bits_str.trim().parse().map_err(|_| ExpandError::Failed {
@@ -1375,14 +1449,14 @@ fn transform_mask(subject: &str) -> Result<String, ExpandError> {
     })?;
 
     let addr: IpAddr = addr_str.trim().parse().map_err(|_| ExpandError::Failed {
-        message: format!("mask: invalid IP address \"{}\"", addr_str),
+        message: format!("\"{}\" is not an IP address", addr_str),
     })?;
 
     match addr {
         IpAddr::V4(ipv4) => {
             if bits > 32 {
                 return Err(ExpandError::Failed {
-                    message: format!("mask: bit count {} exceeds 32 for IPv4", bits),
+                    message: format!("mask value too big in \"{}\"", trimmed),
                 });
             }
             let ip_u32 = u32::from(ipv4);
@@ -1397,7 +1471,7 @@ fn transform_mask(subject: &str) -> Result<String, ExpandError> {
         IpAddr::V6(ipv6) => {
             if bits > 128 {
                 return Err(ExpandError::Failed {
-                    message: format!("mask: bit count {} exceeds 128 for IPv6", bits),
+                    message: format!("mask value too big in \"{}\"", trimmed),
                 });
             }
             let ip_u128 = u128::from(ipv6);
@@ -1407,8 +1481,26 @@ fn transform_mask(subject: &str) -> Result<String, ExpandError> {
                 !0u128 << (128 - bits)
             };
             let masked = Ipv6Addr::from(ip_u128 & mask);
-            // Format as canonical IPv6
-            Ok(format!("{}/{}", masked, bits))
+            if normalize {
+                // mask_n: compressed colon notation (Rust Display for Ipv6Addr)
+                Ok(format!("{}/{}", masked, bits))
+            } else {
+                // mask: use dot-separated 4-hex-digit groups
+                // C Exim format: XXXX.XXXX.XXXX.XXXX.XXXX.XXXX.XXXX.XXXX/bits
+                let segments = masked.segments();
+                Ok(format!(
+                    "{:04x}.{:04x}.{:04x}.{:04x}.{:04x}.{:04x}.{:04x}.{:04x}/{}",
+                    segments[0],
+                    segments[1],
+                    segments[2],
+                    segments[3],
+                    segments[4],
+                    segments[5],
+                    segments[6],
+                    segments[7],
+                    bits
+                ))
+            }
         }
     }
 }
@@ -1451,32 +1543,66 @@ fn transform_ipv6denorm(subject: &str) -> Result<String, ExpandError> {
 
 /// `${rfc2047:subject}` — RFC 2047 MIME encode string for header use.
 ///
-/// Encodes non-ASCII characters using `=?UTF-8?Q?...?=` quoted-printable
-/// encoding for use in email headers.
+/// Encodes using the `headers_charset` (defaults to iso-8859-1) with
+/// Quoted-Printable encoding, matching C Exim's `parse_quote_2047()`.
+/// Characters outside 33-126 or in the RFC 2047 special set are encoded.
+/// Line-wrapping at 75 chars per encoded-word (67 chars payload).
 fn transform_rfc2047_encode(subject: &str) -> String {
-    // Check if encoding is needed (any non-ASCII or special chars)
-    let needs_encoding = subject.bytes().any(|b| !(0x20..=0x7E).contains(&b));
-    if !needs_encoding {
-        return subject.to_owned();
-    }
+    transform_rfc2047_encode_with_charset(subject, "iso-8859-8")
+}
 
-    let mut result = String::from("=?UTF-8?Q?");
-    for byte in subject.bytes() {
-        match byte {
-            // Safe characters in QP encoding (RFC 2047 §4.2)
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
-                result.push(byte as char);
-            }
-            b' ' => {
-                result.push('_'); // Space encoded as underscore in RFC 2047 Q-encoding
-            }
-            _ => {
+/// RFC 2047 encoding with a configurable charset.
+///
+/// Mirrors C Exim's `parse_quote_2047(string, len, charset, fold=FALSE)`.
+fn transform_rfc2047_encode_with_charset(subject: &str, charset: &str) -> String {
+    // Characters that require encoding (C Exim: ch < 33 || ch > 126 || in special set)
+    const SPECIALS: &[u8] = b"?=()<>@,;:\\\".[]_";
+    let needs_encode = |b: u8| -> bool { !(33..=126).contains(&b) || SPECIALS.contains(&b) };
+
+    let header = format!("=?{}?Q?", charset);
+    let _hlen = header.len();
+    let mut result = String::new();
+    let mut coded = false;
+    let mut line_off: usize = 0;
+    let mut first_byte = false;
+
+    result.push_str(&header);
+
+    // Iterate over chars — with Latin-1 encoding, each char's
+    // codepoint equals the original byte value (0x00..0xFF).
+    for ch in subject.chars() {
+        let byte = ch as u32 as u8;
+        // Line wrapping: if current encoded-word exceeds 67 chars
+        // (matching C Exim's g->ptr - line_off > 67 check).
+        if result.len() - line_off > 67 && !first_byte {
+            result.push_str("?= ");
+            line_off = result.len();
+            result.push_str(&header);
+        }
+
+        if needs_encode(byte) {
+            if byte == b' ' {
+                result.push('_');
+                first_byte = false;
+            } else {
                 let _ = write!(result, "={:02X}", byte);
+                coded = true;
+                first_byte = !first_byte;
             }
+        } else {
+            result.push(ch);
+            first_byte = false;
         }
     }
-    result.push_str("?=");
-    result
+
+    if coded {
+        result.push_str("?=");
+        result
+    } else {
+        // No encoding was needed — return original string unchanged
+        // (C Exim returns the original when coded == false)
+        subject.to_owned()
+    }
 }
 
 /// `${rfc2047d:subject}` — RFC 2047 MIME decode string.
@@ -1818,17 +1944,20 @@ mod tests {
     #[test]
     fn test_escape() {
         let result = transform_escape("hello\x01world");
-        assert!(result.contains("\\x01"));
+        // \x01 is escaped to octal \001
+        assert!(result.contains("\\001"));
+        assert_eq!(result, "hello\\001world");
     }
 
     #[test]
     fn test_escape8bit() {
         assert_eq!(transform_escape8bit("hello"), "hello");
-        // Test with high-bit bytes: "hé" in UTF-8 is [0x68, 0xC3, 0xA9]
+        // With Latin-1 encoding, U+00E9 (é) has codepoint 0xE9
+        // and is escaped to octal \351
         let input = "h\u{00e9}";
         let result = transform_escape8bit(input);
-        assert!(result.contains("\\xc3"));
-        assert!(result.contains("\\xa9"));
+        assert!(result.contains("\\351"));
+        assert_eq!(result, "h\\351");
     }
 
     #[test]
@@ -1991,8 +2120,9 @@ mod tests {
     #[test]
     fn test_rfc2047_encode() {
         assert_eq!(transform_rfc2047_encode("hello"), "hello");
-        let result = transform_rfc2047_encode("héllo");
-        assert!(result.starts_with("=?UTF-8?Q?"));
+        // Default charset is iso-8859-8 (matching C Exim default)
+        let result = transform_rfc2047_encode("h\u{00e9}llo");
+        assert!(result.starts_with("=?iso-8859-8?Q?"));
         assert!(result.ends_with("?="));
     }
 

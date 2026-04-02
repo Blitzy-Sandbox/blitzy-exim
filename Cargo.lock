@@ -904,6 +904,7 @@ dependencies = [
  "exim-drivers",
  "exim-expand",
  "exim-ffi",
+ "exim-spool",
  "exim-store",
  "exim-tls",
  "libc",
@@ -967,6 +968,7 @@ version = "0.1.0"
 dependencies = [
  "exim-drivers",
  "exim-ffi",
+ "exim-spool",
  "exim-store",
  "inventory",
  "libc",

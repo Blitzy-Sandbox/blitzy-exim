@@ -43,6 +43,8 @@ use std::time::SystemTime;
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 
+use exim_expand::variables::ExpandContext;
+
 use crate::conditions::{
     acl_check_condition, acl_findcondition, AclCondition, AclConditionError, CsaResult,
     RateLimitEntry,
@@ -52,6 +54,50 @@ use crate::variables::{validate_varname, AclVarStore};
 use crate::verbs::{acl_warn, AclVerb};
 use crate::{AclResult, MessageContext};
 use exim_dns::DnsResolver;
+
+// =============================================================================
+// Verify-Recipient Callback Infrastructure
+// =============================================================================
+// In C Exim, `acl_verify_recipient()` calls `verify_address()` which invokes
+// the router chain.  The Rust workspace cannot have exim-acl depend on
+// exim-deliver (circular dependency), so we use a callback that the SMTP layer
+// provides.  The callback receives the recipient address and returns:
+//   - `Ok(VerifyRecipientResult)` with routing data (address_data, etc.)
+//   - `Err(String)` with a human-readable rejection reason.
+
+/// Result of a `verify = recipient` callback invocation.
+///
+/// This is returned for BOTH success and failure because C Exim's
+/// `copy_error()` in `verify.c` always propagates `address_data` from the
+/// address back to the verification address, regardless of the routing
+/// outcome.  ACL `message=` modifiers may reference `$address_data` even
+/// when verify fails.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyRecipientResult {
+    /// Address data from the last router that touched the address
+    /// (`$address_data`).  Present even on routing failure.
+    pub address_data: Option<String>,
+    /// Sender address data from the matching router (`$sender_address_data`).
+    pub sender_address_data: Option<String>,
+    /// Whether the address is local.
+    pub is_local: bool,
+    /// Whether routing succeeded (`true`) or failed (`false`).
+    pub routed: bool,
+    /// Human-readable rejection reason when routing fails.
+    pub fail_message: Option<String>,
+}
+
+/// Callback type for `verify = recipient` — invoked by the ACL engine when it
+/// encounters a `verify = recipient` condition.  The SMTP / delivery layer
+/// provides the implementation which runs the router chain.
+///
+/// Arguments: `(recipient_address, sender_address)`.
+///
+/// Returns a `VerifyRecipientResult`.  The `routed` field indicates success
+/// vs failure, and `address_data` is populated regardless of the outcome
+/// (matching C Exim's `copy_error()` behaviour).
+pub type VerifyRecipientCallback = Box<dyn Fn(&str, &str) -> VerifyRecipientResult + Send + Sync>;
+
 // Note: Tainted<T>, Clean<T>, and MessageArena are listed in the schema's
 // internal_imports for this module but are not directly consumed in engine.rs
 // itself. They are used by the caller to wrap ACL name strings for taint
@@ -59,6 +105,64 @@ use exim_dns::DnsResolver;
 // module for per-message allocation. The engine module's interface is
 // string-based (&str / Option<&str>) for ACL text, with taint enforcement
 // occurring at the call-site boundary.
+
+// =============================================================================
+// HDEBUG — Debug Output for `-bh` Host-Checking Mode
+// =============================================================================
+
+/// Write a HDEBUG line to stderr when host_checking mode is active.
+///
+/// In C Exim, the macro `HDEBUG(x)` expands to
+/// `if (host_checking || IS_DEBUG(x))` which means ALL debug output
+/// guarded by HDEBUG is produced during `-bh` sessions regardless of
+/// the `debug_selector` setting.  This function replicates that behavior
+/// by writing `>>> ` prefixed lines to stderr when `host_checking` is true.
+pub fn hdebug(host_checking: bool, msg: &str) {
+    if host_checking {
+        eprintln!(">>> {}", msg);
+    }
+}
+
+/// Write a HDEBUG line with indentation for sublist / nested list elements.
+///
+/// Replicates C Exim's `debug_vprintf()` indentation scheme (debug.c lines
+/// 259–272).  The `indent` parameter corresponds to `acl_level + expand_level`
+/// in C:
+///
+/// ```text
+/// For each full group of 4:  "   ╎"   (3 spaces + U+254E)
+/// Then indent % 4 remaining spaces.
+/// ```
+///
+/// Examples:
+/// - indent 0:  `>>> text`
+/// - indent 1:  `>>>  text`
+/// - indent 2:  `>>>   text`
+/// - indent 3:  `>>>    text`
+/// - indent 4:  `>>>    ╎text`        (one "   ╎" block + 0 extra)
+/// - indent 5:  `>>>    ╎ text`       (one "   ╎" block + 1 space)
+/// - indent 8:  `>>>    ╎   ╎text`    (two "   ╎" blocks + 0 extra)
+pub fn hdebug_indent(host_checking: bool, indent: usize, msg: &str) {
+    if !host_checking {
+        return;
+    }
+    let mut prefix = String::with_capacity(indent + 5);
+    prefix.push_str(">>> ");
+
+    // Full 4-unit blocks: each produces "   ╎"
+    let full_blocks = indent / 4;
+    for _ in 0..full_blocks {
+        prefix.push_str("   \u{254E}"); // 3 spaces + ╎ (U+254E)
+    }
+
+    // Remaining 0–3 spaces
+    let remainder = indent % 4;
+    for _ in 0..remainder {
+        prefix.push(' ');
+    }
+
+    eprintln!("{}{}", prefix, msg);
+}
 
 // =============================================================================
 // Constants
@@ -403,6 +507,37 @@ pub struct AclEvalContext {
 
     /// SMTP HELO/EHLO name from the client.
     pub sender_helo_name: String,
+
+    /// Whether we are in `-bh` host-checking mode.
+    /// When `true`, HDEBUG-style output (`>>> ...`) is written to stderr
+    /// for all host list checks, domain list checks, and ACL evaluation
+    /// steps, replicating the C macro `HDEBUG(x) if (host_checking || IS_DEBUG(x))`.
+    pub host_checking: bool,
+
+    /// Expansion context for variable substitution during ACL evaluation.
+    /// Carries state like `$address_data`, `$sender_address`, `$domain`,
+    /// `$local_part` etc. that ACL modifiers (`message =`, `log_message =`,
+    /// `set`) expand via `expand_string_with_context()`.  Updated by
+    /// conditions such as `verify = recipient` which populate
+    /// `$address_data` from the routing result.
+    pub expand_ctx: ExpandContext,
+
+    /// Optional callback for `verify = recipient`.  When set, the ACL
+    /// engine invokes this closure to route the recipient address through
+    /// the actual router chain (which lives in exim-deliver, not reachable
+    /// from exim-acl due to the workspace dependency DAG).  The SMTP layer
+    /// provides the closure, closing over the required ConfigContext and
+    /// router instances.
+    pub verify_recipient_cb: Option<VerifyRecipientCallback>,
+
+    /// Details of a sender verification failure.  Set by
+    /// `acl_verify_sender_via_cb()` when `verify = sender` routes the
+    /// sender address through the router chain and it fails.  The SMTP
+    /// layer reads this after ACL evaluation to emit the multi-line
+    /// "Verification failed for <addr>\n<reason>" prefix before the
+    /// final ACL `message =` text, matching C Exim's
+    /// `sender_verified_failed` behaviour.
+    pub sender_verify_failure: Option<(String, String)>,
 }
 
 impl Default for AclEvalContext {
@@ -428,6 +563,10 @@ impl Default for AclEvalContext {
             sender_rate_period: 0.0,
             client_ip: String::new(),
             sender_helo_name: String::new(),
+            host_checking: false,
+            expand_ctx: ExpandContext::default(),
+            verify_recipient_cb: None,
+            sender_verify_failure: None,
         }
     }
 }
@@ -436,6 +575,28 @@ impl AclEvalContext {
     /// Creates a new evaluation context with default settings.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Expands a string using this context's ExpandContext, providing access
+    /// to variables like `$address_data`, `$domain`, `$local_part` etc.
+    /// Falls back to the raw string on expansion failure.
+    pub fn expand_string(&mut self, s: &str) -> String {
+        // Fast path: no expansion characters → return as-is
+        if !s.contains('$') && !s.contains('\\') {
+            return s.to_string();
+        }
+        match exim_expand::expand_string_with_context(s, &mut self.expand_ctx) {
+            Ok(expanded) => expanded,
+            Err(exim_expand::ExpandError::ForcedFail) => String::new(),
+            Err(e) => {
+                warn!(
+                    input = %s,
+                    error = %e,
+                    "failed to expand ACL message/log_message"
+                );
+                s.to_string()
+            }
+        }
     }
 }
 
@@ -629,7 +790,10 @@ pub fn acl_read(
     source_line_base: i32,
 ) -> Result<Vec<AclBlock>, AclEngineError> {
     let mut blocks: Vec<AclBlock> = Vec::new();
-    let mut line_number = source_line_base;
+    // Subtract 1 because the loop increments line_number at the top before
+    // processing each line, so the first body line will get the correct
+    // absolute line number == source_line_base.
+    let mut line_number = source_line_base - 1;
 
     trace!(
         source = ?source_file,
@@ -923,10 +1087,18 @@ pub fn acl_check_internal(
     };
 
     // --- ACL expansion at top level (acl.c lines 4478–4489) ---
-    // At level 0, the ACL name string is expanded. In the full system this
-    // calls exim_expand::expand_string(). For the ACL engine module, the
-    // caller is responsible for expansion before calling this function.
-    let ss = acl_str.trim();
+    // At level 0, the ACL name string is expanded before lookup. This
+    // supports dynamic ACL names like:
+    //   acl_check_rcpt = acl_${sg{${tr{$sender_host_address}{.}{_}}}{...}{...}}
+    // At deeper recursion levels, the name is already expanded by the
+    // calling `acl` condition handler.
+    let expanded_buf: String;
+    let ss = if eval_ctx.acl_level == 0 {
+        expanded_buf = eval_ctx.expand_string(acl_str.trim());
+        expanded_buf.trim()
+    } else {
+        acl_str.trim()
+    };
 
     // --- ACL resolution (acl.c lines 4507–4579) ---
     // Single-token ACL name (no whitespace/newlines) → try named/file lookup.
@@ -952,6 +1124,8 @@ pub fn acl_check_internal(
             }
             let acl_name = format!("ACL \"{}\"", ss);
             debug!(acl = ss, "using named ACL");
+            // HDEBUG: "using ACL <name>"
+            hdebug(eval_ctx.host_checking, &format!("using ACL \"{}\"", ss));
             let result = evaluate_acl_blocks(
                 eval_ctx,
                 msg_ctx,
@@ -979,6 +1153,8 @@ pub fn acl_check_internal(
             }
             let acl_name = format!("ACL \"{}\"", ss);
             debug!(acl = ss, "using cached ACL");
+            // HDEBUG: "using ACL <name>"
+            hdebug(eval_ctx.host_checking, &format!("using ACL \"{}\"", ss));
             let result = evaluate_acl_blocks(
                 eval_ctx,
                 msg_ctx,
@@ -1116,6 +1292,32 @@ fn evaluate_acl_blocks(
         );
         eval_ctx.current_verb_name = Some(verb_desc);
 
+        // HDEBUG: "processing ACL check_recipient "accept" (TESTSUITE/test-config 20)"
+        // C format: "processing ACL %s \"%s\" (%s %d)"
+        //   - bare ACL name (no quotes, no "ACL " prefix)
+        //   - verb name in double quotes
+        //   - source file + line number in parentheses
+        {
+            let bare_acl_name = acl_name
+                .strip_prefix("ACL \"")
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(acl_name);
+            let location = format!(
+                "{}{}",
+                block.srcfile.as_deref().unwrap_or("<inline>"),
+                block.srcline.map(|l| format!(" {}", l)).unwrap_or_default()
+            );
+            hdebug(
+                eval_ctx.host_checking,
+                &format!(
+                    "processing ACL {} \"{}\" ({})",
+                    bare_acl_name,
+                    block.verb.name(),
+                    location
+                ),
+            );
+        }
+
         debug!(
             verb = block.verb.name(),
             conditions = block.conditions.len(),
@@ -1123,20 +1325,72 @@ fn evaluate_acl_blocks(
             "evaluating ACL verb"
         );
 
-        // --- Condition evaluation (acl.c lines 4600–4707) ---
+        // --- Condition evaluation (acl.c lines 3295–4230) ---
+        //
+        // CRITICAL: C Exim processes the condition list as follows:
+        //   • `message =` / `log_message =` / `endpass` are **modifiers** that
+        //     store the RAW argument and immediately `continue` to the next
+        //     condition.  They are always processed regardless of prior failures.
+        //   • All other conditions are evaluated normally.  On any non-OK result
+        //     the loop `break`s — subsequent conditions/modifiers are NOT reached.
+        //   • After the loop, the stored RAW `message =` / `log_message =` are
+        //     expanded ONCE using the current variable values (including
+        //     `$address_data` which may have been set by `verify = recipient`
+        //     during the loop).
+        //
+        // Reference: acl.c lines 3318-3327 (store raw, continue),
+        //            acl.c line 4229 (if rc != OK break),
+        //            acl.c lines 4248-4294 (post-loop expand).
         let mut all_conditions_ok = true;
         let mut endpass_seen = false;
-        let mut temp_user_msg: Option<String> = None;
-        let mut temp_log_msg: Option<String> = None;
         let mut condition_result = AclResult::Ok;
         let mut had_discard = false;
 
+        // RAW (unexpanded) message/log_message modifier arguments.
+        // Overwritten by each occurrence of the modifier (last one wins).
+        let mut raw_user_message: Option<String> = None;
+        let mut raw_log_message: Option<String> = None;
+
+        // Messages set directly by conditions (e.g. verify sets
+        // user_msg = "Unrouteable address" on failure).
+        let mut cond_user_msg: Option<String> = None;
+        let mut cond_log_msg: Option<String> = None;
+
         for cond in &block.conditions {
-            // Check for ENDPASS marker
+            // --- Modifiers: store raw and `continue` (acl.c 3318-3332) ---
             if cond.condition_type == AclCondition::Endpass {
                 endpass_seen = true;
                 trace!("endpass marker encountered");
                 continue;
+            }
+            if cond.condition_type == AclCondition::Message {
+                // Store the RAW argument — expanded after the loop.
+                raw_user_message = Some(cond.argument.clone());
+                if eval_ctx.host_checking {
+                    hdebug(true, &format!("  message: {}", cond.argument));
+                }
+                trace!(raw = %cond.argument, "message modifier: stored raw");
+                continue;
+            }
+            if cond.condition_type == AclCondition::LogMessage {
+                raw_log_message = Some(cond.argument.clone());
+                if eval_ctx.host_checking {
+                    hdebug(true, &format!("l_message: {}", cond.argument));
+                }
+                trace!(raw = %cond.argument, "log_message modifier: stored raw");
+                continue;
+            }
+
+            // --- Actual conditions: HDEBUG, evaluate, break on failure ---
+
+            // HDEBUG: "check <condition_name> = <arg>" before each condition
+            if eval_ctx.host_checking {
+                let cond_display = if cond.argument.is_empty() {
+                    format!("check {}", cond.condition_type.name())
+                } else {
+                    format!("check {} = {}", cond.condition_type.name(), cond.argument)
+                };
+                hdebug(true, &cond_display);
             }
 
             // Evaluate the condition
@@ -1146,8 +1400,8 @@ fn evaluate_acl_blocks(
                 var_store,
                 where_phase,
                 cond,
-                &mut temp_user_msg,
-                &mut temp_log_msg,
+                &mut cond_user_msg,
+                &mut cond_log_msg,
             );
 
             trace!(
@@ -1166,10 +1420,9 @@ fn evaluate_acl_blocks(
                     had_discard = true;
                 }
                 AclResult::Fail | AclResult::FailDrop => {
-                    // Condition failed
+                    // Condition failed → break (acl.c line 4229)
                     all_conditions_ok = false;
                     condition_result = cond_result;
-                    // After ENDPASS, failure terminates the verb
                     break;
                 }
                 AclResult::Defer => {
@@ -1180,10 +1433,109 @@ fn evaluate_acl_blocks(
                 }
                 AclResult::Error => {
                     // Hard error — propagate immediately
+                    let temp_user_msg = cond_user_msg;
+                    let temp_log_msg = cond_log_msg;
                     propagate_messages(&temp_user_msg, &temp_log_msg, user_msg, log_msg);
                     return AclResult::Error;
                 }
             }
+        }
+
+        // --- Post-loop message expansion (acl.c lines 4248–4294) ---
+        //
+        // C Exim expands stored raw `message=` / `log_message=` AFTER all
+        // conditions in the verb have been processed.  This deferred expansion
+        // is critical because variables like `$address_data` are set during
+        // `verify = recipient` routing, and the message modifier must see the
+        // updated values.
+        //
+        // `msgcond[]` in C determines for which result codes messages are
+        // relevant:
+        //   ACL_ACCEPT  → OK | FAIL | FAIL_DROP
+        //   ACL_DENY    → OK
+        //   ACL_DEFER   → OK
+        //   ACL_DISCARD → OK | FAIL | FAIL_DROP
+        //   ACL_DROP    → OK
+        //   ACL_REQUIRE → FAIL | FAIL_DROP
+        //   ACL_WARN    → OK
+        let effective_result = if all_conditions_ok {
+            if had_discard {
+                AclResult::Discard
+            } else {
+                AclResult::Ok
+            }
+        } else {
+            condition_result
+        };
+
+        // C: if (*epp && rc == OK) user_message = NULL;
+        if endpass_seen && effective_result == AclResult::Ok {
+            raw_user_message = None;
+        }
+
+        let should_expand_messages = match block.verb {
+            AclVerb::Accept => matches!(
+                effective_result,
+                AclResult::Ok | AclResult::Fail | AclResult::FailDrop | AclResult::Discard
+            ),
+            AclVerb::Deny | AclVerb::Defer | AclVerb::Drop => effective_result == AclResult::Ok,
+            AclVerb::Discard => matches!(
+                effective_result,
+                AclResult::Ok | AclResult::Fail | AclResult::FailDrop | AclResult::Discard
+            ),
+            AclVerb::Require => matches!(effective_result, AclResult::Fail | AclResult::FailDrop),
+            AclVerb::Warn => effective_result == AclResult::Ok,
+        };
+
+        // Build the final temp_user_msg / temp_log_msg that the verb
+        // dispatch code will propagate.
+        let mut temp_user_msg: Option<String> = cond_user_msg.clone();
+        let mut temp_log_msg: Option<String> = cond_log_msg.clone();
+
+        if should_expand_messages {
+            let old_user_msg = cond_user_msg;
+            let old_log_msg = cond_log_msg.or_else(|| old_user_msg.clone());
+
+            // For WARN or accept/discard with OK: discard condition-generated
+            // messages — only explicit `message =` survives (acl.c ~4262).
+            if block.verb == AclVerb::Warn
+                || (effective_result == AclResult::Ok
+                    && matches!(block.verb, AclVerb::Accept | AclVerb::Discard))
+            {
+                temp_user_msg = None;
+                temp_log_msg = None;
+            }
+
+            // Expand the stored raw `message =` (acl.c ~4266–4276).
+            if let Some(ref raw) = raw_user_message {
+                // In C, acl_verify_message is set to old_user_msgptr before
+                // expansion so that $acl_verify_message is available.
+                eval_ctx.expand_ctx.acl_verify_message = old_user_msg.unwrap_or_default();
+                let expanded = eval_ctx.expand_string(raw);
+                if !expanded.is_empty() {
+                    temp_user_msg = Some(expanded);
+                }
+            }
+
+            // Expand the stored raw `log_message =` (acl.c ~4279–4291).
+            if let Some(ref raw) = raw_log_message {
+                eval_ctx.expand_ctx.acl_verify_message = old_log_msg.unwrap_or_default();
+                let expanded = eval_ctx.expand_string(raw);
+                if !expanded.is_empty() {
+                    temp_log_msg = match temp_log_msg {
+                        None => Some(expanded.clone()),
+                        Some(existing) => Some(format!("{}: {}", expanded, existing)),
+                    };
+                }
+            }
+
+            // Default: if no log message, use user message (acl.c ~4294).
+            if temp_log_msg.is_none() {
+                temp_log_msg = temp_user_msg.clone();
+            }
+
+            // Clear acl_verify_message after expansion.
+            eval_ctx.expand_ctx.acl_verify_message.clear();
         }
 
         // --- Verb result dispatch (acl.c lines 4710–4770) ---
@@ -1196,6 +1548,23 @@ fn evaluate_acl_blocks(
                 result = ?verb_result,
                 "all conditions passed"
             );
+
+            // HDEBUG: "accept: condition test succeeded in ACL check_recipient"
+            // C format uses bare ACL name (no quotes).
+            {
+                let bare = acl_name
+                    .strip_prefix("ACL \"")
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(acl_name);
+                hdebug(
+                    eval_ctx.host_checking,
+                    &format!(
+                        "{}: condition test succeeded in ACL {}",
+                        block.verb.name(),
+                        bare
+                    ),
+                );
+            }
 
             // WARN verb: call acl_warn() and continue to next verb
             if block.verb == AclVerb::Warn {
@@ -1221,6 +1590,27 @@ fn evaluate_acl_blocks(
                         "QUIT or not-QUIT ACL may not fail"
                     );
                     return AclResult::Ok;
+                }
+
+                // HDEBUG: "end of ACL check_recipient: ACCEPT"
+                // C format uses bare ACL name (no quotes).
+                let result_label = match verb_result {
+                    AclResult::Ok => "ACCEPT",
+                    AclResult::Fail => "DENY",
+                    AclResult::Defer => "DEFER",
+                    AclResult::Discard => "DISCARD",
+                    AclResult::FailDrop => "DROP",
+                    AclResult::Error => "ERROR",
+                };
+                {
+                    let bare = acl_name
+                        .strip_prefix("ACL \"")
+                        .and_then(|s| s.strip_suffix('"'))
+                        .unwrap_or(acl_name);
+                    hdebug(
+                        eval_ctx.host_checking,
+                        &format!("end of ACL {}: {}", bare, result_label),
+                    );
                 }
 
                 return verb_result;
@@ -1256,13 +1646,47 @@ fn evaluate_acl_blocks(
                 "conditions failed: continuing to next verb"
             );
 
+            // HDEBUG: "accept: condition test failed in ACL check_recipient"
+            {
+                let bare = acl_name
+                    .strip_prefix("ACL \"")
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(acl_name);
+                hdebug(
+                    eval_ctx.host_checking,
+                    &format!(
+                        "{}: condition test failed in ACL {}",
+                        block.verb.name(),
+                        bare
+                    ),
+                );
+            }
+
+            // Propagate message/log_message modifiers even when conditions
+            // fail.  In C Exim, `message =` directly sets `*user_msgptr`
+            // (the output parameter) during condition evaluation, so the
+            // custom message is available regardless of whether the verb
+            // succeeds or fails.  The Rust code uses a per-verb temp
+            // variable, so we must copy it to the output here to match C
+            // behavior.  The last verb to set a message wins.
+            propagate_messages(&temp_user_msg, &temp_log_msg, user_msg, log_msg);
+
             // For REQUIRE verb, condition failure always terminates
             if block.verb == AclVerb::Require {
-                propagate_messages(&temp_user_msg, &temp_log_msg, user_msg, log_msg);
-
                 if condition_result == AclResult::Defer {
                     eval_ctx.acl_temp_details = true;
                     return AclResult::Defer;
+                }
+                // HDEBUG: "end of ACL check_recipient: DENY"
+                {
+                    let bare = acl_name
+                        .strip_prefix("ACL \"")
+                        .and_then(|s| s.strip_suffix('"'))
+                        .unwrap_or(acl_name);
+                    hdebug(
+                        eval_ctx.host_checking,
+                        &format!("end of ACL {}: DENY", bare),
+                    );
                 }
                 return AclResult::Fail;
             }
@@ -1271,6 +1695,16 @@ fn evaluate_acl_blocks(
 
     // No verb terminated — implicit DENY (acl.c line 4770)
     debug!(acl = acl_name, "end of ACL reached: implicit DENY");
+    {
+        let bare = acl_name
+            .strip_prefix("ACL \"")
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(acl_name);
+        hdebug(
+            eval_ctx.host_checking,
+            &format!("end of ACL {}: implicit DENY", bare),
+        );
+    }
     AclResult::Fail
 }
 
@@ -1326,16 +1760,71 @@ fn evaluate_single_condition(
         return AclResult::Ok;
     }
 
-    // --- Message modifier: capture argument as user message ---
-    if cond.condition_type == AclCondition::Message {
-        *user_msg = Some(cond.argument.clone());
-        return AclResult::Ok;
-    }
+    // NOTE: message= and log_message= modifiers are handled directly in the
+    // condition loop in acl_check_internal() — they store the RAW argument
+    // and are expanded after the loop completes (matching C acl.c behavior).
+    // They should never reach this function.
 
-    // --- Log_message modifier: capture argument as log message ---
-    if cond.condition_type == AclCondition::LogMessage {
-        *log_msg = Some(cond.argument.clone());
-        return AclResult::Ok;
+    // --- Nested ACL condition (`acl = <name> [args]`) (acl.c ~4597–4632) ---
+    // The `acl` condition must be handled here in the engine because it
+    // requires recursive `acl_check_internal()` / `acl_check_wargs()` which
+    // need `AclEvalContext` (not available in `conditions.rs`).
+    if cond.condition_type == AclCondition::Acl {
+        // Expand the argument to get the ACL name and optional positional args
+        let expanded_arg = eval_ctx.expand_string(&cond.argument);
+        // The format is: "acl_name arg1 arg2 ..." or just "acl_name"
+        // or it can be a file path "/some/acl.file"
+        let parts: Vec<&str> = expanded_arg.splitn(2, char::is_whitespace).collect();
+        let acl_name = parts[0];
+        let args_str = if parts.len() > 1 { parts[1] } else { "" };
+
+        // Collect positional arguments (space-separated)
+        let args: Vec<&str> = if args_str.is_empty() {
+            Vec::new()
+        } else {
+            args_str.split_whitespace().collect()
+        };
+
+        let acl_result = if args.is_empty() {
+            // Simple nested ACL — call acl_check_internal recursively
+            eval_ctx.acl_level += 1;
+            let result = acl_check_internal(
+                eval_ctx,
+                msg_ctx,
+                var_store,
+                where_phase,
+                Some(acl_name),
+                user_msg,
+                log_msg,
+            );
+            eval_ctx.acl_level -= 1;
+            result
+        } else {
+            // Nested ACL with positional args — call acl_check_wargs
+            let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            acl_check_wargs(
+                eval_ctx,
+                msg_ctx,
+                var_store,
+                where_phase,
+                acl_name,
+                &string_args,
+                user_msg,
+                log_msg,
+            )
+        };
+
+        // Apply negation per standard condition handling
+        let final_result = if cond.negated {
+            match acl_result {
+                AclResult::Ok => AclResult::Fail,
+                AclResult::Fail => AclResult::Ok,
+                other => other,
+            }
+        } else {
+            acl_result
+        };
+        return final_result;
     }
 
     // --- Phase restriction check using the forbids bitmask (acl.c ~4549) ---
@@ -1390,6 +1879,12 @@ fn evaluate_single_condition(
         &mut eval_ctx.sender_rate_period,
         &eval_ctx.client_ip,
         &eval_ctx.sender_helo_name,
+        eval_ctx.host_checking,
+        eval_ctx.verify_recipient_cb.as_ref(),
+        &mut eval_ctx.expand_ctx,
+        user_msg,
+        log_msg,
+        &mut eval_ctx.sender_verify_failure,
     );
 
     match result {

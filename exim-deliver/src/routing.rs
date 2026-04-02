@@ -393,6 +393,10 @@ fn validate_router_references(routers: &[RouterInstance]) -> Result<(), RoutingE
 ///   the portion of `local_part` matched by the `*` wildcard (0 if no wildcard).
 /// * `None` — No prefix matched.
 pub fn route_check_prefix(local_part: &str, prefixes: &str) -> Option<(usize, usize)> {
+    // C Exim's route_check_prefix() uses strncmpic() — case-insensitive
+    // comparison — for both wildcard and exact prefix matching.
+    let lp_lower = local_part.to_ascii_lowercase();
+
     for pattern in prefixes.split(':') {
         let pattern = pattern.trim();
         if pattern.is_empty() {
@@ -407,7 +411,19 @@ pub fn route_check_prefix(local_part: &str, prefixes: &str) -> Option<(usize, us
                 // Pattern is just "*" — matches zero-length prefix
                 return Some((0, 0));
             }
-            if let Some(pos) = local_part.find(suffix_part) {
+            let sp_lower = suffix_part.to_ascii_lowercase();
+            // Search from the END of the string backwards (C Exim scans
+            // rightward from `local_part + len - plen`, effectively matching
+            // the rightmost occurrence that still leaves a non-empty local
+            // part).  We replicate by scanning left-to-right through all
+            // occurrences and returning the last one that leaves at least one
+            // char remaining.  However, C Exim scans from the far right and
+            // returns the FIRST match it finds (rightmost).  We use rfind to
+            // get the rightmost occurrence.
+            // Actually, C code iterates `p` from `local_part + Ustrlen(local_part) - (--plen)`
+            // down to `local_part`.  It returns the first match from the right.
+            // We replicate with rfind on the lowercased strings.
+            if let Some(pos) = lp_lower.rfind(&sp_lower) {
                 let total_matched = pos + suffix_part.len();
                 // Ensure the match leaves at least one character for the local part
                 if total_matched < local_part.len() {
@@ -415,8 +431,9 @@ pub fn route_check_prefix(local_part: &str, prefixes: &str) -> Option<(usize, us
                 }
             }
         } else {
-            // Exact prefix match (no wildcard)
-            if local_part.starts_with(pattern) && pattern.len() < local_part.len() {
+            // Exact prefix match (no wildcard) — case-insensitive
+            let pat_lower = pattern.to_ascii_lowercase();
+            if lp_lower.starts_with(&pat_lower) && pattern.len() < local_part.len() {
                 return Some((pattern.len(), 0));
             }
         }
@@ -447,6 +464,11 @@ pub fn route_check_prefix(local_part: &str, prefixes: &str) -> Option<(usize, us
 ///   `wildcard_len` is the portion matched by the `*` wildcard.
 /// * `None` — No suffix matched.
 pub fn route_check_suffix(local_part: &str, suffixes: &str) -> Option<(usize, usize)> {
+    // C Exim's route_check_suffix() uses strncmpic() — case-insensitive
+    // comparison — for both wildcard and exact suffix matching.
+    let lp_lower = local_part.to_ascii_lowercase();
+    let alen = local_part.len();
+
     for pattern in suffixes.split(':') {
         let pattern = pattern.trim();
         if pattern.is_empty() {
@@ -455,21 +477,37 @@ pub fn route_check_suffix(local_part: &str, suffixes: &str) -> Option<(usize, us
 
         if let Some(prefix_part) = pattern.strip_suffix('*') {
             // Wildcard at end: <fixed_prefix>*
+            // C code: scans `p` from `local_part` to `local_part + alen - slen + 1`
+            //   checking strncmpic(suffix, p, slen).  Returns total = alen - (p - local_part).
             if prefix_part.is_empty() {
                 return Some((0, 0));
             }
-            if let Some(pos) = local_part.rfind(prefix_part) {
-                let suffix_len = local_part.len() - pos;
-                let wildcard_len = local_part.len() - pos - prefix_part.len();
-                // Ensure the match leaves at least one character for the local part
-                if pos > 0 {
-                    return Some((suffix_len, wildcard_len));
+            let pp_lower = prefix_part.to_ascii_lowercase();
+            let slen = prefix_part.len();
+            // Scan from left (pos 0) up to alen - slen (inclusive)
+            if alen > slen {
+                for pos in 0..=(alen - slen) {
+                    if lp_lower[pos..].starts_with(&pp_lower) {
+                        let tlen = alen - pos;
+                        let wildcard_len = tlen - slen;
+                        return Some((tlen, wildcard_len));
+                    }
                 }
+            } else if alen == slen && lp_lower == pp_lower {
+                // Exact match — but leaves nothing for local part (C requires
+                // alen > slen for the non-wildcard branch; the wildcard branch
+                // would match tlen == alen which is the whole string).
+                // C code: pend = local_part + alen - slen + 1 = local_part + 1
+                // so p iterates from local_part[0] only — pos=0, tlen = alen.
+                // That strips the entire local part, which C allows for wildcard suffixes.
+                return Some((alen, 0));
             }
         } else {
-            // Exact suffix match (no wildcard)
-            if local_part.ends_with(pattern) && pattern.len() < local_part.len() {
-                return Some((pattern.len(), 0));
+            // Exact suffix match (no wildcard) — case-insensitive
+            let pat_lower = pattern.to_ascii_lowercase();
+            let slen = pattern.len();
+            if alen > slen && lp_lower[alen - slen..] == pat_lower[..] {
+                return Some((slen, 0));
             }
         }
     }
@@ -513,6 +551,21 @@ fn match_in_list(
             match_named_list(&val, list_name.trim(), caseless, config)?
         } else if pattern == "*" {
             true
+        } else if pattern.starts_with('^') {
+            // Regex pattern (C Exim: items starting with '^' are PCRE regexes).
+            // Build the regex with case-insensitive flag if caseless.
+            let re_str = if caseless {
+                format!("(?i){}", pattern)
+            } else {
+                pattern.to_string()
+            };
+            match regex::Regex::new(&re_str) {
+                Ok(re) => re.is_match(&val),
+                Err(e) => {
+                    tracing::warn!(pattern = %pattern, error = %e, "invalid regex in list");
+                    false
+                }
+            }
         } else {
             let pat = if caseless {
                 pattern.to_ascii_lowercase()
@@ -1538,13 +1591,22 @@ pub fn route_address(
             }
         }
 
-        // ── Prefix/suffix stripping ────────────────────────────────────
+        // ── Local-part case folding (C Exim route.c line 1658) ────────
+        // C Exim stores both cc_local_part (caseful) and lc_local_part
+        // (lowercased) and selects the appropriate one per-router based on
+        // the caseful_local_part setting.  By default, the lowercased form
+        // is used for prefix/suffix matching and downstream $local_part
+        // expansion.  We replicate that here.
         let original_local_part = addr.local_part.clone();
+        if !router_inst.config().caseful_local_part {
+            addr.local_part = addr.local_part.to_ascii_lowercase();
+        }
         let mut prefix_len = 0usize;
         let mut suffix_len = 0usize;
 
         if let Some(ref prefix_list) = router_inst.config().prefix {
-            if let Some((plen, _wlen)) = route_check_prefix(&addr.local_part, prefix_list) {
+            let result = route_check_prefix(&addr.local_part, prefix_list);
+            if let Some((plen, _wlen)) = result {
                 prefix_len = plen;
             } else if !router_inst.config().prefix_optional {
                 // Required prefix not found — skip this router
@@ -1555,7 +1617,8 @@ pub fn route_address(
         }
 
         if let Some(ref suffix_list) = router_inst.config().suffix {
-            if let Some((slen, _wlen)) = route_check_suffix(&addr.local_part, suffix_list) {
+            let result = route_check_suffix(&addr.local_part, suffix_list);
+            if let Some((slen, _wlen)) = result {
                 suffix_len = slen;
             } else if !router_inst.config().suffix_optional {
                 tracing::debug!(router = %rname, "required suffix not matched, skipping");
@@ -1684,9 +1747,14 @@ pub fn route_address(
                     }
                 }
 
-                // Copy extra headers
+                // Copy extra headers — use context-aware expansion so that
+                // $local_user_uid / $local_user_gid resolve to the passwd
+                // values found by check_local_user.
                 if let Some(ref extra) = router_inst.config().extra_headers {
-                    match expand_string(extra) {
+                    let mut exp_ctx = exim_expand::variables::ExpandContext::new();
+                    exp_ctx.local_user_uid = addr.uid;
+                    exp_ctx.local_user_gid = addr.gid;
+                    match exim_expand::expand_string_with_context(extra, &mut exp_ctx) {
                         Ok(expanded) if !expanded.is_empty() => {
                             addr.prop.extra_headers = Some(expanded);
                         }
@@ -1838,6 +1906,14 @@ pub fn route_address(
                         (new_addr_str.clone(), String::new())
                     };
 
+                    // Track the original top-level address so the
+                    // delivery log can display it in angle brackets
+                    // (C Exim: addr->onetime_parent).
+                    let original = addr
+                        .onetime_parent
+                        .clone()
+                        .unwrap_or_else(|| addr.address.as_ref().to_string());
+
                     let new_item = AddressItem {
                         address: Tainted::new(new_addr_str.clone()),
                         domain: dom,
@@ -1859,6 +1935,9 @@ pub fn route_address(
                         return_path: addr.return_path.clone(),
                         uid: 0,
                         gid: 0,
+                        prefix: None,
+                        suffix: None,
+                        onetime_parent: Some(original),
                         unique: new_addr_str.to_ascii_lowercase(),
                         parent_index: 0,
                         children: Vec::new(),

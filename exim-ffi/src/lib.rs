@@ -331,6 +331,111 @@ pub fn get_login_name() -> Option<String> {
     }
 }
 
+/// Retrieve the real name (GECOS field) of the current process user.
+///
+/// This reads the `pw_gecos` field from the system passwd database
+/// for the calling process's UID.  If the GECOS field contains
+/// comma-separated sub-fields, only the first (full name) is returned.
+///
+/// Returns `None` if the user cannot be looked up.
+pub fn get_real_name() -> Option<String> {
+    // SAFETY: getuid() is a simple syscall returning the process UID.
+    // getpwuid() returns a pointer to a static struct passwd which is
+    // valid until the next call to getpwuid/getpwnam in this thread.
+    // We copy the gecos string immediately and do not retain the pointer.
+    unsafe {
+        let uid = libc::getuid();
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            return None;
+        }
+        let gecos = std::ffi::CStr::from_ptr((*pw).pw_gecos);
+        let full = gecos.to_str().ok()?.to_string();
+        // GECOS may have comma-separated fields; use only the first.
+        Some(full.split(',').next().unwrap_or("").to_string())
+    }
+}
+
+/// Performs a reverse DNS lookup of the given IP address string using
+/// libc's `getnameinfo`.  Returns `Some(hostname)` on success or `None`
+/// if the lookup fails or only returns a numeric address.
+///
+/// # Safety justification
+/// The `unsafe` block calls `getnameinfo`, a standard POSIX function, with
+/// stack-allocated `sockaddr_in`/`sockaddr_in6` structs whose lifetimes
+/// exceed the call.
+pub fn reverse_lookup(address: &str) -> Option<String> {
+    use std::ffi::CStr;
+
+    let addr: std::net::IpAddr = address.parse().ok()?;
+
+    let mut host_buf = [0u8; 256];
+
+    let rc = match addr {
+        std::net::IpAddr::V4(v4) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: We pass a valid stack-allocated sockaddr_in with correct
+            // length to getnameinfo. The buffer is stack-allocated and large
+            // enough. getnameinfo only reads from the sockaddr and writes to
+            // the host buffer.
+            unsafe {
+                libc::getnameinfo(
+                    &sin as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    host_buf.as_mut_ptr() as *mut libc::c_char,
+                    host_buf.len() as libc::socklen_t,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                )
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.octets(),
+                },
+                sin6_scope_id: 0,
+            };
+            // SAFETY: Same justification as IPv4 case above.
+            unsafe {
+                libc::getnameinfo(
+                    &sin6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    host_buf.as_mut_ptr() as *mut libc::c_char,
+                    host_buf.len() as libc::socklen_t,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                )
+            }
+        }
+    };
+
+    if rc == 0 {
+        // SAFETY: getnameinfo guarantees NUL-termination on success.
+        let cstr = unsafe { CStr::from_ptr(host_buf.as_ptr() as *const libc::c_char) };
+        let name = cstr.to_string_lossy().to_string();
+        // If it returned a numeric address, that's not a real hostname
+        if name == addr.to_string() {
+            return None;
+        }
+        Some(name)
+    } else {
+        None
+    }
+}
+
 pub fn format_tod_full() -> String {
     // SAFETY: libc time/localtime/strftime are standard C library functions.
     // localtime returns a pointer to a static `struct tm` which is valid

@@ -949,10 +949,107 @@ pub fn smtp_start_session(
     }
 
     // ── Phase 10: Connect ACL (lines ~2600–2680) ──
-    debug!(
-        phase = ?AclWhere::Connect,
-        "smtp_start_session: connect ACL evaluation point"
-    );
+    //
+    // Evaluate the acl_smtp_connect ACL if configured.  The ACL name string
+    // may contain expansion variables (e.g. `connect${substr_-1_1:$sender_host_address}`)
+    // so we must expand it first.  If the ACL denies the connection, send
+    // the rejection response immediately and return Ok(false) to signal that
+    // no banner should be sent and the session should be closed.
+    if let Some(ref acl_connect_raw) = config_ctx.acl_smtp_connect {
+        debug!(
+            phase = ?AclWhere::Connect,
+            acl = %acl_connect_raw,
+            "smtp_start_session: evaluating connect ACL"
+        );
+
+        // Expand the ACL name string.  Create a minimal ExpandContext with
+        // $sender_host_address set so that expressions like
+        // `${substr_-1_1:$sender_host_address}` resolve correctly.
+        let expanded_acl = {
+            let mut expand_ctx = exim_expand::variables::ExpandContext::default();
+            if let Some(ref addr) = message_ctx.sender_host_address {
+                expand_ctx.sender_host_address = exim_store::Tainted::new(addr.clone());
+            }
+            expand_ctx.primary_hostname =
+                exim_store::Clean::new(server_ctx.smtp_active_hostname.clone());
+            match exim_expand::expand_string_with_context(acl_connect_raw, &mut expand_ctx) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "smtp_start_session: connect ACL name expansion failed"
+                    );
+                    // On expansion failure, deny the connection (matching C behavior)
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(b"550 Administrative prohibition\r\n");
+                    let _ = std::io::stdout().flush();
+                    return Ok(false);
+                }
+            }
+        };
+
+        // Build a minimal AclSessionState for the connect phase.
+        let acl_session = command_loop::AclSessionState {
+            client_ip: message_ctx.sender_host_address.clone().unwrap_or_default(),
+            named_host_lists: config_ctx.named_host_lists.clone(),
+            named_domain_lists: config_ctx.named_domain_lists.clone(),
+            named_address_lists: config_ctx.named_address_lists.clone(),
+            named_local_part_lists: config_ctx.named_local_part_lists.clone(),
+            ..Default::default()
+        };
+
+        let (acl_rc, user_msg, _log_msg) = command_loop::run_acl_check(
+            AclWhere::Connect,
+            Some(&expanded_acl),
+            None, // no recipient for connect phase
+            &config_ctx.acl_definitions,
+            &acl_session,
+        );
+
+        match acl_rc {
+            exim_acl::AclResult::Fail | exim_acl::AclResult::FailDrop => {
+                // Connection denied by ACL.  Send the rejection message.
+                let msg = if user_msg.is_empty() {
+                    "Administrative prohibition".to_string()
+                } else {
+                    user_msg
+                };
+                let response = format!("550 {}\r\n", msg);
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(response.as_bytes());
+                let _ = std::io::stdout().flush();
+                info!(
+                    acl = %expanded_acl,
+                    "smtp_start_session: connection denied by connect ACL"
+                );
+                return Ok(false);
+            }
+            exim_acl::AclResult::Error => {
+                // ACL error — deny with temporary error
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(b"451 Temporary service error\r\n");
+                let _ = std::io::stdout().flush();
+                warn!(
+                    acl = %expanded_acl,
+                    "smtp_start_session: connect ACL evaluation error"
+                );
+                return Ok(false);
+            }
+            _ => {
+                // ACL accepted — proceed to banner
+                debug!(
+                    acl = %expanded_acl,
+                    result = %acl_rc,
+                    "smtp_start_session: connect ACL accepted"
+                );
+            }
+        }
+    } else {
+        debug!(
+            phase = ?AclWhere::Connect,
+            "smtp_start_session: no connect ACL configured"
+        );
+    }
 
     // ── Phase 11: Banner construction ──
     // C Exim default: "$primary_hostname ESMTP Exim $version_number $tod_full"
@@ -1121,6 +1218,8 @@ mod tests {
             sender_host_notsocket: false,
             is_inetd: false,
             atrn_mode: false,
+            is_local_session: false,
+            smtp_batched_input: false,
             interface_address: Some("192.168.1.1".to_string()),
             interface_port: 25,
         };
@@ -1144,6 +1243,8 @@ mod tests {
             sender_host_notsocket: false,
             is_inetd: false,
             atrn_mode: false,
+            is_local_session: false,
+            smtp_batched_input: false,
             interface_address: None,
             interface_port: 0,
         };
@@ -1190,6 +1291,8 @@ mod tests {
             sender_host_notsocket: false,
             is_inetd: false,
             atrn_mode: false,
+            is_local_session: false,
+            smtp_batched_input: false,
             interface_address: None,
             interface_port: 0,
         };
