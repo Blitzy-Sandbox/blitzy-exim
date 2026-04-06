@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::marker::PhantomData;
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
 
 // nix::sys::socket::{send, MsgFlags} removed — we now use
 // exim_ffi::fd::safe_write_fd() which works on both sockets and pipes.
@@ -396,10 +397,13 @@ pub struct ConfigContext {
     // Named lists from configuration for ACL condition evaluation.
     // These are propagated into AclSessionState so conditions like
     // `domains = +local_domains` can resolve `+` references.
-    pub named_domain_lists: HashMap<String, String>,
-    pub named_host_lists: HashMap<String, String>,
-    pub named_address_lists: HashMap<String, String>,
-    pub named_local_part_lists: HashMap<String, String>,
+    //
+    // Wrapped in Arc to avoid deep-cloning these immutable maps on every
+    // ACL invocation (Directive 2 — performance optimisation).
+    pub named_domain_lists: Arc<HashMap<String, String>>,
+    pub named_host_lists: Arc<HashMap<String, String>>,
+    pub named_address_lists: Arc<HashMap<String, String>>,
+    pub named_local_part_lists: Arc<HashMap<String, String>>,
 
     // Spool directory path for writing -H/-D files after DATA.
     pub spool_directory: String,
@@ -552,31 +556,38 @@ impl ConfigContext {
             submission_domain: None,
             submission_name: None,
 
-            // Named lists — propagated from parsed config for ACL condition resolution
-            named_domain_lists: cfg
-                .named_lists
-                .domain_lists
-                .iter()
-                .map(|(k, v)| (k.clone(), v.value.clone()))
-                .collect(),
-            named_host_lists: cfg
-                .named_lists
-                .host_lists
-                .iter()
-                .map(|(k, v)| (k.clone(), v.value.clone()))
-                .collect(),
-            named_address_lists: cfg
-                .named_lists
-                .address_lists
-                .iter()
-                .map(|(k, v)| (k.clone(), v.value.clone()))
-                .collect(),
-            named_local_part_lists: cfg
-                .named_lists
-                .localpart_lists
-                .iter()
-                .map(|(k, v)| (k.clone(), v.value.clone()))
-                .collect(),
+            // Named lists — propagated from parsed config for ACL condition resolution.
+            // Wrapped in Arc so that AclSessionState construction is a cheap
+            // reference-count increment instead of a deep HashMap clone
+            // (Directive 2 — performance optimisation).
+            named_domain_lists: Arc::new(
+                cfg.named_lists
+                    .domain_lists
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.value.clone()))
+                    .collect(),
+            ),
+            named_host_lists: Arc::new(
+                cfg.named_lists
+                    .host_lists
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.value.clone()))
+                    .collect(),
+            ),
+            named_address_lists: Arc::new(
+                cfg.named_lists
+                    .address_lists
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.value.clone()))
+                    .collect(),
+            ),
+            named_local_part_lists: Arc::new(
+                cfg.named_lists
+                    .localpart_lists
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.value.clone()))
+                    .collect(),
+            ),
 
             // Spool and delivery settings from the canonical config
             spool_directory: if cfg.spool_directory.is_empty() {
@@ -948,6 +959,13 @@ pub struct SmtpSession<'ctx, S> {
     /// subsequent RCPTs after the first one (smtp_in.c ~3191-3194).
     /// Reset on RSET/MAIL FROM.
     sender_verify_told: bool,
+
+    /// DNS resolver constructed once per SMTP session (per fork) and reused
+    /// across all ACL phases.  Eliminates the per-ACL-call
+    /// `DnsResolver::from_system()` that created a tokio `Runtime` and
+    /// parsed `/etc/resolv.conf` on every invocation (Directive 1).
+    /// `pub(crate)` so that the ATRN module can pass it to `run_acl_check`.
+    pub(crate) dns_resolver: Option<exim_dns::DnsResolver>,
 }
 
 // =============================================================================
@@ -978,6 +996,18 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
         let io = SmtpIoState::new(in_fd, out_fd);
         let chunking_ctx = ChunkingContext::new(false);
 
+        // Construct the DNS resolver once for the entire SMTP session
+        // lifetime.  This replaces the per-ACL-call DnsResolver::from_system()
+        // that allocated a tokio Runtime and parsed /etc/resolv.conf on every
+        // invocation (Directive 1 — performance optimisation).
+        let dns_resolver = match exim_dns::DnsResolver::from_system() {
+            Ok(resolver) => Some(resolver),
+            Err(e) => {
+                warn!(error = %e, "failed to initialise session DNS resolver; ACL DNS lookups will be unavailable");
+                None
+            }
+        };
+
         SmtpSession {
             _state: PhantomData,
             authenticated_by: None,
@@ -1002,6 +1032,7 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
             smtp_write_error: 0,
             rcpt_in_progress: false,
             sender_verify_told: false,
+            dns_resolver,
         }
     }
 }
@@ -1033,10 +1064,11 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 .clone()
                 .unwrap_or_default(),
             helo_name: self.message_ctx.helo_name.clone().unwrap_or_default(),
-            named_domain_lists: self.config_ctx.named_domain_lists.clone(),
-            named_host_lists: self.config_ctx.named_host_lists.clone(),
-            named_address_lists: self.config_ctx.named_address_lists.clone(),
-            named_local_part_lists: self.config_ctx.named_local_part_lists.clone(),
+            // Arc::clone() — cheap reference-count increment, not deep copy (Directive 2).
+            named_domain_lists: Arc::clone(&self.config_ctx.named_domain_lists),
+            named_host_lists: Arc::clone(&self.config_ctx.named_host_lists),
+            named_address_lists: Arc::clone(&self.config_ctx.named_address_lists),
+            named_local_part_lists: Arc::clone(&self.config_ctx.named_local_part_lists),
             reply_address: String::new(),
             header_list: HashMap::new(),
             host_checking: self.server_ctx.host_checking,
@@ -1841,6 +1873,7 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
             smtp_write_error: self.smtp_write_error,
             rcpt_in_progress: self.rcpt_in_progress,
             sender_verify_told: self.sender_verify_told,
+            dns_resolver: self.dns_resolver,
         }
     }
 
@@ -1966,6 +1999,7 @@ impl<'ctx> SmtpSession<'ctx, Connected> {
                 Some(name_ref),
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state(),
+                &mut self.dns_resolver,
             );
             if acl_rc != AclResult::Ok {
                 let result =
@@ -2046,6 +2080,18 @@ impl<'ctx> SmtpSession<'ctx, Greeted> {
         let io = SmtpIoState::new(in_fd, out_fd);
         let chunking_ctx = ChunkingContext::new(false);
 
+        // Construct the DNS resolver once for the entire SMTP session
+        // lifetime.  This replaces the per-ACL-call DnsResolver::from_system()
+        // that allocated a tokio Runtime and parsed /etc/resolv.conf on every
+        // invocation (Directive 1 — performance optimisation).
+        let dns_resolver = match exim_dns::DnsResolver::from_system() {
+            Ok(resolver) => Some(resolver),
+            Err(e) => {
+                warn!(error = %e, "failed to initialise session DNS resolver; ACL DNS lookups will be unavailable");
+                None
+            }
+        };
+
         SmtpSession {
             _state: PhantomData,
             authenticated_by: None,
@@ -2070,6 +2116,7 @@ impl<'ctx> SmtpSession<'ctx, Greeted> {
             smtp_write_error: 0,
             rcpt_in_progress: false,
             sender_verify_told: false,
+            dns_resolver,
         }
     }
 
@@ -2136,6 +2183,7 @@ impl<'ctx> SmtpSession<'ctx, Greeted> {
                 Some(&sender),
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state(),
+                &mut self.dns_resolver,
             );
             if acl_rc != AclResult::Ok {
                 let result =
@@ -2231,6 +2279,7 @@ impl<'ctx> SmtpSession<'ctx, MailFrom> {
                 Some(&recipient),
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state(),
+                &mut self.dns_resolver,
             );
             let acl_rc = acl_full.result;
             let user_msg = acl_full.user_msg;
@@ -2364,6 +2413,7 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
                 Some(&recipient),
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state_for_recipient(&recipient),
+                &mut self.dns_resolver,
             );
             let acl_rc = acl_full.result;
             let user_msg = acl_full.user_msg;
@@ -2465,6 +2515,7 @@ impl<'ctx> SmtpSession<'ctx, RcptTo> {
                 None,
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state(),
+                &mut self.dns_resolver,
             );
             if acl_rc != AclResult::Ok {
                 let result =
@@ -3103,6 +3154,7 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 Some(&mechanism),
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state(),
+                &mut self.dns_resolver,
             );
             if acl_rc != AclResult::Ok {
                 let result =
@@ -3204,6 +3256,7 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 None,
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state(),
+                &mut self.dns_resolver,
             );
             if acl_rc != AclResult::Ok {
                 let result = self.smtp_handle_acl_fail(
@@ -3331,6 +3384,7 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 Some(argument),
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state(),
+                &mut self.dns_resolver,
             );
             if acl_rc != AclResult::Ok {
                 let _ =
@@ -3360,6 +3414,7 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 Some(argument),
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state(),
+                &mut self.dns_resolver,
             );
             if acl_rc != AclResult::Ok {
                 let _ =
@@ -3405,6 +3460,7 @@ impl<'ctx, S> SmtpSession<'ctx, S> {
                 Some(argument),
                 &self.config_ctx.acl_definitions,
                 &self.acl_session_state(),
+                &mut self.dns_resolver,
             );
             if acl_rc != AclResult::Ok {
                 let _ =
@@ -4179,19 +4235,19 @@ fn handle_rcptto_session(mut session: SmtpSession<'_, RcptTo>) -> SmtpSetupResul
                                     .helo_name
                                     .clone()
                                     .unwrap_or_default(),
-                                named_domain_lists: data_session
-                                    .config_ctx
-                                    .named_domain_lists
-                                    .clone(),
-                                named_host_lists: data_session.config_ctx.named_host_lists.clone(),
-                                named_address_lists: data_session
-                                    .config_ctx
-                                    .named_address_lists
-                                    .clone(),
-                                named_local_part_lists: data_session
-                                    .config_ctx
-                                    .named_local_part_lists
-                                    .clone(),
+                                // Arc::clone — cheap ref-count increment (Directive 2).
+                                named_domain_lists: Arc::clone(
+                                    &data_session.config_ctx.named_domain_lists,
+                                ),
+                                named_host_lists: Arc::clone(
+                                    &data_session.config_ctx.named_host_lists,
+                                ),
+                                named_address_lists: Arc::clone(
+                                    &data_session.config_ctx.named_address_lists,
+                                ),
+                                named_local_part_lists: Arc::clone(
+                                    &data_session.config_ctx.named_local_part_lists,
+                                ),
                                 reply_address: reply_address.clone(),
                                 header_list: header_map.clone(),
                                 host_checking: data_session.server_ctx.host_checking,
@@ -4211,6 +4267,7 @@ fn handle_rcptto_session(mut session: SmtpSession<'_, RcptTo>) -> SmtpSetupResul
                                 None,
                                 &data_session.config_ctx.acl_definitions,
                                 &acl_state,
+                                &mut data_session.dns_resolver,
                             );
                             let acl_rc = acl_result.result;
                             let user_msg = acl_result.user_msg;
@@ -5216,13 +5273,14 @@ pub struct AclSessionState {
     /// Client's HELO/EHLO name.
     pub helo_name: String,
     /// Named domain lists from configuration (`domainlist local_domains = ...`).
-    pub named_domain_lists: HashMap<String, String>,
+    /// Arc-wrapped to avoid deep-cloning on every ACL invocation (Directive 2).
+    pub named_domain_lists: Arc<HashMap<String, String>>,
     /// Named host lists from configuration (`hostlist ...`).
-    pub named_host_lists: HashMap<String, String>,
+    pub named_host_lists: Arc<HashMap<String, String>>,
     /// Named address lists from configuration (`addresslist ...`).
-    pub named_address_lists: HashMap<String, String>,
+    pub named_address_lists: Arc<HashMap<String, String>>,
     /// Named local-part lists from configuration (`localpartlist ...`).
-    pub named_local_part_lists: HashMap<String, String>,
+    pub named_local_part_lists: Arc<HashMap<String, String>>,
     /// Reply address computed from message headers (Reply-To or From).
     /// Set for DATA ACL evaluation after message body is received.
     pub reply_address: String,
@@ -5285,6 +5343,7 @@ pub fn run_acl_check(
     recipient: Option<&str>,
     acl_definitions: &HashMap<String, (String, String, i32)>,
     session_state: &AclSessionState,
+    dns_resolver: &mut Option<exim_dns::DnsResolver>,
 ) -> (AclResult, String, String) {
     let r = run_acl_check_full(
         where_phase,
@@ -5292,6 +5351,7 @@ pub fn run_acl_check(
         recipient,
         acl_definitions,
         session_state,
+        dns_resolver,
     );
     (r.result, r.user_msg, r.log_msg)
 }
@@ -5304,6 +5364,7 @@ pub fn run_acl_check_full(
     recipient: Option<&str>,
     acl_definitions: &HashMap<String, (String, String, i32)>,
     session_state: &AclSessionState,
+    dns_resolver: &mut Option<exim_dns::DnsResolver>,
 ) -> AclCheckResult {
     // Create ACL evaluation context
     let mut eval_ctx = exim_acl::engine::AclEvalContext::default();
@@ -5316,10 +5377,13 @@ pub fn run_acl_check_full(
     // like `senders`, `hosts`, `domains`, `local_parts` have the actual
     // values to match against.
     acl_msg_ctx.sender_address = session_state.sender_address.clone();
-    acl_msg_ctx.named_domain_lists = session_state.named_domain_lists.clone();
-    acl_msg_ctx.named_host_lists = session_state.named_host_lists.clone();
-    acl_msg_ctx.named_address_lists = session_state.named_address_lists.clone();
-    acl_msg_ctx.named_local_part_lists = session_state.named_local_part_lists.clone();
+    // Deref through Arc to produce owned HashMap clones that
+    // exim_acl::MessageContext expects (exim-acl is out-of-scope for
+    // the Arc promotion, so this deep-clone remains).
+    acl_msg_ctx.named_domain_lists = (*session_state.named_domain_lists).clone();
+    acl_msg_ctx.named_host_lists = (*session_state.named_host_lists).clone();
+    acl_msg_ctx.named_address_lists = (*session_state.named_address_lists).clone();
+    acl_msg_ctx.named_local_part_lists = (*session_state.named_local_part_lists).clone();
 
     // Set client IP, HELO name, and host_checking flag on the eval context
     eval_ctx.client_ip = session_state.client_ip.clone();
@@ -5355,20 +5419,18 @@ pub fn run_acl_check_full(
         eval_ctx.verify_recipient_cb = Some(Box::new(move |addr, sender| cb_clone(addr, sender)));
     }
 
-    // Initialize DNS resolver for ACL conditions that need DNS lookups
-    // (hosts, dnslists, verify, etc.). In C Exim, the DNS resolver is a
-    // global singleton initialised once at startup. Here we create it
-    // per-evaluation because DnsResolver is not Clone and the eval context
-    // takes ownership. The resolver reads /etc/resolv.conf and caches
-    // results internally, so repeated creation is acceptable for
-    // correctness even if not optimal for throughput.
-    match exim_dns::DnsResolver::from_system() {
-        Ok(resolver) => {
-            eval_ctx.dns_resolver = Some(resolver);
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to initialise DNS resolver for ACL evaluation");
-        }
+    // Populate the DNS resolver from the session-level resolver passed by
+    // the caller.  The resolver is constructed once per SMTP session (in
+    // SmtpSession::new) and reused across all ACL phases, eliminating the
+    // per-call Runtime::new() + /etc/resolv.conf parse (Directive 1).
+    //
+    // AclEvalContext::dns_resolver takes Option<DnsResolver> by ownership.
+    // We temporarily move the resolver out of the caller's Option via
+    // take(), let the ACL engine borrow it, then move it back via
+    // replace().  The caller passes `&mut Option<DnsResolver>` so the
+    // borrow-and-return pattern is transparent.
+    if let Some(resolver) = dns_resolver.take() {
+        eval_ctx.dns_resolver = Some(resolver);
     }
 
     // Pre-parse all named ACL definitions from the config into the eval
@@ -5398,6 +5460,12 @@ pub fn run_acl_check_full(
         &mut user_msg,
         &mut log_msg,
     );
+
+    // Return the DNS resolver back to the caller so it can be reused by
+    // subsequent ACL calls within the same SMTP session (Directive 1).
+    if let Some(resolver) = eval_ctx.dns_resolver.take() {
+        *dns_resolver = Some(resolver);
+    }
 
     // Extract sender verification failure details from the ACL eval
     // context — set by `acl_verify_sender_via_cb()` when `verify = sender`

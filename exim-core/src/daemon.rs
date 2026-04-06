@@ -671,7 +671,10 @@ fn daemon_event_loop(
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "poll() failed");
-                    std::thread::sleep(Duration::from_millis(100));
+                    // Use poll() with an empty fd set as a non-blocking sleep
+                    // instead of std::thread::sleep — avoids blocking the daemon
+                    // event loop thread on transient poll() errors (Directive 5).
+                    let _ = nix::poll::poll(&mut [], PollTimeout::try_from(100i32).unwrap());
                 }
             }
 
@@ -1560,9 +1563,30 @@ fn handle_smtp_child(
         ..Default::default()
     };
 
-    // Write connection log to mainlog (AAP §0.7.1 — C Exim format).
+    // ── Child-process one-time initialisation ──
+    //
+    // Create spool and log directories once per child process, not per
+    // message or per log line.  This eliminates repeated stat() chains on
+    // every path component (Directives 3 & 4).
     let spool_dir = config.spool_directory.clone();
-    write_mainlog(&spool_dir, &format!("Connection from [{}]", peer_address));
+    let log_dir = format!("{}/log", spool_dir);
+    let _ = std::fs::create_dir_all(&log_dir);
+    let input_dir = format!("{}/input", spool_dir);
+    let _ = std::fs::create_dir_all(&input_dir);
+
+    // Open mainlog once for the child process lifetime (Directive 3).
+    // All subsequent write_mainlog_cached() calls reuse this file handle
+    // instead of opening and closing the file per log line.
+    let mainlog_path = format!("{}/mainlog", log_dir);
+    let mut mainlog_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&mainlog_path);
+
+    // Write connection log to mainlog (AAP §0.7.1 — C Exim format).
+    if let Ok(ref mut f) = mainlog_file {
+        write_mainlog_cached(f, &format!("Connection from [{}]", peer_address));
+    }
 
     // Delegate to the SMTP inbound command loop (smtp_setup_msg).
     // This function:
@@ -1608,6 +1632,7 @@ fn handle_smtp_child(
                 config,
                 peer_address,
                 tls_backend,
+                &mut mainlog_file,
             );
         }
         exim_smtp::inbound::command_loop::SmtpSetupResult::Error => {
@@ -1615,11 +1640,13 @@ fn handle_smtp_child(
         }
     }
 
-    // Log SMTP session end in mainlog.
-    write_mainlog(
-        &spool_dir,
-        &format!("SMTP connection from [{}] closed", peer_address),
-    );
+    // Log SMTP session end in mainlog using the cached file handle.
+    if let Ok(ref mut f) = mainlog_file {
+        write_mainlog_cached(
+            f,
+            &format!("SMTP connection from [{}] closed", peer_address),
+        );
+    }
 
     // The child will exit via the caller's exit(0) after this returns.
 }
@@ -1685,6 +1712,16 @@ fn protocol_name(proto: exim_smtp::SmtpProtocol) -> &'static str {
 /// * `config_ctx` — SMTP config context
 /// * `config` — Frozen parsed configuration
 /// * `peer_address` — String representation of the peer address
+/// * `tls_backend` — Optional TLS backend for encrypted connections
+/// * `mainlog_file` — Cached mainlog file handle opened once at child
+///   startup (Directive 3 — eliminates per-log-line open/close)
+//
+// Justification for #[allow]: The 9th parameter `mainlog_file` is a
+// performance-critical cached file handle passed from the child-process
+// initialisation path (Directive 3).  Bundling into a struct would
+// require restructuring the recursive tail-call and write_to_client
+// closure, adding complexity without functional benefit.
+#[allow(clippy::too_many_arguments)]
 fn receive_and_spool_message(
     conn_fd: std::os::unix::io::RawFd,
     server_ctx: &exim_smtp::inbound::command_loop::ServerContext,
@@ -1693,6 +1730,7 @@ fn receive_and_spool_message(
     config: &Arc<Config>,
     peer_address: &str,
     mut tls_backend: Option<Box<exim_tls::rustls_backend::RustlsBackend>>,
+    mainlog_file: &mut std::result::Result<std::fs::File, std::io::Error>,
 ) {
     use std::io::Write as _;
 
@@ -1811,9 +1849,9 @@ fn receive_and_spool_message(
     // Arc<Config> derefs to exim_config::ConfigContext via Config::deref().
     let spool_dir = config.spool_directory.clone();
 
-    // Ensure spool subdirectories exist.
+    // Spool input directory is created once at SMTP child startup
+    // (Directive 4).  No per-message create_dir_all here.
     let input_dir = format!("{}/input", spool_dir);
-    let _ = std::fs::create_dir_all(&input_dir);
 
     // Write the -D (data) spool file containing the message body.
     let data_path = format!("{}/{}-D", input_dir, message_id);
@@ -1932,8 +1970,10 @@ fn receive_and_spool_message(
         total_body_size,
         message_id,
     );
-    // Write to mainlog if available.
-    write_mainlog(&spool_dir, &log_line);
+    // Write to mainlog using the cached file handle (Directive 3).
+    if let Ok(ref mut f) = mainlog_file {
+        write_mainlog_cached(f, &log_line);
+    }
 
     tracing::info!(
         message_id = %message_id,
@@ -1982,6 +2022,7 @@ fn receive_and_spool_message(
                 config,
                 peer_address,
                 tls_backend,
+                mainlog_file,
             );
         }
         exim_smtp::inbound::command_loop::SmtpSetupResult::Error => {
@@ -1997,6 +2038,10 @@ fn receive_and_spool_message(
 ///
 /// This implements the basic logging infrastructure required by AAP §0.7.1
 /// ("main log, reject log, and panic log entries must match C Exim format").
+///
+/// Used by the daemon parent process (startup log at line 494) where no
+/// cached file handle is available.  SMTP child processes use
+/// [`write_mainlog_cached`] with a pre-opened file handle instead.
 fn write_mainlog(spool_dir: &str, line: &str) {
     let log_dir = format!("{}/log", spool_dir);
     let _ = std::fs::create_dir_all(&log_dir);
@@ -2017,6 +2062,21 @@ fn write_mainlog(spool_dir: &str, line: &str) {
         Err(e) => {
             tracing::error!(error = %e, path = %mainlog_path, "failed to write mainlog");
         }
+    }
+}
+
+/// Write a log line to the mainlog using a pre-opened file handle.
+///
+/// This is the performance-optimised path used by SMTP child processes
+/// (Directive 3).  The file handle is opened once at child startup in
+/// [`handle_smtp_child`] and reused for the child's entire lifetime,
+/// eliminating per-log-line `open()`/`close()` syscalls.
+fn write_mainlog_cached(file: &mut std::fs::File, line: &str) {
+    let now = chrono_format_now();
+    let formatted = format!("{} {}\n", now, line);
+    use std::io::Write as _;
+    if let Err(e) = file.write_all(formatted.as_bytes()) {
+        tracing::error!(error = %e, "failed to write to cached mainlog");
     }
 }
 

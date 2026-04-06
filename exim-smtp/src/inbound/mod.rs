@@ -998,12 +998,18 @@ pub fn smtp_start_session(
             ..Default::default()
         };
 
+        // The Connect ACL runs once per connection before the SmtpSession
+        // (and its session-lifetime DnsResolver) is constructed.  We pass a
+        // None resolver here — the connect phase rarely needs DNS lookups,
+        // and the per-message hot path is handled by the session's resolver.
+        let mut connect_dns_resolver: Option<exim_dns::DnsResolver> = None;
         let (acl_rc, user_msg, _log_msg) = command_loop::run_acl_check(
             AclWhere::Connect,
             Some(&expanded_acl),
             None, // no recipient for connect phase
             &config_ctx.acl_definitions,
             &acl_session,
+            &mut connect_dns_resolver,
         );
 
         match acl_rc {

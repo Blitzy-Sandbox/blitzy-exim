@@ -326,6 +326,7 @@ pub fn atrn_handle_provider<S>(
         None,
         &session.config_ctx.acl_definitions,
         &session.acl_session_state(),
+        &mut session.dns_resolver,
     );
     if acl_rc != AclResult::Ok {
         return Err(session.smtp_handle_acl_fail(
