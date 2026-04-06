@@ -5,11 +5,9 @@ metadata:
   description: "Complete C-to-Rust migration of Exim MTA — 18-crate workspace with 250K+ lines of Rust"
   tags:
     - rust
-    - c
     - infrastructure
-    - in-progress
+    - refactor
   labels:
-    blitzy.com/status: in-progress
     blitzy.com/language: rust
   annotations:
     github.com/project-slug: Blitzy-Sandbox/blitzy-exim
