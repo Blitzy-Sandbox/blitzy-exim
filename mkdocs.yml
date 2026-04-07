@@ -6,3 +6,4 @@ nav:
   - Technical Specifications: technical-specifications.md
 plugins:
   - techdocs-core
+  - mermaid2
