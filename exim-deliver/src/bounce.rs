@@ -93,6 +93,14 @@ const HTYPE_ID: char = 'I';
 /// Header type constant for "old"/deleted headers (matches C htype_old = '*').
 const HTYPE_OLD: char = '*';
 
+/// Header type constant for `Bcc:` / `Resent-Bcc:` (matches C htype_bcc = 'B').
+///
+/// Bcc headers are sensitive: they MUST NOT be included in bounce DSN
+/// attachments, because re-emitting them would leak the original blind-copy
+/// recipient list to the message sender (a privacy breach of the BCC contract).
+/// See `src/src/receive.c` and `src/src/macros.h` for the C definition.
+const HTYPE_BCC: char = 'B';
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Error Message Identifier Enum (C: ERRMESS_* constants)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -786,9 +794,17 @@ fn write_original_message_section<W: Write>(
     let size_limit = config.bounce_return_size_limit.max(0) as usize;
     let line_limit = config.bounce_return_linesize_limit.max(0) as usize;
 
-    // Write headers
+    // Write headers — filtering out old/replaced headers and Bcc/Resent-Bcc
+    // per RFC 3464 §3 (B1 fix: Bcc leak).  The C `src/src/moan.c` code path
+    // relies on the spool file's `htype_bcc` classification to skip Bcc
+    // entries; we use the same strategy here.  We also apply an independent
+    // header-text check as a defensive fallback in case the spool reader
+    // produced a header with a misclassified type.
     for hdr in headers {
-        if hdr.header_type == HTYPE_OLD {
+        if hdr.header_type == HTYPE_OLD || hdr.header_type == HTYPE_BCC {
+            continue;
+        }
+        if is_bcc_header(&hdr.text) {
             continue;
         }
         // Enforce line length limit on each header line
@@ -1642,8 +1658,12 @@ pub fn send_bounce_message(
             let line_limit = config.bounce_return_linesize_limit.max(0) as usize;
             let mut written: usize = 0;
 
-            // Write headers from MessageContext
+            // Write headers from MessageContext — B1 fix: strip Bcc/Resent-Bcc
+            // headers to avoid leaking blind-copy recipients back to the sender.
             for hdr_text in &msg_ctx.headers {
+                if is_bcc_header(hdr_text) {
+                    continue;
+                }
                 let text = if line_limit > 0 && hdr_text.len() > line_limit {
                     &hdr_text[..line_limit]
                 } else {
@@ -1876,7 +1896,12 @@ pub fn send_warning_message(
 
             let line_limit = config.bounce_return_linesize_limit.max(0) as usize;
 
+            // B1 fix: strip Bcc/Resent-Bcc headers before re-emitting headers
+            // into the delay-warning DSN attachment.
             for hdr_text in &msg_ctx.headers {
+                if is_bcc_header(hdr_text) {
+                    continue;
+                }
                 let text = if line_limit > 0 && hdr_text.len() > line_limit {
                     &hdr_text[..line_limit]
                 } else {
@@ -2072,7 +2097,11 @@ pub fn maybe_send_dsn(
 
         let line_limit = config.bounce_return_linesize_limit.max(0) as usize;
 
+        // B1 fix: strip Bcc/Resent-Bcc headers before emitting into the DSN.
         for hdr_text in &msg_ctx.headers {
+            if is_bcc_header(hdr_text) {
+                continue;
+            }
             let text = if line_limit > 0 && hdr_text.len() > line_limit {
                 &hdr_text[..line_limit]
             } else {
@@ -2129,16 +2158,71 @@ pub fn maybe_send_dsn(
 
 /// Classify a header string into a header type character.
 ///
-/// Used when converting `MessageContext.headers` (Vec<String>) into
-/// `HeaderLine` structs for `write_bounce_references`.
+/// Used when converting `MessageContext.headers` (`Vec<String>`) into
+/// `HeaderLine` structs for `write_bounce_references` and related helpers.
+///
+/// Mirrors the C `htype_*` classification in `src/src/macros.h` and the
+/// dispatch table in `src/src/globals.c` (`header_names[]`).  Currently
+/// recognises the subset of types that affect downstream bounce logic:
+///
+/// - `Message-ID:` → [`HTYPE_ID`] (used by References: chain construction)
+/// - `Bcc:` / `Resent-Bcc:` → [`HTYPE_BCC`] (B1 fix: required so that
+///   [`is_bcc_header`] can strip them from DSN attachments)
 fn classify_header_type(header: &str) -> char {
     let lower = header.to_lowercase();
     if lower.starts_with("message-id:") {
         HTYPE_ID
+    } else if lower.starts_with("bcc:") || lower.starts_with("resent-bcc:") {
+        HTYPE_BCC
     } else {
         // Default type for non-special headers
         ' '
     }
+}
+
+/// Check whether a raw header line is a `Bcc:` or `Resent-Bcc:` header
+/// (B1 fix).
+///
+/// The match is case-insensitive, skips leading whitespace (for continuation
+/// lines), and matches only on the header name up to (and including) the
+/// colon separator.  This mirrors the C `htype_bcc` classification in
+/// `src/src/receive.c:2444-2445`.
+///
+/// Used when iterating `MessageContext.headers` (`Vec<String>`), which does
+/// not carry the `htype` classification produced by the spool-file reader.
+///
+/// # Example
+///
+/// ```ignore
+/// assert!(is_bcc_header("Bcc: secret@example.com\r\n"));
+/// assert!(is_bcc_header("bcc:recipient@example.com\n"));
+/// assert!(is_bcc_header("Resent-Bcc: later@example.com\n"));
+/// assert!(!is_bcc_header("To: user@example.com\n"));
+/// assert!(!is_bcc_header("X-Bcc-Info: metadata\n"));
+/// ```
+fn is_bcc_header(header_line: &str) -> bool {
+    // Skip leading whitespace in case this is a folded continuation line;
+    // in practice the spool format keeps the header name on the first line
+    // but being permissive costs nothing and avoids false negatives.
+    let trimmed = header_line.trim_start();
+
+    // Strict prefix match on `Bcc:` and `Resent-Bcc:` (case-insensitive).
+    // Whitespace between the name and `:` is not permitted per RFC 5322 §3.6.1
+    // but the Exim parser is lenient; the C `htype_bcc` classifier is exact,
+    // so we follow the same conservative rule here.
+    // Using `get(..N)` avoids panicking on ASCII-boundary edge cases for the
+    // initial byte check.
+    if let Some(head) = trimmed.get(..4) {
+        if head.eq_ignore_ascii_case("bcc:") {
+            return true;
+        }
+    }
+    if let Some(head) = trimmed.get(..11) {
+        if head.eq_ignore_ascii_case("resent-bcc:") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Convert an errno value to a DSN status code string.
@@ -2399,5 +2483,108 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("read error"));
         assert!(output.contains("/var/spool/mail"));
+    }
+
+    // ----------------------------------------------------------------
+    // B1 fix: Bcc header detection tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn is_bcc_header_exact_lowercase() {
+        assert!(is_bcc_header("bcc: secret@example.com\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_exact_title_case() {
+        assert!(is_bcc_header("Bcc: secret@example.com\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_upper_case() {
+        assert!(is_bcc_header("BCC: secret@example.com\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_mixed_case() {
+        assert!(is_bcc_header("BcC: secret@example.com\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_no_space_after_colon() {
+        assert!(is_bcc_header("Bcc:secret@example.com\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_with_crlf() {
+        assert!(is_bcc_header("Bcc: secret@example.com\r\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_resent_bcc() {
+        assert!(is_bcc_header("Resent-Bcc: later@example.com\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_resent_bcc_mixed_case() {
+        assert!(is_bcc_header("ReSeNt-BcC: later@example.com\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_rejects_to() {
+        assert!(!is_bcc_header("To: user@example.com\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_rejects_cc() {
+        assert!(!is_bcc_header("Cc: user@example.com\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_rejects_x_bcc_info() {
+        // X-Bcc-Info: is a custom header that must NOT match.
+        assert!(!is_bcc_header("X-Bcc-Info: metadata\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_rejects_bcc_like_name() {
+        // Bcc-Redirect: is a (hypothetical) custom header that must NOT match.
+        assert!(!is_bcc_header("Bcc-Redirect: other@example.com\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_rejects_empty() {
+        assert!(!is_bcc_header(""));
+        assert!(!is_bcc_header("\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_rejects_continuation_line_value() {
+        // A continuation line containing "bcc:" in the value should not be flagged
+        // — but note is_bcc_header is only called on header-start lines in the
+        // actual bounce code.  This test documents the intentional permissive
+        // leading-whitespace trim behaviour: after trim_start, a line starting
+        // with "bcc:" IS flagged.  This is the defensive fallback design.
+        assert!(!is_bcc_header("   folded value but no bcc prefix\n"));
+    }
+
+    #[test]
+    fn is_bcc_header_short_input_no_panic() {
+        // Inputs shorter than the shortest pattern ("bcc:" = 4) must not panic.
+        assert!(!is_bcc_header(""));
+        assert!(!is_bcc_header("B"));
+        assert!(!is_bcc_header("Bc"));
+        assert!(!is_bcc_header("Bcc"));
+        // Missing colon: not a valid header-start line.
+        assert!(!is_bcc_header("Bcc "));
+    }
+
+    #[test]
+    fn classify_header_type_bcc() {
+        assert_eq!(classify_header_type("Bcc: secret@example.com"), HTYPE_BCC);
+        assert_eq!(classify_header_type("bcc: secret@example.com"), HTYPE_BCC);
+        assert_eq!(
+            classify_header_type("Resent-Bcc: later@example.com"),
+            HTYPE_BCC
+        );
     }
 }

@@ -1354,6 +1354,16 @@ pub fn filter_test_mode(
 /// Execute an Exim filter and print the result.
 ///
 /// Separated to isolate the cfg-gated code paths.
+///
+/// F3: Uses [`exim_interpret_outcome`] to access the full post-evaluation
+/// state including generated `mail`/`vacation` messages, which were
+/// previously silently discarded. In `-bf` filter-test mode we print
+/// the complete outcome so operators can verify that every command —
+/// `deliver`, `save`, `pipe`, `mail`, `vacation`, `headers add/remove`,
+/// `freeze`, `fail`, `defer`, `finish`, `logfile`, `logwrite` — is
+/// surfacing the side effect it should. In production mode the
+/// `exim-deliver` orchestrator drains the same outcome and enqueues
+/// each [`FilterGeneratedMessage`] via the spool subsystem.
 fn run_exim_filter(filter_text: &str, is_system: bool) -> ExitCode {
     #[cfg(feature = "exim-filter")]
     {
@@ -1361,9 +1371,59 @@ fn run_exim_filter(filter_text: &str, is_system: bool) -> ExitCode {
             system_filter: is_system,
             ..Default::default()
         };
-        match exim_miscmods::exim_filter::exim_interpret(filter_text, opts) {
-            Ok(result) => {
-                print_filter_result(&result);
+        match exim_miscmods::exim_filter::exim_interpret_outcome(filter_text, opts) {
+            Ok(outcome) => {
+                print_filter_result(&outcome.result);
+                // F3: Print deliveries (generated_addresses).
+                for addr in &outcome.generated_addresses {
+                    println!("  deliver: {addr}");
+                }
+                // F3: Print header modifications.
+                for h in &outcome.added_headers {
+                    // Show only the first line to avoid flooding the
+                    // filter-test output with multi-line headers.
+                    let first_line = h.lines().next().unwrap_or(h);
+                    println!("  headers add: {first_line}");
+                }
+                for name in &outcome.removed_headers {
+                    println!("  headers remove: {name}");
+                }
+                // F3: Print control-verb explanations.
+                if let Some(ref t) = outcome.freeze_text {
+                    println!("  freeze text: {t}");
+                }
+                if let Some(ref t) = outcome.fail_text {
+                    println!("  fail text: {t}");
+                }
+                if let Some(ref t) = outcome.defer_text {
+                    println!("  defer text: {t}");
+                }
+                // F3: Print generated mail/vacation messages. We show
+                // metadata and the first two lines of the body so
+                // operators can verify the Auto-Submitted header is
+                // present without dumping the entire quoted-printable
+                // payload.
+                for gm in &outcome.generated_messages {
+                    let kind = match gm.category {
+                        exim_miscmods::exim_filter::GeneratedMessageKind::Vacation => "vacation",
+                        exim_miscmods::exim_filter::GeneratedMessageKind::Mail => "mail",
+                    };
+                    println!(
+                        "  {kind}: envelope_from={:?}, recipients={}, bytes={}",
+                        gm.envelope_from,
+                        gm.envelope_recipients.len(),
+                        gm.message_text.len()
+                    );
+                    for r in &gm.envelope_recipients {
+                        println!("    -> {r}");
+                    }
+                    // First non-empty header line is usually "From:" —
+                    // print the first few header lines for diagnostic
+                    // value in -bf mode.
+                    for line in gm.message_text.lines().take(8) {
+                        println!("    | {line}");
+                    }
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -1381,12 +1441,90 @@ fn run_exim_filter(filter_text: &str, is_system: bool) -> ExitCode {
 }
 
 /// Execute a Sieve filter and print the result.
+///
+/// Per SV1/SV4, `sieve_interpret` returns a [`SieveOutcome`] struct
+/// that aggregates the overall [`SieveResult`], the list of
+/// [`GeneratedAction`]s produced by `fileinto`/`redirect`, optional
+/// reject/ereject messaging (RFC 5429), an `is_ereject` flag, and the
+/// final active IMAP flag set (RFC 5232).  In `-bf` test mode we
+/// print every field so operators can verify that each command
+/// (`fileinto`, `redirect`, `reject`, `ereject`, `setflag`,
+/// `addflag`, `removeflag`, `mark`, `unmark`) parses and evaluates to
+/// the targets, flags, and semantics they expect.
 fn run_sieve_filter(filter_text: &str) -> ExitCode {
     #[cfg(feature = "sieve-filter")]
     {
         match exim_miscmods::sieve_filter::sieve_interpret(filter_text) {
-            Ok(result) => {
-                println!("Sieve filter result: {result}");
+            Ok(outcome) => {
+                println!("Sieve filter result: {}", outcome.result);
+                for action in &outcome.actions {
+                    let kind = if action.is_file {
+                        "fileinto"
+                    } else {
+                        "redirect"
+                    };
+                    if action.flags.is_empty() {
+                        println!("  {kind}: {}", action.address);
+                    } else {
+                        println!(
+                            "  {kind}: {} [flags: {}]",
+                            action.address,
+                            action.flags.join(" ")
+                        );
+                    }
+                }
+                if let Some(msg) = &outcome.reject_message {
+                    let kind = if outcome.is_ereject {
+                        "ereject"
+                    } else {
+                        "reject"
+                    };
+                    println!("  {kind}: {msg}");
+                }
+                if !outcome.flags.is_empty() {
+                    println!("  active flags: {}", outcome.flags.join(" "));
+                }
+                // SV5: surface vacation auto-reply request (RFC 5230) so that
+                // `-bf` test mode exposes it to the user running the filter
+                // against a sample message. The orchestrator is responsible
+                // for actually dispatching the reply; `-bf` is a dry run.
+                if let Some(vacation) = &outcome.vacation {
+                    let handle_repr = vacation
+                        .handle
+                        .as_deref()
+                        .map(|h| format!("{h:?}"))
+                        .unwrap_or_else(|| "<none>".to_string());
+                    println!(
+                        "  vacation: days={}, handle={}, addresses={}, mime={}",
+                        vacation.days,
+                        handle_repr,
+                        vacation.addresses.len(),
+                        vacation.mime,
+                    );
+                    if let Some(subj) = &vacation.subject {
+                        println!("    subject: {subj}");
+                    }
+                    if let Some(from) = &vacation.from {
+                        println!("    from: {from}");
+                    }
+                    let reply_ok = vacation.should_reply();
+                    println!("    should_reply: {reply_ok}");
+                }
+                // SV5: surface notify requests (RFC 5435 / RFC 5436). Each
+                // notification may produce a generated message via
+                // NotifyAction::build_mailto() when the method is `mailto:`.
+                for notify in &outcome.notifications {
+                    println!(
+                        "  notify: method={}, importance={}",
+                        notify.method, notify.importance,
+                    );
+                    if let Some(msg) = &notify.message {
+                        println!("    message: {msg}");
+                    }
+                    if !notify.options.is_empty() {
+                        println!("    options: {}", notify.options.join(","));
+                    }
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -1734,7 +1872,11 @@ pub fn test_retry_mode(args: &[String], config: &Arc<exim_config::Config>) -> Ex
 
     // Look up retry configuration for the given domain.
     // basic_errno and more_errno default to 0 when testing from CLI.
-    match exim_deliver::retry_find_config(domain, error_str, 0, 0, &config_ctx) {
+    //
+    // The `-brt` mode has no envelope sender context — pass `None` for
+    // sender_address (R1 fix). Rules with a `senders` clause will not match
+    // in this CLI test mode, which mirrors the C implementation behaviour.
+    match exim_deliver::retry_find_config(domain, error_str, None, 0, 0, &config_ctx) {
         Some(rule) => {
             println!("  Matching retry rule: {rule:?}");
             ExitCode::SUCCESS

@@ -913,7 +913,10 @@ fn generate_spf_bindings(out_dir: &Path) {
     let bindings = builder
         // Server lifecycle
         .allowlist_function("SPF_server_new")
+        .allowlist_function("SPF_server_new_dns")
         .allowlist_function("SPF_server_free")
+        // Server configuration setters (SP2 — SPF_server_set_rec_dom for %{r}, %{d}, %{h} macros)
+        .allowlist_function("SPF_server_set_rec_dom")
         // Request lifecycle
         .allowlist_function("SPF_request_new")
         .allowlist_function("SPF_request_free")
@@ -932,16 +935,27 @@ fn generate_spf_bindings(out_dir: &Path) {
         .allowlist_function("SPF_strreason")
         // Library version
         .allowlist_function("SPF_get_lib_version")
-        // DNS resolver functions
+        // DNS resolver functions — the SPF_dns_.* wildcard picks up
+        // SPF_dns_rr_new, SPF_dns_rr_new_init, SPF_dns_rr_new_nxdomain,
+        // SPF_dns_rr_free, SPF_dns_rr_buf_realloc, SPF_dns_rr_dup,
+        // SPF_dns_rlookup, SPF_dns_rlookup6, SPF_dns_get_client_dom,
+        // SPF_dns_free, SPF_dns_cache_new — required for the SP1 DNS
+        // callback trampoline implementation.
         .allowlist_function("SPF_dns_.*")
         // Types
         .allowlist_type("SPF_server_t")
         .allowlist_type("SPF_request_t")
         .allowlist_type("SPF_response_t")
         .allowlist_type("SPF_dns_rr_t")
+        .allowlist_type("SPF_dns_rr_data_t")
         .allowlist_type("SPF_dns_server_t")
+        .allowlist_type("SPF_dns_stat_t")
+        .allowlist_type("SPF_errcode_t")
         .allowlist_type("SPF_result_t")
         .allowlist_type("SPF_reason_t")
+        // ns_type for DNS query types (needed by SPF_dns_lookup_t callback).
+        // Must be allowlisted because bindgen doesn't emit it transitively.
+        .allowlist_type("__ns_type")
         // Constants (SPF_RESULT_*, SPF_REASON_*, etc.)
         .allowlist_var("SPF_.*")
         .generate()

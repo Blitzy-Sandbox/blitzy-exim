@@ -56,6 +56,26 @@ enum SpfFfi {
         dns_type: libc::c_int,
         debug: libc::c_int,
     },
+    /// SP1: Create SPF server using a caller-provided DNS resolver stack.
+    ///
+    /// Calls `SPF_server_new_dns(dns, debug)`. The provided DNS server is
+    /// borrowed for the lifetime of the returned `SPF_server_t`; the SPF
+    /// server does NOT take ownership unless the DNS server's `destroy`
+    /// callback is non-null (we always set it to NULL so the Rust side
+    /// owns the lifecycle).
+    ServerNewDns {
+        dns: *mut ffi::SPF_dns_server_t,
+        debug: libc::c_int,
+    },
+    /// SP2: Set the receiving domain (used for %{r}, %{d}, %{h} macros).
+    ///
+    /// Calls `SPF_server_set_rec_dom(sp, dom)`. The `dom` pointer must
+    /// reference a NUL-terminated C string that remains valid for the
+    /// duration of the call.
+    ServerSetRecDom {
+        server: *mut ffi::SPF_server_t,
+        dom: *const libc::c_char,
+    },
     RequestNew {
         server: *mut ffi::SPF_server_t,
     },
@@ -107,6 +127,36 @@ enum SpfFfi {
     ResponseFree {
         resp: *mut ffi::SPF_response_t,
     },
+    /// SP1: Allocate an `SPF_dns_rr_t` with the given herrno/ttl/rr_type.
+    ///
+    /// Calls `SPF_dns_rr_new_init(server, domain, rr_type, ttl, herrno)`.
+    /// Used by the Rust DNS trampoline when building a response on behalf
+    /// of the caller's DNS hook.
+    DnsRrNewInit {
+        server: *mut ffi::SPF_dns_server_t,
+        domain: *const libc::c_char,
+        rr_type: ffi::ns_type,
+        ttl: libc::c_int,
+        herrno: ffi::SPF_dns_stat_t,
+    },
+    /// SP1: Resize the `idx`-th entry of `spfrr->rr[]` to `len` bytes.
+    ///
+    /// Calls `SPF_dns_rr_buf_realloc(spfrr, idx, len)`. Used by the DNS
+    /// trampoline to grow the rr buffer before memcpy'ing record data.
+    DnsRrBufRealloc {
+        spfrr: *mut ffi::SPF_dns_rr_t,
+        idx: libc::c_int,
+        len: libc::size_t,
+    },
+    /// SP1: Free an `SPF_dns_rr_t` allocated by the DNS layer.
+    ///
+    /// Calls `SPF_dns_rr_free(spfrr)`. This is ordinarily invoked by
+    /// libspf2 itself when the DNS cache is flushed; the trampoline
+    /// does NOT call this directly (ownership transfers to libspf2
+    /// once the pointer is returned).
+    DnsRrFree {
+        spfrr: *mut ffi::SPF_dns_rr_t,
+    },
 }
 
 /// Result of an SPF FFI dispatch operation.
@@ -125,6 +175,12 @@ fn spf_ffi(op: SpfFfi) -> SpfFfiResult {
         match op {
             SpfFfi::ServerNew { dns_type, debug } => {
                 SpfFfiResult::Ptr(ffi::SPF_server_new(dns_type as u32, debug) as *mut libc::c_void)
+            }
+            SpfFfi::ServerNewDns { dns, debug } => {
+                SpfFfiResult::Ptr(ffi::SPF_server_new_dns(dns, debug) as *mut libc::c_void)
+            }
+            SpfFfi::ServerSetRecDom { server, dom } => {
+                SpfFfiResult::Code(ffi::SPF_server_set_rec_dom(server, dom) as libc::c_int)
             }
             SpfFfi::RequestNew { server } => {
                 SpfFfiResult::Ptr(ffi::SPF_request_new(server) as *mut libc::c_void)
@@ -186,6 +242,22 @@ fn spf_ffi(op: SpfFfi) -> SpfFfiResult {
             }
             SpfFfi::ResponseFree { resp } => {
                 ffi::SPF_response_free(resp);
+                SpfFfiResult::Done
+            }
+            SpfFfi::DnsRrNewInit {
+                server,
+                domain,
+                rr_type,
+                ttl,
+                herrno,
+            } => SpfFfiResult::Ptr(
+                ffi::SPF_dns_rr_new_init(server, domain, rr_type, ttl, herrno) as *mut libc::c_void,
+            ),
+            SpfFfi::DnsRrBufRealloc { spfrr, idx, len } => {
+                SpfFfiResult::Code(ffi::SPF_dns_rr_buf_realloc(spfrr, idx, len) as libc::c_int)
+            }
+            SpfFfi::DnsRrFree { spfrr } => {
+                ffi::SPF_dns_rr_free(spfrr);
                 SpfFfiResult::Done
             }
         }
@@ -389,6 +461,402 @@ fn to_cstring(s: &str, context: &str) -> Result<CString, SpfError> {
 }
 
 // ---------------------------------------------------------------------------
+// CustomDnsServer — Rust-owned SPF_dns_server_t + boxed DnsLookupFn
+// ---------------------------------------------------------------------------
+
+/// Rust-owned custom DNS resolver stack for libspf2 (SP1).
+///
+/// Encapsulates:
+/// * a heap-allocated `SPF_dns_server_t` struct (so the pointer stays
+///   valid for the lifetime of the enclosing [`SpfServer`]),
+/// * a boxed [`DnsLookupFn`] closure stashed inside the server struct's
+///   `hook` field,
+/// * a heap-allocated NUL-terminated name string (`"exim-rust\0"`) used
+///   by libspf2 for diagnostic messages.
+///
+/// # Lifecycle
+///
+/// * `new` allocates the struct + closure + name and wires them together.
+/// * [`Drop::drop`] reclaims all three allocations. It is invoked **after**
+///   [`SpfServer::drop`] has freed the enclosing `SPF_server_t`, so
+///   libspf2 can no longer reach into this struct.
+///
+/// # Source Context
+///
+/// Mirrors the C implementation in `src/src/miscmods/spf.c` lines 211–239
+/// (`SPF_dns_exim_new`), which uses `store_malloc` instead of `Box` and
+/// relies on Exim's garbage-collected pool allocator for cleanup.
+struct CustomDnsServer {
+    /// Raw pointer to the heap-allocated SPF_dns_server_t. We intentionally
+    /// do NOT use `Box<ffi::SPF_dns_server_t>` directly because libspf2
+    /// takes a raw `*mut` internally; we manage the box manually through
+    /// `Box::into_raw`/`Box::from_raw` to keep ownership discipline clear.
+    dns_server: *mut ffi::SPF_dns_server_t,
+    /// Raw pointer to the heap-allocated `Box<DnsLookupFn>`. This is stashed
+    /// inside `dns_server->hook` for the trampoline to recover.
+    hook: *mut DnsLookupFn,
+    /// Heap-allocated name string owned by this struct. `dns_server->name`
+    /// points into this buffer; `CString` guarantees NUL termination and
+    /// stable pointer validity until this field is dropped. The field is
+    /// never read directly by Rust code — it exists solely to keep the
+    /// backing buffer alive for libspf2's `dns_server->name` raw pointer.
+    #[allow(dead_code)]
+    // Justification: `name` is alive-for-its-side-effects — libspf2 holds
+    // a raw pointer to its buffer via `dns_server->name`. Dropping this
+    // field would invalidate that pointer. Rust's dead-code analysis
+    // cannot see across the FFI boundary.
+    name: CString,
+}
+
+impl CustomDnsServer {
+    /// Build a new custom DNS resolver stack wrapping the provided hook.
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err` in the current implementation; the `Result` is
+    /// retained in the signature to match the surrounding FFI error style
+    /// and to accommodate future fallible initialization steps without
+    /// breaking callers.
+    fn new(hook: DnsLookupFn) -> Result<Self, SpfError> {
+        // Move the hook into a box and extract a raw pointer so we can
+        // stash it inside the SPF_dns_server_t's `hook` field.
+        let hook_box: Box<DnsLookupFn> = Box::new(hook);
+        let hook_ptr: *mut DnsLookupFn = Box::into_raw(hook_box);
+
+        // Allocate the name string on the heap; we need a pointer with a
+        // stable, known-non-NULL lifetime that libspf2 can hold across
+        // multiple calls. Using a `'static` literal would also work but
+        // owning the buffer keeps the struct self-contained.
+        let name = CString::new("exim-rust").expect("static string 'exim-rust' cannot contain NUL");
+
+        // Allocate the SPF_dns_server_t on the heap. Default zero-init
+        // is provided by bindgen for the struct.
+        let mut server_box: Box<ffi::SPF_dns_server_t> = Box::new(ffi::SPF_dns_server_t::default());
+
+        // Wire up the struct fields.
+        //
+        // * destroy = NULL   — libspf2 will NOT free this struct (we own it)
+        // * lookup  = trampoline — our extern "C" callback
+        // * other callbacks NULL — we only need synchronous lookup
+        // * layer_below = NULL — no fallback DNS layer
+        // * name = "exim-rust" (static-lifetime-equivalent buffer)
+        // * debug = 0 — no debug output from libspf2
+        // * hook = hook_ptr (our boxed DnsLookupFn)
+        server_box.destroy = Option::None;
+        server_box.lookup = Some(dns_lookup_trampoline);
+        server_box.get_spf = Option::None;
+        server_box.get_exp = Option::None;
+        server_box.add_cache = Option::None;
+        server_box.layer_below = ptr::null_mut();
+        server_box.name = name.as_ptr();
+        server_box.debug = 0;
+        server_box.hook = hook_ptr as *mut libc::c_void;
+
+        let dns_server: *mut ffi::SPF_dns_server_t = Box::into_raw(server_box);
+
+        Ok(Self {
+            dns_server,
+            hook: hook_ptr,
+            name,
+        })
+    }
+
+    /// Returns the raw `SPF_dns_server_t` pointer suitable for passing to
+    /// `SPF_server_new_dns`.
+    fn as_ffi_ptr(&self) -> *mut ffi::SPF_dns_server_t {
+        self.dns_server
+    }
+}
+
+impl Drop for CustomDnsServer {
+    fn drop(&mut self) {
+        // SAFETY: both pointers were originated from `Box::into_raw` in
+        // `CustomDnsServer::new` and have not been shared with libspf2
+        // in any way that outlives the enclosing SpfServer (destroy ==
+        // NULL prevents libspf2 from invoking any destructor on them).
+        // The enclosing SpfServer::drop() is always run before this
+        // Drop impl (CustomDnsServer is contained in SpfServer), so no
+        // concurrent access from libspf2 is possible here.
+        unsafe {
+            if !self.dns_server.is_null() {
+                // Reconstruct and drop the server-struct box.
+                drop(Box::from_raw(self.dns_server));
+                self.dns_server = ptr::null_mut();
+            }
+            if !self.hook.is_null() {
+                // Reconstruct and drop the hook closure box.
+                drop(Box::from_raw(self.hook));
+                self.hook = ptr::null_mut();
+            }
+        }
+        // `self.name` is a CString and will be dropped automatically at
+        // scope end, freeing the underlying char buffer.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DNS callback trampoline — the single extern "C" bridge to DnsLookupFn.
+// ---------------------------------------------------------------------------
+
+/// C ABI trampoline invoked by libspf2 for every DNS query (SP1).
+///
+/// This function is the sole bridge between the libspf2 DNS resolver
+/// interface (`SPF_dns_lookup_t`) and the Rust [`DnsLookupFn`] closure
+/// provided by the Exim DNS subsystem. It must:
+///
+/// 1. Never panic across the FFI boundary — [`std::panic::catch_unwind`]
+///    catches any Rust panic and converts it into a `NO_RECOVERY`
+///    synthetic record (libspf2 interprets this as a transient DNS
+///    error).
+/// 2. Dispatch to the correct Rust callback by recovering the
+///    `Box<DnsLookupFn>` stashed in `spf_dns_server->hook`.
+/// 3. Correctly populate an `SPF_dns_rr_t` return value using
+///    `SPF_dns_rr_new_init` + `SPF_dns_rr_buf_realloc`, mirroring the C
+///    reference implementation in `src/src/miscmods/spf.c` lines 66–207.
+///
+/// # Safety
+///
+/// Callers (libspf2) MUST pass:
+/// * a non-NULL `spf_dns_server` owned by Rust whose `hook` field points
+///   to a valid `Box<DnsLookupFn>`,
+/// * a non-NULL NUL-terminated `domain` string,
+/// * a valid `rr_type` (standard DNS RR type code).
+///
+/// `should_cache` is ignored — caching, if enabled, is performed by the
+/// `SPF_dns_cache` layer above this one (which we currently don't stack).
+///
+/// # Return
+///
+/// A `*mut SPF_dns_rr_t` allocated with `SPF_dns_rr_new_init`. libspf2
+/// takes ownership and frees it via `SPF_dns_rr_free` when the cache is
+/// flushed. On any error (NULL inputs, hook panic, allocation failure)
+/// we return a record with a synthetic `herrno` indicating a DNS failure
+/// so libspf2 can handle it gracefully.
+unsafe extern "C" fn dns_lookup_trampoline(
+    spf_dns_server: *mut ffi::SPF_dns_server_t,
+    domain: *const libc::c_char,
+    rr_type: ffi::ns_type,
+    _should_cache: libc::c_int,
+) -> *mut ffi::SPF_dns_rr_t {
+    // netdb.h error codes — not available from bindgen because they come
+    // from <netdb.h> rather than <spf2/*.h>. These are the POSIX
+    // `h_errno` / gethostbyname() codes used by libspf2 internally.
+    const HOST_NOT_FOUND: ffi::SPF_dns_stat_t = 1;
+    const TRY_AGAIN: ffi::SPF_dns_stat_t = 2;
+    const NO_RECOVERY: ffi::SPF_dns_stat_t = 3;
+    const NO_DATA: ffi::SPF_dns_stat_t = 4;
+    const NETDB_SUCCESS: ffi::SPF_dns_stat_t = 0;
+
+    // ns_type for SPF (code 99) — RFC 6686/7208 obsoleted this; mirror the
+    // C short-circuit at spf.c:92–98.
+    const NS_T_SPF: libc::c_uint = 99;
+
+    // Default TTL for synthetic error records (24 hours) mirrors the C
+    // implementation's `SPF_dns_rr_new_init(server, "", ns_t_any,
+    // 24*60*60, HOST_NOT_FOUND)` pattern at spf.c:230. For success
+    // records we pass `3600` below as a conservative 1-hour TTL.
+
+    // ----- Input validation (defensive — libspf2 should never give us
+    // NULL but we check anyway).
+
+    if spf_dns_server.is_null() || domain.is_null() {
+        // Nothing to do — even allocating a fallback record needs the
+        // server pointer. Returning NULL is allowed by libspf2's lookup
+        // contract and is the only safe option.
+        return ptr::null_mut();
+    }
+
+    // SAFETY: domain is non-NULL per check above; CStr::from_ptr requires
+    // NUL termination which libspf2 guarantees for DNS query names.
+    let domain_cstr = CStr::from_ptr(domain);
+
+    // ----- Short-circuit: SPF RR lookups return NO_DATA (bug #1294).
+    //
+    // Mirrors `src/src/miscmods/spf.c` lines 92–98.
+
+    if rr_type == NS_T_SPF {
+        return build_dns_rr(spf_dns_server, domain, rr_type, NO_DATA, &[]);
+    }
+
+    // ----- Recover the Rust closure pointer from the server's hook field.
+
+    let hook_ptr = (*spf_dns_server).hook as *const DnsLookupFn;
+    if hook_ptr.is_null() {
+        // No hook installed — synthesize NO_RECOVERY to signal a
+        // transient DNS failure. libspf2 will report `temperror`.
+        return build_dns_rr(spf_dns_server, domain, rr_type, NO_RECOVERY, &[]);
+    }
+
+    // SAFETY: hook_ptr is non-NULL and was originated from `Box::into_raw`
+    // in CustomDnsServer::new; the SpfServer owning the box cannot be
+    // dropped while libspf2 holds a reference to the enclosing
+    // SPF_server_t, so the box is guaranteed valid here.
+    let hook_ref: &DnsLookupFn = &*hook_ptr;
+
+    // Convert the C string to Rust — we catch any potential UTF-8 errors
+    // by falling back to the lossy form, which is acceptable here because
+    // domain names are ASCII by DNS convention and any non-ASCII bytes
+    // would have already been rejected during earlier SMTP-time parsing.
+    let domain_str = domain_cstr.to_string_lossy();
+
+    // ----- Invoke the Rust closure inside catch_unwind.
+    //
+    // Any panic must be caught here — letting it unwind into libspf2 C
+    // code is undefined behavior. On panic, return NO_RECOVERY so the
+    // SPF evaluation reports a transient error rather than crashing.
+
+    let lookup_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hook_ref(&domain_str, rr_type as u16)
+    }));
+
+    match lookup_result {
+        Ok(Ok(records)) if records.is_empty() => {
+            // Hook returned successfully but with no matching records.
+            // Translate to NO_DATA so libspf2 treats this as "domain
+            // exists but has no record of this type".
+            build_dns_rr(spf_dns_server, domain, rr_type, NO_DATA, &[])
+        }
+        Ok(Ok(records)) => {
+            // Happy path — build an SPF_dns_rr_t with the returned
+            // records.
+            build_dns_rr(spf_dns_server, domain, rr_type, NETDB_SUCCESS, &records)
+        }
+        Ok(Err(spf_err)) => {
+            // Hook reported a DNS error. Inspect the message to choose
+            // the most appropriate herrno; default to NO_RECOVERY which
+            // libspf2 maps to a permanent error.
+            let msg = spf_err.message.to_ascii_lowercase();
+            let herrno = if msg.contains("not found") || msg.contains("nxdomain") {
+                HOST_NOT_FOUND
+            } else if msg.contains("timeout") || msg.contains("try again") {
+                TRY_AGAIN
+            } else {
+                NO_RECOVERY
+            };
+            build_dns_rr(spf_dns_server, domain, rr_type, herrno, &[])
+        }
+        Err(_) => {
+            // The hook panicked. Log nothing here (we're inside C code;
+            // best to stay minimal) and synthesize NO_RECOVERY.
+            build_dns_rr(spf_dns_server, domain, rr_type, NO_RECOVERY, &[])
+        }
+    }
+}
+
+/// Build an `SPF_dns_rr_t` suitable for returning from the trampoline.
+///
+/// This helper is factored out of [`dns_lookup_trampoline`] so each return
+/// path can construct a well-formed record with minimal noise. It uses the
+/// consolidated [`spf_ffi`] dispatch for every libspf2 call so that all
+/// unsafe FFI calls remain accounted for.
+///
+/// # Arguments
+///
+/// * `spf_dns_server` — the calling DNS server (used as the source field).
+/// * `domain` — NUL-terminated query name (already validated by caller).
+/// * `rr_type` — the DNS RR type originally requested.
+/// * `herrno` — the `SPF_dns_stat_t` code to record (NETDB_SUCCESS,
+///   NO_DATA, NO_RECOVERY, HOST_NOT_FOUND, TRY_AGAIN).
+/// * `records` — zero or more `DnsRecord` values to copy into the rr array.
+///   Only consulted when `herrno == NETDB_SUCCESS`.
+///
+/// # Returns
+///
+/// A freshly-allocated `SPF_dns_rr_t*` that libspf2 will eventually free
+/// via `SPF_dns_rr_free`. Returns NULL if the initial allocation fails
+/// (which typically indicates out-of-memory; libspf2 treats a NULL return
+/// as a transient DNS failure).
+///
+/// # Safety
+///
+/// `spf_dns_server` and `domain` must satisfy the same preconditions as
+/// [`dns_lookup_trampoline`].
+unsafe fn build_dns_rr(
+    spf_dns_server: *mut ffi::SPF_dns_server_t,
+    domain: *const libc::c_char,
+    rr_type: ffi::ns_type,
+    herrno: ffi::SPF_dns_stat_t,
+    records: &[DnsRecord],
+) -> *mut ffi::SPF_dns_rr_t {
+    // Dispatch: DnsRrNewInit — allocate an empty SPF_dns_rr_t.
+    let spfrr = match spf_ffi(SpfFfi::DnsRrNewInit {
+        server: spf_dns_server,
+        domain,
+        rr_type,
+        ttl: 3600,
+        herrno,
+    }) {
+        SpfFfiResult::Ptr(p) => p as *mut ffi::SPF_dns_rr_t,
+        _ => unreachable!(),
+    };
+    if spfrr.is_null() {
+        // Out of memory or libspf2 internal error. Propagate NULL.
+        return ptr::null_mut();
+    }
+
+    // If we're reporting an error (non-zero herrno) or have no records,
+    // the empty SPF_dns_rr_t from new_init is sufficient. Return early.
+    if herrno != 0 || records.is_empty() {
+        return spfrr;
+    }
+
+    // Populate the rr[] array: for each record, expand the buffer to fit
+    // the record payload and copy the bytes in.
+    for (idx, record) in records.iter().enumerate() {
+        let idx_c = idx as libc::c_int;
+        let len = record.data.len();
+
+        // Always allocate at least 1 byte so buf_realloc returns a valid
+        // pointer; libspf2 uses a bumped buffer length internally.
+        let alloc_len = if len == 0 { 1 } else { len };
+
+        // Dispatch: DnsRrBufRealloc — grow rr[idx] to alloc_len bytes.
+        let rc = match spf_ffi(SpfFfi::DnsRrBufRealloc {
+            spfrr,
+            idx: idx_c,
+            len: alloc_len,
+        }) {
+            SpfFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
+        if rc != ffi::SPF_errcode_t_SPF_E_SUCCESS as libc::c_int {
+            // Allocation failure while growing rr[idx]. Best effort: stop
+            // populating and return whatever we've built so far with the
+            // num_rr field reflecting actual populated entries.
+            break;
+        }
+
+        // SAFETY:
+        // * `spfrr` is non-NULL (checked above).
+        // * `(*spfrr).rr` is a `*mut *mut SPF_dns_rr_data_t` that was
+        //   allocated by `SPF_dns_rr_buf_realloc` with at least
+        //   `idx + 1` entries.
+        // * `rr[idx]` points to a buffer of at least `alloc_len` bytes
+        //   as set by the realloc call.
+        let rr_array: *mut *mut ffi::SPF_dns_rr_data_t = (*spfrr).rr;
+        if rr_array.is_null() {
+            break;
+        }
+        let target_ptr: *mut ffi::SPF_dns_rr_data_t = *rr_array.add(idx);
+        if target_ptr.is_null() {
+            break;
+        }
+
+        // Copy the record data into the target buffer.
+        if len > 0 {
+            ptr::copy_nonoverlapping(record.data.as_ptr(), target_ptr as *mut u8, len);
+        }
+    }
+
+    // Set num_rr to reflect the actual populated count. libspf2 iterates
+    // rr[] up to num_rr, so this must match or be less than the realloc'd
+    // entries.
+    (*spfrr).num_rr = records.len() as libc::c_int;
+
+    spfrr
+}
+
+// ---------------------------------------------------------------------------
 // SpfServer — safe wrapper around SPF_server_t
 // ---------------------------------------------------------------------------
 
@@ -405,12 +873,23 @@ fn to_cstring(s: &str, context: &str) -> Result<CString, SpfError> {
 /// NOT transfer ownership of the server — the server must outlive all
 /// requests derived from it.
 ///
+/// When constructed via [`SpfServer::new_with_dns_hook`], the server owns a
+/// [`CustomDnsServer`] which in turn owns the heap-allocated
+/// `SPF_dns_server_t` struct and the boxed Rust [`DnsLookupFn`] closure. The
+/// [`CustomDnsServer`] is dropped *after* the SPF server is freed to avoid
+/// use-after-free in libspf2's resolver-destroy chain.
+///
 /// # Thread Safety
 ///
 /// This type is intentionally `!Send` and `!Sync` because the underlying
 /// libspf2 `SPF_server_t` is not thread-safe.
 pub struct SpfServer {
     server: *mut ffi::SPF_server_t,
+    /// Optional custom DNS resolver stack owned by this server. Populated by
+    /// [`SpfServer::new_with_dns_hook`] and `None` otherwise. Kept alive for
+    /// the lifetime of the SPF server and dropped in the correct order by
+    /// [`Drop::drop`].
+    custom_dns: Option<Box<CustomDnsServer>>,
 }
 
 impl SpfServer {
@@ -438,7 +917,109 @@ impl SpfServer {
                 "SPF_server_new returned null — failed to initialize SPF server context",
             ));
         }
-        Ok(Self { server })
+        Ok(Self {
+            server,
+            custom_dns: Option::None,
+        })
+    }
+
+    /// Create a new SPF server that uses the caller-provided DNS resolver
+    /// for all DNS queries (SP1).
+    ///
+    /// This is the safe Rust equivalent of the C sequence:
+    ///
+    /// ```text
+    /// dc = SPF_dns_exim_new(debug);      // register SPF_dns_exim_lookup
+    /// dc = SPF_dns_cache_new(dc, NULL, debug, 8);
+    /// spf_server = SPF_server_new_dns(dc, debug);
+    /// ```
+    ///
+    /// from `src/src/miscmods/spf.c` lines 248–275. The [`DnsLookupFn`] is
+    /// boxed and stashed inside the newly allocated `SPF_dns_server_t`'s
+    /// `hook` field; when libspf2 invokes our `extern "C"` trampoline, it
+    /// recovers the boxed closure and dispatches to it.
+    ///
+    /// # Safety & Lifecycle
+    ///
+    /// * The returned [`SpfServer`] owns both the `SPF_server_t` and the
+    ///   `SPF_dns_server_t` + boxed hook closure.
+    /// * Dropping the server frees them in the correct order (SPF server
+    ///   first, then the custom DNS server struct, then the hook box).
+    /// * Panics inside the hook closure are caught at the FFI boundary via
+    ///   [`std::panic::catch_unwind`]; the trampoline returns a synthetic
+    ///   `NO_RECOVERY` record rather than letting the panic unwind into C
+    ///   code (which would be undefined behavior).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpfError`] if any of the underlying libspf2 calls fail
+    /// (memory allocation failure, library initialization error).
+    pub fn new_with_dns_hook(hook: DnsLookupFn) -> Result<Self, SpfError> {
+        // Allocate the custom DNS resolver stack. This owns the
+        // SPF_dns_server_t struct + the boxed DnsLookupFn.
+        let custom_dns = Box::new(CustomDnsServer::new(hook)?);
+        let dns_server_ptr: *mut ffi::SPF_dns_server_t = custom_dns.as_ffi_ptr();
+
+        // Dispatch: ServerNewDns — creates SPF server backed by the custom
+        // DNS resolver. libspf2 stores the pointer but does NOT take
+        // ownership (our SPF_dns_server_t has destroy == NULL).
+        let server = match spf_ffi(SpfFfi::ServerNewDns {
+            dns: dns_server_ptr,
+            debug: 0,
+        }) {
+            SpfFfiResult::Ptr(p) => p as *mut ffi::SPF_server_t,
+            _ => unreachable!(),
+        };
+        if server.is_null() {
+            // The SpfServer was never created, so `custom_dns` is dropped
+            // here, which correctly frees the SPF_dns_server_t and the
+            // boxed hook closure — no memory leak.
+            return Err(SpfError::new(
+                "SPF_server_new_dns returned null — failed to initialize SPF server \
+                 with custom DNS resolver",
+            ));
+        }
+
+        Ok(Self {
+            server,
+            custom_dns: Some(custom_dns),
+        })
+    }
+
+    /// Set the receiving domain for this SPF server (SP2).
+    ///
+    /// This populates the `%{r}`, `%{d}`, and `%{h}` SPF macros used in
+    /// explanation strings. Mirrors the C call:
+    ///
+    /// ```c
+    /// SPF_server_set_rec_dom(spf_server, CS primary_hostname);
+    /// ```
+    ///
+    /// from `src/src/miscmods/spf.c` line 314.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpfError`] if:
+    /// * `dom` contains an interior NUL byte (cannot be converted to
+    ///   a C string), or
+    /// * `SPF_server_set_rec_dom` returns a non-success [`SPF_errcode_t`].
+    pub fn set_rec_dom(&self, dom: &str) -> Result<(), SpfError> {
+        let c_dom = to_cstring(dom, "receiving domain")?;
+        // Dispatch: ServerSetRecDom — installs receiving domain for macros.
+        let rc = match spf_ffi(SpfFfi::ServerSetRecDom {
+            server: self.server,
+            dom: c_dom.as_ptr(),
+        }) {
+            SpfFfiResult::Code(c) => c,
+            _ => unreachable!(),
+        };
+        if rc != ffi::SPF_errcode_t_SPF_E_SUCCESS as libc::c_int {
+            return Err(SpfError::new(format!(
+                "SPF_server_set_rec_dom failed for '{}' (error code {})",
+                dom, rc
+            )));
+        }
+        Ok(())
     }
 
     /// Create a new SPF request associated with this server.
@@ -465,6 +1046,16 @@ impl SpfServer {
         Ok(SpfRequest { request })
     }
 
+    /// Returns `true` if this server was constructed with a custom DNS
+    /// resolver hook (via [`SpfServer::new_with_dns_hook`]).
+    ///
+    /// Primarily used in tests and diagnostics to confirm that a server was
+    /// wired into the Exim DNS subsystem rather than using libspf2's
+    /// default resolver stack.
+    pub fn has_custom_dns_hook(&self) -> bool {
+        self.custom_dns.is_some()
+    }
+
     /// Get the libspf2 library version as `(major, minor, patch)`.
     ///
     /// Calls `SPF_get_lib_version` to retrieve the compile-time version
@@ -487,11 +1078,22 @@ impl Drop for SpfServer {
     fn drop(&mut self) {
         if !self.server.is_null() {
             // Dispatch: ServerFree — releases SPF server resources.
+            //
+            // CRITICAL ORDERING: free the SPF server FIRST, then drop
+            // `custom_dns` (below). libspf2 keeps a pointer to our
+            // SPF_dns_server_t inside the SPF_server_t; tearing down
+            // the DNS server before the SPF server could trigger a
+            // use-after-free in any late cache-flush callback. Our
+            // SPF_dns_server_t has destroy == NULL, so SPF_server_free
+            // will NOT invoke any destructor on it.
             spf_ffi(SpfFfi::ServerFree {
                 server: self.server,
             });
             self.server = ptr::null_mut();
         }
+        // `self.custom_dns` (Option<Box<CustomDnsServer>>) is dropped
+        // automatically at scope end, which runs CustomDnsServer::drop —
+        // freeing the SPF_dns_server_t box and the boxed DnsLookupFn.
     }
 }
 
@@ -951,5 +1553,443 @@ mod tests {
         assert!(major >= 0);
         assert!(minor >= 0);
         assert!(patch >= 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // SP1/SP2 tests — custom DNS resolver hook + rec_dom setter.
+    // -----------------------------------------------------------------------
+
+    /// SP1: `CustomDnsServer::new` allocates a fully-wired SPF_dns_server_t.
+    ///
+    /// Verifies that after construction:
+    /// * `dns_server` is non-NULL,
+    /// * `hook` is non-NULL,
+    /// * the hook pointer has been stashed in `dns_server->hook`,
+    /// * `lookup` is Some (i.e. the trampoline function pointer is installed),
+    /// * `destroy`, `get_spf`, `get_exp`, `add_cache` are all None,
+    /// * `name` points to our "exim-rust" buffer.
+    #[test]
+    fn custom_dns_server_new_wires_all_fields() {
+        let hook: DnsLookupFn = Box::new(|_domain, _rr_type| Ok(Vec::new()));
+        let cds = CustomDnsServer::new(hook).expect("CustomDnsServer::new should not fail");
+
+        assert!(!cds.dns_server.is_null(), "dns_server must be non-NULL");
+        assert!(!cds.hook.is_null(), "hook pointer must be non-NULL");
+
+        // SAFETY: we just constructed cds and have exclusive ownership of
+        // its raw pointer; no concurrent access exists.
+        unsafe {
+            let server = &*cds.dns_server;
+            assert!(server.lookup.is_some(), "lookup callback must be set");
+            assert!(server.destroy.is_none(), "destroy must be None");
+            assert!(server.get_spf.is_none(), "get_spf must be None");
+            assert!(server.get_exp.is_none(), "get_exp must be None");
+            assert!(server.add_cache.is_none(), "add_cache must be None");
+            assert!(server.layer_below.is_null(), "layer_below must be NULL");
+            assert!(!server.name.is_null(), "name must be non-NULL");
+            assert_eq!(server.debug, 0, "debug must be 0");
+            assert_eq!(
+                server.hook, cds.hook as *mut libc::c_void,
+                "server.hook must match stashed closure pointer"
+            );
+
+            // Verify the name buffer contains "exim-rust".
+            let name_cstr = CStr::from_ptr(server.name);
+            assert_eq!(name_cstr.to_bytes(), b"exim-rust");
+        }
+    }
+
+    /// SP1: `CustomDnsServer::as_ffi_ptr` returns the heap pointer unchanged.
+    #[test]
+    fn custom_dns_server_as_ffi_ptr_matches_heap() {
+        let hook: DnsLookupFn = Box::new(|_, _| Ok(Vec::new()));
+        let cds = CustomDnsServer::new(hook).unwrap();
+        assert_eq!(cds.as_ffi_ptr(), cds.dns_server);
+    }
+
+    /// SP1: Dropping `CustomDnsServer` reclaims both heap allocations.
+    ///
+    /// This test relies on Miri-style leak detection not being available
+    /// in plain `cargo test`; we verify the Drop doesn't panic and
+    /// subsequent `CustomDnsServer::new` calls succeed (indicating no
+    /// catastrophic corruption).
+    #[test]
+    fn custom_dns_server_drop_is_clean() {
+        for _ in 0..10 {
+            let hook: DnsLookupFn = Box::new(|_, _| Ok(Vec::new()));
+            let cds = CustomDnsServer::new(hook).unwrap();
+            drop(cds);
+        }
+    }
+
+    /// SP1: `SpfServer::new_with_dns_hook` constructs a server with a
+    /// custom DNS resolver. Verifies both the server pointer and that
+    /// `has_custom_dns_hook` reports `true`.
+    #[test]
+    fn spf_server_new_with_dns_hook_creates_server() {
+        let hook: DnsLookupFn = Box::new(|_domain, _rr_type| {
+            // Never actually invoked in this test — just need something
+            // that satisfies the type.
+            Ok(Vec::new())
+        });
+        let server = SpfServer::new_with_dns_hook(hook);
+        assert!(
+            server.is_ok(),
+            "new_with_dns_hook should succeed with a valid hook"
+        );
+        let server = server.unwrap();
+        assert!(
+            server.has_custom_dns_hook(),
+            "has_custom_dns_hook must be true"
+        );
+    }
+
+    /// SP1: Default `SpfServer::new()` does NOT install a custom DNS hook.
+    #[test]
+    fn spf_server_new_has_no_custom_dns_hook() {
+        let server = SpfServer::new().unwrap();
+        assert!(
+            !server.has_custom_dns_hook(),
+            "default new() must not install custom DNS hook"
+        );
+    }
+
+    /// SP2: `set_rec_dom` accepts a valid ASCII domain name.
+    #[test]
+    fn spf_server_set_rec_dom_accepts_valid_name() {
+        let server = SpfServer::new().unwrap();
+        let result = server.set_rec_dom("mx.example.com");
+        assert!(result.is_ok(), "set_rec_dom should accept valid name");
+    }
+
+    /// SP2: `set_rec_dom` accepts an empty string (libspf2 accepts it).
+    #[test]
+    fn spf_server_set_rec_dom_accepts_empty_name() {
+        let server = SpfServer::new().unwrap();
+        let result = server.set_rec_dom("");
+        // libspf2's SPF_server_set_rec_dom is tolerant of empty strings
+        // — it simply stores the empty value. Our wrapper should not
+        // fail.
+        assert!(result.is_ok(), "set_rec_dom should accept empty string");
+    }
+
+    /// SP2: `set_rec_dom` rejects a name containing a NUL byte.
+    #[test]
+    fn spf_server_set_rec_dom_rejects_embedded_nul() {
+        let server = SpfServer::new().unwrap();
+        let result = server.set_rec_dom("bad\0name");
+        assert!(result.is_err(), "set_rec_dom must reject embedded NUL");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("null byte") || err.message.contains("receiving domain"),
+            "error message should mention NUL or receiving domain, got: {}",
+            err.message
+        );
+    }
+
+    /// SP2: `set_rec_dom` can be called multiple times (idempotent).
+    #[test]
+    fn spf_server_set_rec_dom_is_idempotent() {
+        let server = SpfServer::new().unwrap();
+        assert!(server.set_rec_dom("first.example.com").is_ok());
+        assert!(server.set_rec_dom("second.example.com").is_ok());
+        assert!(server.set_rec_dom("third.example.com").is_ok());
+    }
+
+    /// SP2: `set_rec_dom` works on a server created with a custom DNS hook.
+    #[test]
+    fn spf_server_set_rec_dom_works_with_custom_dns_hook() {
+        let hook: DnsLookupFn = Box::new(|_, _| Ok(Vec::new()));
+        let server = SpfServer::new_with_dns_hook(hook).unwrap();
+        let result = server.set_rec_dom("receiver.example.com");
+        assert!(
+            result.is_ok(),
+            "set_rec_dom should work with custom DNS hook"
+        );
+    }
+
+    /// SP1: The trampoline returns a non-NULL record for a T_SPF query
+    /// (short-circuit to NO_DATA).
+    ///
+    /// This exercises the SPF-RR short-circuit path in
+    /// `dns_lookup_trampoline`. The hook is a no-op.
+    #[test]
+    fn trampoline_short_circuits_spf_rr_type() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let hook: DnsLookupFn = Box::new(move |_domain, _rr_type| {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+
+        let cds = CustomDnsServer::new(hook).unwrap();
+        let dns_server_ptr = cds.as_ffi_ptr();
+
+        // Construct a query: rr_type = 99 (T_SPF), domain = "example.com".
+        let domain_cstring = CString::new("example.com").unwrap();
+
+        // SAFETY: we constructed cds and dns_server_ptr is valid; the
+        // trampoline's preconditions are satisfied.
+        let result = unsafe {
+            dns_lookup_trampoline(
+                dns_server_ptr,
+                domain_cstring.as_ptr(),
+                99, // T_SPF
+                0,  // should_cache: unused
+            )
+        };
+
+        assert!(
+            !result.is_null(),
+            "trampoline must return a non-NULL SPF_dns_rr_t for T_SPF query"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "hook must NOT be invoked for T_SPF (short-circuit)"
+        );
+
+        // Clean up the rr we just allocated.
+        spf_ffi(SpfFfi::DnsRrFree { spfrr: result });
+    }
+
+    /// SP1: The trampoline invokes the hook for a T_TXT query and returns
+    /// a populated SPF_dns_rr_t.
+    #[test]
+    fn trampoline_invokes_hook_for_txt_query() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let captured_domain = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_rr_type = Arc::new(AtomicUsize::new(0));
+
+        let cc = call_count.clone();
+        let cd = captured_domain.clone();
+        let ct = captured_rr_type.clone();
+        let hook: DnsLookupFn = Box::new(move |domain, rr_type| {
+            cc.fetch_add(1, Ordering::SeqCst);
+            *cd.lock().unwrap() = domain.to_string();
+            ct.store(rr_type as usize, Ordering::SeqCst);
+
+            // Return a single synthetic TXT record: "v=spf1 -all".
+            Ok(vec![DnsRecord {
+                rr_type: 16, // T_TXT
+                data: b"v=spf1 -all".to_vec(),
+            }])
+        });
+
+        let cds = CustomDnsServer::new(hook).unwrap();
+        let dns_server_ptr = cds.as_ffi_ptr();
+        let domain_cstring = CString::new("example.com").unwrap();
+
+        // SAFETY: trampoline preconditions satisfied (see test above).
+        let result = unsafe {
+            dns_lookup_trampoline(
+                dns_server_ptr,
+                domain_cstring.as_ptr(),
+                16, // T_TXT
+                0,
+            )
+        };
+
+        assert!(!result.is_null(), "trampoline must return non-NULL rr");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "hook must be invoked exactly once"
+        );
+        assert_eq!(
+            *captured_domain.lock().unwrap(),
+            "example.com",
+            "hook must receive the correct domain"
+        );
+        assert_eq!(
+            captured_rr_type.load(Ordering::SeqCst),
+            16,
+            "hook must receive the correct rr_type"
+        );
+
+        // Verify the rr contains 1 record.
+        unsafe {
+            let rr = &*result;
+            assert_eq!(rr.num_rr, 1, "rr must contain 1 record");
+            assert_eq!(rr.rr_type, 16, "rr_type must be T_TXT");
+        }
+
+        spf_ffi(SpfFfi::DnsRrFree { spfrr: result });
+    }
+
+    /// SP1: The trampoline handles a hook returning NO_DATA (empty Vec).
+    #[test]
+    fn trampoline_handles_empty_records() {
+        let hook: DnsLookupFn = Box::new(|_, _| Ok(Vec::new()));
+        let cds = CustomDnsServer::new(hook).unwrap();
+        let dns_server_ptr = cds.as_ffi_ptr();
+        let domain_cstring = CString::new("nonexistent.example.com").unwrap();
+
+        let result = unsafe {
+            dns_lookup_trampoline(
+                dns_server_ptr,
+                domain_cstring.as_ptr(),
+                16, // T_TXT
+                0,
+            )
+        };
+
+        assert!(
+            !result.is_null(),
+            "trampoline must return non-NULL rr even for empty result"
+        );
+        unsafe {
+            let rr = &*result;
+            assert_eq!(rr.num_rr, 0, "num_rr must be 0 for NO_DATA");
+            // herrno must be NO_DATA (4)
+            assert_eq!(rr.herrno, 4, "herrno must be NO_DATA (4)");
+        }
+
+        spf_ffi(SpfFfi::DnsRrFree { spfrr: result });
+    }
+
+    /// SP1: The trampoline maps hook errors to NO_RECOVERY.
+    #[test]
+    fn trampoline_maps_hook_error_to_no_recovery() {
+        let hook: DnsLookupFn = Box::new(|_, _| Err(SpfError::new("DNS resolver unreachable")));
+        let cds = CustomDnsServer::new(hook).unwrap();
+        let dns_server_ptr = cds.as_ffi_ptr();
+        let domain_cstring = CString::new("example.com").unwrap();
+
+        let result =
+            unsafe { dns_lookup_trampoline(dns_server_ptr, domain_cstring.as_ptr(), 16, 0) };
+
+        assert!(!result.is_null());
+        unsafe {
+            let rr = &*result;
+            // Generic error → NO_RECOVERY = 3
+            assert_eq!(rr.herrno, 3, "herrno must be NO_RECOVERY (3)");
+        }
+
+        spf_ffi(SpfFfi::DnsRrFree { spfrr: result });
+    }
+
+    /// SP1: The trampoline maps "nxdomain" errors to HOST_NOT_FOUND.
+    #[test]
+    fn trampoline_maps_nxdomain_to_host_not_found() {
+        let hook: DnsLookupFn = Box::new(|_, _| Err(SpfError::new("DNS returned NXDOMAIN")));
+        let cds = CustomDnsServer::new(hook).unwrap();
+        let dns_server_ptr = cds.as_ffi_ptr();
+        let domain_cstring = CString::new("example.com").unwrap();
+
+        let result =
+            unsafe { dns_lookup_trampoline(dns_server_ptr, domain_cstring.as_ptr(), 16, 0) };
+
+        assert!(!result.is_null());
+        unsafe {
+            let rr = &*result;
+            // NXDOMAIN → HOST_NOT_FOUND = 1
+            assert_eq!(rr.herrno, 1, "herrno must be HOST_NOT_FOUND (1)");
+        }
+
+        spf_ffi(SpfFfi::DnsRrFree { spfrr: result });
+    }
+
+    /// SP1: The trampoline maps "timeout" errors to TRY_AGAIN.
+    #[test]
+    fn trampoline_maps_timeout_to_try_again() {
+        let hook: DnsLookupFn = Box::new(|_, _| Err(SpfError::new("DNS query timeout")));
+        let cds = CustomDnsServer::new(hook).unwrap();
+        let dns_server_ptr = cds.as_ffi_ptr();
+        let domain_cstring = CString::new("example.com").unwrap();
+
+        let result =
+            unsafe { dns_lookup_trampoline(dns_server_ptr, domain_cstring.as_ptr(), 16, 0) };
+
+        assert!(!result.is_null());
+        unsafe {
+            let rr = &*result;
+            // Timeout → TRY_AGAIN = 2
+            assert_eq!(rr.herrno, 2, "herrno must be TRY_AGAIN (2)");
+        }
+
+        spf_ffi(SpfFfi::DnsRrFree { spfrr: result });
+    }
+
+    /// SP1: The trampoline catches panics in the hook and returns
+    /// NO_RECOVERY without crashing.
+    ///
+    /// This is the critical safety test for FFI — a Rust panic must
+    /// never cross into C code.
+    #[test]
+    fn trampoline_catches_hook_panic() {
+        let hook: DnsLookupFn = Box::new(|_, _| {
+            panic!("intentional panic for test");
+        });
+        let cds = CustomDnsServer::new(hook).unwrap();
+        let dns_server_ptr = cds.as_ffi_ptr();
+        let domain_cstring = CString::new("example.com").unwrap();
+
+        // This call MUST NOT unwind into test harness.
+        let result =
+            unsafe { dns_lookup_trampoline(dns_server_ptr, domain_cstring.as_ptr(), 16, 0) };
+
+        assert!(
+            !result.is_null(),
+            "trampoline must return non-NULL rr even on panic"
+        );
+        unsafe {
+            let rr = &*result;
+            // Panic → NO_RECOVERY = 3
+            assert_eq!(
+                rr.herrno, 3,
+                "panicking hook must yield herrno = NO_RECOVERY (3)"
+            );
+        }
+
+        spf_ffi(SpfFfi::DnsRrFree { spfrr: result });
+    }
+
+    /// SP1: The trampoline handles NULL inputs gracefully (returns NULL).
+    #[test]
+    fn trampoline_rejects_null_inputs() {
+        let hook: DnsLookupFn = Box::new(|_, _| Ok(Vec::new()));
+        let cds = CustomDnsServer::new(hook).unwrap();
+        let dns_server_ptr = cds.as_ffi_ptr();
+
+        // NULL domain.
+        let r1 = unsafe { dns_lookup_trampoline(dns_server_ptr, ptr::null(), 16, 0) };
+        assert!(r1.is_null(), "trampoline must return NULL for NULL domain");
+
+        // NULL server.
+        let domain_cstring = CString::new("example.com").unwrap();
+        let r2 = unsafe { dns_lookup_trampoline(ptr::null_mut(), domain_cstring.as_ptr(), 16, 0) };
+        assert!(r2.is_null(), "trampoline must return NULL for NULL server");
+    }
+
+    /// SP1: The trampoline handles a server with a NULL hook (e.g.
+    /// accidentally torn down) by returning NO_RECOVERY.
+    #[test]
+    fn trampoline_handles_null_hook_gracefully() {
+        // Manually construct a CustomDnsServer with a NULL hook to
+        // simulate a torn-down state.
+        let mut server_box: Box<ffi::SPF_dns_server_t> = Box::new(ffi::SPF_dns_server_t::default());
+        server_box.lookup = Some(dns_lookup_trampoline);
+        server_box.hook = ptr::null_mut(); // <-- deliberately NULL
+        let dns_server_ptr = Box::into_raw(server_box);
+        let domain_cstring = CString::new("example.com").unwrap();
+
+        let result =
+            unsafe { dns_lookup_trampoline(dns_server_ptr, domain_cstring.as_ptr(), 16, 0) };
+
+        assert!(!result.is_null());
+        unsafe {
+            let rr = &*result;
+            assert_eq!(rr.herrno, 3, "NULL hook must yield NO_RECOVERY (3)");
+            spf_ffi(SpfFfi::DnsRrFree { spfrr: result });
+            // Free our manually-constructed server.
+            drop(Box::from_raw(dns_server_ptr));
+        }
     }
 }

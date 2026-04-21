@@ -77,6 +77,7 @@ use exim_drivers::DriverInfoBase;
 // =============================================================================
 
 use exim_dns::{DnsError, DnsRecordData, DnsRecordType, DnsResolver, DnsResult};
+use std::rc::Rc;
 
 // =============================================================================
 // Internal Imports — pdkim submodule
@@ -648,30 +649,66 @@ fn dkim_init(state: &mut DkimState) {
 /// # Arguments
 ///
 /// * `state` — Mutable DKIM state for this connection.
-/// * `dns` — DNS resolver for public-key lookups (captured in callback closure).
+/// * `dns` — Shared DNS resolver for public-key lookups.  Wrapped in [`Rc`]
+///   so it can be cloned into the `'static` DNS callback closure that PDKIM
+///   requires.  Per AAP §0.4.3 the daemon uses a fork-per-connection model,
+///   so single-threaded `Rc` is correct (no cross-thread sharing possible
+///   within one connection's process).
 #[instrument(level = "debug", skip_all)]
-pub fn verify_init(state: &mut DkimState, _dns: &DnsResolver) -> Result<(), DkimError> {
+pub fn verify_init(state: &mut DkimState, dns: Rc<DnsResolver>) -> Result<(), DkimError> {
     if !state.init_done {
         dkim_init(state);
     }
 
     // Create a DNS callback closure for PDKIM to fetch TXT records.
-    // The DnsResolver is not Send, so we create a new one for the callback
-    // context.  In production, this would use a shared resolver reference.
-    let dns_callback = {
-        // PDKIM's dns_txt_callback expects: fn(&str) -> Option<String>
-        // We bridge to our query_dns_txt function.
-        move |name: &str| -> Option<String> {
-            // We cannot capture the DnsResolver here because it's not 'static.
-            // Instead, create a minimal resolver for the callback.
-            // In production integration, this would use the shared resolver.
-            // For now, return None to indicate DNS unavailable in callback;
-            // actual DNS lookups happen through verify_finish processing.
-            debug!(
-                name = name,
-                "DKIM: DNS TXT callback invoked (deferred to external resolver)"
-            );
-            None
+    //
+    // `DnsTxtCallback` is `Box<dyn Fn(&str) -> Option<String>>` with an
+    // implicit `'static` bound, so we must own (not borrow) the resolver
+    // inside the closure.  `Rc<DnsResolver>` is the right fit for the
+    // fork-per-connection model: cheap to clone, no `Send` requirement,
+    // and the resolver is dropped when the last closure referencing it
+    // goes out of scope at end-of-message.
+    //
+    // This closure is PDKIM's ONLY path to DNS, so correctness here is
+    // load-bearing for the entire DKIM verification pipeline.  Any `None`
+    // return at the callback level is interpreted by PDKIM as
+    // `VerifyExtStatus::InvalidPubkeyUnavailable` (a temperror), which is
+    // the safe fail-closed default when DNS genuinely has no answer.
+    let dns_for_callback = Rc::clone(&dns);
+    let dns_callback = move |name: &str| -> Option<String> {
+        // Bridge to [`query_dns_txt`] which handles:
+        //   - DnsResult::Succeed vs. Fail/Again/Defer
+        //   - Multi-part TXT RDATA concatenation
+        //   - PDKIM_DNS_TXT_MAX_RECLEN enforcement
+        //   - DKIM-looking record preference (`v=DKIM`, `p=…`)
+        match query_dns_txt(name, dns_for_callback.as_ref()) {
+            Ok(tainted) => {
+                // Unwrap the Tainted<String> — PDKIM parses the record
+                // text and applies its own validation before trusting
+                // any tag values derived from it.
+                let record = tainted.into_inner();
+                debug!(
+                    name = name,
+                    len = record.len(),
+                    "DKIM: DNS TXT callback returning record"
+                );
+                Some(record)
+            }
+            Err(DkimError::DnsLookupFailed { .. }) => {
+                debug!(
+                    name = name,
+                    "DKIM: DNS TXT lookup failed — signalling temperror to PDKIM"
+                );
+                None
+            }
+            Err(other) => {
+                warn!(
+                    name = name,
+                    error = %other,
+                    "DKIM: unexpected error from DNS TXT callback"
+                );
+                None
+            }
         }
     };
 
@@ -687,7 +724,7 @@ pub fn verify_init(state: &mut DkimState, _dns: &DnsResolver) -> Result<(), Dkim
 
     debug!(
         max_sigs = DKIM_MAX_SIGNATURES,
-        "DKIM: verification context initialized"
+        "DKIM: verification context initialized with live DNS TXT callback"
     );
     Ok(())
 }

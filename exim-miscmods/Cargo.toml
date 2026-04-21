@@ -256,9 +256,40 @@ sha1 = { workspace = true }
 # computation. SHA-256 is the most common DKIM hash algorithm.
 sha2 = { workspace = true }
 
+# Pure-Rust RSA (PKCS#1 v1.5 + PSS) signing/verification — required by
+# DKIM (rsa-sha1/rsa-sha256) and ARC-Seal/ARC-Message-Signature.
+# The `sha2` feature integrates the workspace sha2 0.10 digest types
+# so RSA signatures are produced from already-accumulated SHA-256 hashes.
+# The default `encoding` feature pulls in pkcs1/pkcs8/spki transitively,
+# enabling PEM/DER key parsing without additional direct dependencies.
+rsa = { workspace = true }
+
+# Pure-Rust Ed25519 (RFC 8032) signing/verification — required for
+# DKIM/ARC ed25519-sha256 signatures (RFC 8463).
+ed25519-dalek = { workspace = true }
+
+# Generic Signer/Verifier traits used by the rsa and ed25519-dalek APIs.
+# Re-exported here so `signature::{Signer, Verifier, SignatureEncoding}`
+# can be used uniformly across the crypto_sign/crypto_verify dispatch.
+signature = { workspace = true }
+
+# Random number generation — rsa::pkcs1v15::SigningKey::sign uses
+# deterministic output, but RSA-PSS and Ed25519 key generation (in tests)
+# require a CSPRNG. Also used by DMARC pct= sampling (DN1 remediation).
+rand = { workspace = true }
+rand_core = { workspace = true }
+
 # C type definitions — required for low-level operations in DSCP (setsockopt
 # with IPPROTO_IP/IPV6_TCLASS) and PROXY protocol (socket address structures).
 libc = { workspace = true }
+
+# Public Suffix List parser — required by DMARC (RFC 7489 §3.2) to correctly
+# determine the organizational domain for a given DNS name. The naïve
+# "split on first dot" approach fails for multi-label TLDs (co.uk, com.au,
+# pvt.k12.ca.us), producing incorrect alignment results. This crate parses
+# Mozilla's Public Suffix List and provides `Psl::domain()` for registrable
+# domain lookup. Used by DM2 remediation in dmarc.rs.
+publicsuffix = { workspace = true }
 
 # =============================================================================
 # Library Target

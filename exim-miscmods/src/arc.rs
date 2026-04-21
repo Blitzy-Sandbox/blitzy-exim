@@ -39,14 +39,17 @@
 // External imports
 // ---------------------------------------------------------------------------
 
+use std::rc::Rc;
 use thiserror::Error;
 use tracing::{debug, info};
+
+use exim_dns::DnsResolver;
 
 // ---------------------------------------------------------------------------
 // Internal imports — DKIM module (same crate)
 // ---------------------------------------------------------------------------
 
-use super::dkim::pdkim::signing::{HashAlgorithm, SigningError};
+use super::dkim::pdkim::signing::{self, HashAlgorithm, KeyFormat, KeyType, SigningError};
 use super::dkim::pdkim::{
     self, decode_base64, encode_base64, relax_header_n, Canon, PdkimError,
     PDKIM_DEFAULT_SIGN_HEADERS,
@@ -392,6 +395,20 @@ pub struct ArcSigningContext {
 
     /// Reverse-order list of message header texts for signing.
     pub headers_rlist: Vec<HeaderEntry>,
+
+    /// Pre-existing ARC chain parsed from the inbound message headers.
+    ///
+    /// Populated by [`arc_sign_init`] by parsing any existing AAR/AMS/AS
+    /// headers in the message.  Consumed by [`arc_sign`] when constructing
+    /// the ARC-Seal `hdata` accumulator for signing: the chain must be
+    /// hashed in instance-ascending order — AAR(i=1), AMS(i=1), AS(i=1),
+    /// AAR(i=2), AMS(i=2), AS(i=2), ..., followed by the *new* set's
+    /// AAR+AMS+AS-with-empty-b — per RFC 8617 §5.1.2.
+    ///
+    /// Mirrors the C code's reliance on `ctx->arcset_chain` from
+    /// `arc_sign_prepend_as()` (arc.c lines 1643–1670) which walks the
+    /// entire chain when signing a non-fail AS.
+    pub existing_sets: Vec<ArcSet>,
 }
 
 // ===========================================================================
@@ -864,22 +881,32 @@ fn arc_vfy_collect_hdrs(
     Ok(ArcState::Pass) // Placeholder — further checks follow
 }
 
-/// Compute the header hash for AMS verification.
+/// Compute the raw canonicalized data bytes used as input for AMS
+/// signature verification.
 ///
-/// Replaces C `arc_get_verify_hhash()` (arc.c lines 655–710).
-fn arc_get_verify_hhash(headers_rlist: &mut [HeaderEntry], ams: &ArcLine) -> Vec<u8> {
+/// Walks the reverse-order header list and, for each header name listed in
+/// `ams.signed_headers` (the `h=` tag), finds the first unused matching
+/// header, canonicalizes it per the AMS `c=` setting, and appends it to the
+/// accumulation buffer. Finally appends the AMS header itself (with the
+/// `b=` value stripped, no trailing CRLF) which is the self-signed
+/// pseudo-header per RFC 6376 §3.5.
+///
+/// The returned bytes are passed directly to [`signing::verify`] as the
+/// message to verify against; the Rust signing backend (`RustCrypto`) then
+/// hashes the data internally (using SHA-256 for `rsa-sha256` or raw mode
+/// for Ed25519) before performing the public-key verification.
+///
+/// This differs from the C implementation which pre-computes a hash and
+/// passes it to GnuTLS `gnutls_pubkey_verify_hash2` (which expects a hash
+/// rather than raw data). The semantic result is identical — the same
+/// digest is computed — but the API boundary is different.
+///
+/// Replaces C `arc_get_verify_hhash()` (arc.c lines 655–710), adapted to
+/// the RustCrypto API shape.
+fn arc_get_verify_data(headers_rlist: &mut [HeaderEntry], ams: &ArcLine) -> Vec<u8> {
     let is_relaxed = ams.canonicalization.0 == Canon::Relaxed;
-    let hash_algo = HashAlgorithm::from_name(&ams.algorithm_hash);
 
-    let algo = match hash_algo {
-        Some(a) => a,
-        Option::None => {
-            debug!("ARC: hash setup error, possibly nonhandled hashtype");
-            return Vec::new();
-        }
-    };
-
-    let mut hasher = pdkim::HashContext::new_from_algo(algo);
+    let mut data = Vec::new();
 
     debug!("ARC: AMS header data for verification:");
 
@@ -907,7 +934,7 @@ fn arc_get_verify_hhash(headers_rlist: &mut [HeaderEntry], ams: &ArcLine) -> Vec
                         entry.text.clone()
                     };
                     debug!("  {}", s.trim_end());
-                    hasher.update(s.as_bytes());
+                    data.extend_from_slice(s.as_bytes());
                     entry.used = true;
                     break;
                 }
@@ -923,17 +950,50 @@ fn arc_get_verify_hhash(headers_rlist: &mut [HeaderEntry], ams: &ArcLine) -> Vec
         sig_header.clone()
     };
     debug!("  {}", s.trim_end());
-    hasher.update(s.as_bytes());
+    data.extend_from_slice(s.as_bytes());
 
-    let result = hasher.finalize();
-    debug!("ARC: header hash: {:02x?}", &result);
-    result
+    debug!("ARC: AMS raw verify-data len={}", data.len());
+    data
 }
 
-/// Verify an ARC-Message-Signature (similar to DKIM signature verification).
+/// Map an ARC algorithm string (e.g. `"rsa-sha256"`, `"ed25519-sha256"`)
+/// into the pair ([`KeyType`], [`HashAlgorithm`]) required by
+/// [`signing::verify_init`] / [`signing::signing_init`].
+///
+/// Returns `None` if the key-type or hash-algo portion is unrecognized.
+/// RFC 8617 mandates `rsa-sha256` but Ed25519 is also widely implemented.
+fn arc_algo_components(
+    algorithm_key: &str,
+    algorithm_hash: &str,
+) -> Option<(KeyType, HashAlgorithm)> {
+    let key_type = match algorithm_key.to_ascii_lowercase().as_str() {
+        "rsa" => KeyType::Rsa,
+        "ed25519" => KeyType::Ed25519,
+        _ => return None,
+    };
+    let hash_algo = HashAlgorithm::from_name(algorithm_hash)?;
+    Some((key_type, hash_algo))
+}
+
+/// Verify an ARC-Message-Signature.
+///
+/// Performs real cryptographic verification: fetches the DKIM public key
+/// from DNS using the AMS `d=`/`s=` tags, canonicalizes the signed
+/// headers plus the AMS pseudo-header (with `b=` stripped), then invokes
+/// [`signing::verify`] which hashes the data internally and checks the
+/// public-key signature.
 ///
 /// Replaces C `arc_ams_verify()` (arc.c lines 855–938).
-fn arc_ams_verify(state: &mut ArcVerifyState, set_index: usize) -> Result<(), ArcError> {
+///
+/// When `dns` is `None`, verification is limited to structural checks
+/// (required-tag presence and format). This mode is used only by tests
+/// that exercise non-verification code paths; in production the DNS
+/// resolver is always passed in from the DATA ACL.
+fn arc_ams_verify(
+    state: &mut ArcVerifyState,
+    set_index: usize,
+    dns: Option<&DnsResolver>,
+) -> Result<(), ArcError> {
     let arc_set = &state.ctx.arcset_chain[set_index];
     let ams = match &arc_set.hdr_ams {
         Some(ams) => ams.clone(),
@@ -982,41 +1042,135 @@ fn arc_ams_verify(state: &mut ArcVerifyState, set_index: usize) -> Result<(), Ar
 
     state.ctx.arcset_chain[set_index].ams_verify_done = Some("in-progress".to_string());
 
-    // Compute the header hash
-    let hhash = arc_get_verify_hhash(&mut state.headers_rlist, &ams);
-    if hhash.is_empty() {
-        let reason = "AMS header hash computation failed";
-        state.ctx.arcset_chain[set_index].ams_verify_done = Some(reason.to_string());
-        state.state_reason = Some(reason.to_string());
-        return Err(ArcError::VerificationError(reason.to_string()));
-    }
-
     debug!(
         "ARC i={} AMS verify — domain={}, selector={}",
         ams.instance, ams.domain, ams.selector
     );
 
-    // For now, mark as passed (full crypto verification requires DNS lookup
-    // which needs a DnsResolver that is injected at the integration level).
-    // The verification pipeline is: compute header hash, fetch public key
-    // from DNS, verify signature against hash using public key.
-    //
-    // In the integrated system, this calls dkim::sig_verify() with the
-    // DNS-fetched public key. Here we provide the framework for the full
-    // verification to be connected when the DNS resolver is available.
+    // Compute the raw canonicalized data bytes for verification.
+    let verify_data = arc_get_verify_data(&mut state.headers_rlist, &ams);
+    if verify_data.is_empty() {
+        let reason = "AMS header data computation failed";
+        state.ctx.arcset_chain[set_index].ams_verify_done = Some(reason.to_string());
+        state.state_reason = Some(reason.to_string());
+        return Err(ArcError::VerificationError(reason.to_string()));
+    }
 
-    debug!("ARC i={} AMS verify pass (structural)", ams.instance);
-    state.ctx.arcset_chain[set_index].ams_verify_passed = true;
-    state.ctx.arcset_chain[set_index].ams_verify_done = Some("pass".to_string());
+    // When no DNS resolver is supplied (test-only path), skip the
+    // cryptographic step and leave the entry marked as unverified.
+    // This keeps legacy no-DNS tests compilable without asserting a
+    // false "pass" state.
+    let resolver = match dns {
+        Some(r) => r,
+        Option::None => {
+            debug!(
+                "ARC i={} AMS verify: no DNS resolver — skipping signature check",
+                ams.instance
+            );
+            state.ctx.arcset_chain[set_index].ams_verify_done = Some("no dns".to_string());
+            state.state_reason = Some("no dns resolver available".to_string());
+            return Err(ArcError::VerificationError("no dns resolver".to_string()));
+        }
+    };
 
-    Ok(())
+    // Decode the base64-encoded signature into raw bytes for verify().
+    let signature = match decode_base64(&String::from_utf8_lossy(&ams.signature)) {
+        Some(bytes) => bytes,
+        Option::None => {
+            // Signature is already stored as raw bytes by the parser, so
+            // this fallback path is just defensive; try raw directly.
+            ams.signature.clone()
+        }
+    };
+    let sig_bytes = if signature.is_empty() {
+        ams.signature.clone()
+    } else {
+        signature
+    };
+
+    // Fetch the DKIM public key from DNS. The DKIM _domainkey namespace
+    // is shared between DKIM and ARC per RFC 8617 §4.1.3.
+    let dnsname = format!("{}._domainkey.{}", ams.selector, ams.domain);
+    let (pubkey_bytes, _dns_hashes) = match super::dkim::parse_dns_pubkey(&dnsname, resolver) {
+        Ok(tup) => tup,
+        Err(e) => {
+            let reason = format!("DNS pubkey fetch failed for {}: {}", dnsname, e);
+            state.ctx.arcset_chain[set_index].ams_verify_done = Some(reason.clone());
+            state.state_reason = Some(reason.clone());
+            return Err(ArcError::VerificationError(reason));
+        }
+    };
+
+    // Map algorithm strings to the signing-module enums.
+    let (key_type, hash_algo) = match arc_algo_components(&ams.algorithm_key, &ams.algorithm_hash) {
+        Some(tup) => tup,
+        Option::None => {
+            let reason = format!(
+                "unsupported algorithm: {}-{}",
+                ams.algorithm_key, ams.algorithm_hash
+            );
+            state.ctx.arcset_chain[set_index].ams_verify_done = Some(reason.clone());
+            state.state_reason = Some(reason.clone());
+            return Err(ArcError::VerificationError(reason));
+        }
+    };
+
+    // Ed25519 public keys in DNS are raw 32-byte values; RSA keys are
+    // DER-encoded `SubjectPublicKeyInfo` per RFC 6376.
+    let key_format = match key_type {
+        KeyType::Ed25519 => KeyFormat::Ed25519Bare,
+        KeyType::Rsa => KeyFormat::Der,
+    };
+
+    // Initialize verification context, feed raw data, and verify. The
+    // RustCrypto backend hashes the data internally; we pass the raw
+    // canonicalized bytes (NOT a pre-computed digest).
+    let (mut vctx, _key_bits) = match signing::verify_init(&pubkey_bytes, key_type, key_format) {
+        Ok(tup) => tup,
+        Err(e) => {
+            let reason = format!("verify_init failed: {}", e);
+            state.ctx.arcset_chain[set_index].ams_verify_done = Some(reason.clone());
+            state.state_reason = Some(reason.clone());
+            return Err(ArcError::VerificationError(reason));
+        }
+    };
+    vctx.data_append(&verify_data);
+
+    let verified = match signing::verify(&mut vctx, &sig_bytes, hash_algo) {
+        Ok(b) => b,
+        Err(e) => {
+            let reason = format!("verify failed: {}", e);
+            state.ctx.arcset_chain[set_index].ams_verify_done = Some(reason.clone());
+            state.state_reason = Some(reason.clone());
+            return Err(ArcError::VerificationError(reason));
+        }
+    };
+
+    if verified {
+        debug!("ARC i={} AMS verify pass (crypto)", ams.instance);
+        state.ctx.arcset_chain[set_index].ams_verify_passed = true;
+        state.ctx.arcset_chain[set_index].ams_verify_done = Some("pass".to_string());
+        Ok(())
+    } else {
+        let reason = "AMS signature mismatch";
+        debug!(
+            "ARC i={} AMS verify fail (signature mismatch)",
+            ams.instance
+        );
+        state.ctx.arcset_chain[set_index].ams_verify_done = Some(reason.to_string());
+        state.state_reason = Some(reason.to_string());
+        Err(ArcError::VerificationError(reason.to_string()))
+    }
 }
 
 /// Check chain integrity: sequential instances, all members present, no
 /// cv=fail seals. Also verify the latest AMS.
 ///
 /// Replaces C `arc_headers_check()` (arc.c lines 947–1008).
-fn arc_headers_check(state: &mut ArcVerifyState) -> Result<(), ArcError> {
+fn arc_headers_check(
+    state: &mut ArcVerifyState,
+    dns: Option<&DnsResolver>,
+) -> Result<(), ArcError> {
     let chain_len = state.ctx.arcset_chain.len();
     if chain_len == 0 {
         return Err(ArcError::ChainValidation("no ARC sets".to_string()));
@@ -1059,7 +1213,7 @@ fn arc_headers_check(state: &mut ArcVerifyState) -> Result<(), ArcError> {
 
         // Evaluate AMS verification for oldest-pass tracking
         if !ams_fail_found {
-            match arc_ams_verify(state, idx) {
+            match arc_ams_verify(state, idx, dns) {
                 Ok(()) => {
                     state.oldest_pass = expected_inst;
                 }
@@ -1092,7 +1246,7 @@ fn arc_headers_check(state: &mut ArcVerifyState) -> Result<(), ArcError> {
                 return Err(ArcError::VerificationError(done.clone()));
             }
         }
-        arc_ams_verify(state, last_idx)?;
+        arc_ams_verify(state, last_idx, dns)?;
     }
 
     Ok(())
@@ -1101,7 +1255,7 @@ fn arc_headers_check(state: &mut ArcVerifyState) -> Result<(), ArcError> {
 /// Verify all ARC-Seal signatures in the chain.
 ///
 /// Replaces C `arc_verify_seals()` (arc.c lines 1150–1162).
-fn arc_verify_seals(state: &mut ArcVerifyState) -> Result<(), ArcError> {
+fn arc_verify_seals(state: &mut ArcVerifyState, dns: Option<&DnsResolver>) -> Result<(), ArcError> {
     let chain_len = state.ctx.arcset_chain.len();
     if chain_len == 0 {
         return Err(ArcError::ChainValidation("no ARC sets".to_string()));
@@ -1109,17 +1263,78 @@ fn arc_verify_seals(state: &mut ArcVerifyState) -> Result<(), ArcError> {
 
     // Verify seals from highest to lowest instance
     for idx in (0..chain_len).rev() {
-        arc_seal_verify(state, idx)?;
+        arc_seal_verify(state, idx, dns)?;
     }
 
     debug!("ARC: AS vfy overall pass");
     Ok(())
 }
 
+/// Build the raw canonicalized byte sequence used as input for ARC-Seal
+/// signature verification.
+///
+/// RFC 8617 §5.1.2 specifies the AS hash input as the concatenation of
+/// canonicalized AAR+AMS+AS triples from the earliest instance up to and
+/// including the seal being verified. For the seal being verified itself,
+/// the `b=` value is stripped and no trailing CRLF is appended; all
+/// other headers use their complete form with a trailing CRLF.
+///
+/// The returned bytes are passed directly to [`signing::verify`], which
+/// hashes them internally per the configured hash algorithm.
+fn arc_get_seal_verify_data(arcset_chain: &[ArcSet], set_index: usize) -> Vec<u8> {
+    let mut data = Vec::new();
+    debug!("ARC: AS header data for verification:");
+
+    for chain_idx in 0..=set_index {
+        let chain_set = &arcset_chain[chain_idx];
+
+        if let Some(ref aar) = chain_set.hdr_aar {
+            let s = relax_header_n(&aar.complete, aar.complete.len(), true);
+            debug!("  {}", s.trim_end());
+            data.extend_from_slice(s.as_bytes());
+        }
+
+        if let Some(ref ams) = chain_set.hdr_ams {
+            let s = relax_header_n(&ams.complete, ams.complete.len(), true);
+            debug!("  {}", s.trim_end());
+            data.extend_from_slice(s.as_bytes());
+        }
+
+        if let Some(ref as_hdr) = chain_set.hdr_as {
+            let s = if chain_idx == set_index {
+                relax_header_n(
+                    &as_hdr.raw_sig_no_b_val,
+                    as_hdr.raw_sig_no_b_val.len(),
+                    false,
+                )
+            } else {
+                relax_header_n(&as_hdr.complete, as_hdr.complete.len(), true)
+            };
+            debug!("  {}", s.trim_end());
+            data.extend_from_slice(s.as_bytes());
+        }
+    }
+
+    data
+}
+
 /// Verify a single ARC-Seal.
 ///
+/// Performs real cryptographic verification: walks the chain to build the
+/// seal-hash input, fetches the seal's DKIM public key from DNS using the
+/// AS `d=`/`s=` tags, then invokes [`signing::verify`] which hashes the
+/// data and checks the public-key signature.
+///
 /// Replaces C `arc_seal_verify()` (arc.c lines 1012–1147).
-fn arc_seal_verify(state: &mut ArcVerifyState, set_index: usize) -> Result<(), ArcError> {
+///
+/// When `dns` is `None`, structural verification (cv= state checks) is
+/// performed but the signature check is skipped. This is used only by
+/// tests and returns `Err` so the chain is flagged as unverified.
+fn arc_seal_verify(
+    state: &mut ArcVerifyState,
+    set_index: usize,
+    dns: Option<&DnsResolver>,
+) -> Result<(), ArcError> {
     let arc_set = &state.ctx.arcset_chain[set_index];
     let instance = arc_set.instance;
 
@@ -1142,69 +1357,96 @@ fn arc_seal_verify(state: &mut ArcVerifyState, set_index: usize) -> Result<(), A
         return Err(ArcError::ChainValidation("seal cv state".to_string()));
     }
 
-    // Step 3: Initialize hash for ARC-Seal verification
-    let hash_algo = HashAlgorithm::from_name(&hdr_as.algorithm_hash);
-    let algo = match hash_algo {
-        Some(a) => a,
+    // Step 3: Build canonicalized data bytes for this seal.
+    let seal_data = arc_get_seal_verify_data(&state.ctx.arcset_chain, set_index);
+    debug!(
+        "ARC i={} AS raw seal-data len={}",
+        instance,
+        seal_data.len()
+    );
+
+    // Step 4: Fetch public key if DNS resolver is available.
+    let resolver = match dns {
+        Some(r) => r,
         Option::None => {
-            state.state_reason = Some("seal hash setup error".to_string());
-            return Err(ArcError::VerificationError(
-                "seal hash setup error".to_string(),
-            ));
+            state.state_reason = Some("no dns resolver available".to_string());
+            debug!(
+                "ARC i={} AS verify: no DNS resolver — skipping signature check",
+                instance
+            );
+            return Err(ArcError::VerificationError("no dns resolver".to_string()));
         }
     };
 
-    let mut hasher = pdkim::HashContext::new_from_algo(algo);
-
-    // Step 4: Compute canonicalized form of ARC header fields
-    debug!("ARC: AS header data for verification:");
-
-    for chain_idx in 0..=set_index {
-        let chain_set = &state.ctx.arcset_chain[chain_idx];
-
-        // Hash AAR
-        if let Some(ref aar) = chain_set.hdr_aar {
-            let s = relax_header_n(&aar.complete, aar.complete.len(), true);
-            debug!("  {}", s.trim_end());
-            hasher.update(s.as_bytes());
+    let dnsname = format!("{}._domainkey.{}", hdr_as.selector, hdr_as.domain);
+    let (pubkey_bytes, _dns_hashes) = match super::dkim::parse_dns_pubkey(&dnsname, resolver) {
+        Ok(tup) => tup,
+        Err(e) => {
+            let reason = format!("DNS pubkey fetch failed for {}: {}", dnsname, e);
+            state.state_reason = Some(reason.clone());
+            return Err(ArcError::VerificationError(reason));
         }
+    };
 
-        // Hash AMS
-        if let Some(ref ams) = chain_set.hdr_ams {
-            let s = relax_header_n(&ams.complete, ams.complete.len(), true);
-            debug!("  {}", s.trim_end());
-            hasher.update(s.as_bytes());
-        }
+    // Step 5: Map algorithm strings to the signing-module enums.
+    let (key_type, hash_algo) =
+        match arc_algo_components(&hdr_as.algorithm_key, &hdr_as.algorithm_hash) {
+            Some(tup) => tup,
+            Option::None => {
+                let reason = format!(
+                    "unsupported seal algorithm: {}-{}",
+                    hdr_as.algorithm_key, hdr_as.algorithm_hash
+                );
+                state.state_reason = Some(reason.clone());
+                return Err(ArcError::VerificationError(reason));
+            }
+        };
 
-        // Hash AS — for the current set, use raw_sig_no_b_val
-        if let Some(ref as_hdr) = chain_set.hdr_as {
-            let s = if chain_idx == set_index {
-                relax_header_n(
-                    &as_hdr.raw_sig_no_b_val,
-                    as_hdr.raw_sig_no_b_val.len(),
-                    false,
-                )
-            } else {
-                relax_header_n(&as_hdr.complete, as_hdr.complete.len(), true)
-            };
-            debug!("  {}", s.trim_end());
-            hasher.update(s.as_bytes());
-        }
+    let key_format = match key_type {
+        KeyType::Ed25519 => KeyFormat::Ed25519Bare,
+        KeyType::Rsa => KeyFormat::Der,
+    };
+
+    // Step 6: Decode the base64 signature bytes.
+    let signature = match decode_base64(&String::from_utf8_lossy(&hdr_as.signature)) {
+        Some(bytes) if !bytes.is_empty() => bytes,
+        _ => hdr_as.signature.clone(),
+    };
+    if signature.is_empty() {
+        let reason = format!("AS i={} signature empty", instance);
+        state.state_reason = Some(reason.clone());
+        return Err(ArcError::VerificationError(reason));
     }
 
-    // Step 5: Finalize hash
-    let hhash = hasher.finalize();
-    debug!(
-        "ARC i={} AS header hash computed: {:02x?}",
-        instance, &hhash
-    );
+    // Step 7: Run the RustCrypto verify — it hashes seal_data internally.
+    let (mut vctx, _key_bits) = match signing::verify_init(&pubkey_bytes, key_type, key_format) {
+        Ok(tup) => tup,
+        Err(e) => {
+            let reason = format!("seal verify_init failed: {}", e);
+            state.state_reason = Some(reason.clone());
+            return Err(ArcError::VerificationError(reason));
+        }
+    };
+    vctx.data_append(&seal_data);
 
-    // Steps 6-8: In the fully integrated system, this would fetch the
-    // public key from DNS and verify the signature. The structural
-    // verification (chain ordering, cv= checks) is complete above.
+    let verified = match signing::verify(&mut vctx, &signature, hash_algo) {
+        Ok(b) => b,
+        Err(e) => {
+            let reason = format!("seal verify failed: {}", e);
+            state.state_reason = Some(reason.clone());
+            return Err(ArcError::VerificationError(reason));
+        }
+    };
 
-    debug!("ARC: AS vfy i={} pass (structural)", instance);
-    Ok(())
+    if verified {
+        debug!("ARC: AS vfy i={} pass (crypto)", instance);
+        Ok(())
+    } else {
+        let reason = format!("AS i={} signature mismatch", instance);
+        state.state_reason = Some(reason.clone());
+        debug!("ARC: AS vfy i={} fail (signature mismatch)", instance);
+        Err(ArcError::VerificationError(reason))
+    }
 }
 
 // ===========================================================================
@@ -1221,14 +1463,20 @@ fn arc_seal_verify(state: &mut ArcVerifyState, set_index: usize) -> Result<(), A
 /// # Arguments
 ///
 /// * `headers` — All message headers in original order.
+/// * `dns` — DNS resolver for public-key lookups, shared via `Rc` so the
+///   same resolver can be reused across the entire chain walk without
+///   cloning the underlying hickory resolver. Mirrors the D1 pattern from
+///   [`crate::dkim::verify_init`].
 ///
 /// # Returns
 ///
-/// * `Ok(ArcState::Pass)` — ARC chain verified successfully.
+/// * `Ok(ArcState::Pass)` — ARC chain verified successfully (AMS and all
+///   seals verified cryptographically).
 /// * `Ok(ArcState::None)` — No ARC headers present.
-/// * `Ok(ArcState::Fail)` — ARC chain verification failed.
-/// * `Err(ArcError)` — Internal error during verification.
-pub fn arc_verify(headers: &[String]) -> Result<ArcState, ArcError> {
+/// * `Ok(ArcState::Fail)` — ARC chain verification failed (structural,
+///   crypto, or DNS error).
+/// * `Err(ArcError)` — Internal error during parsing before verification.
+pub fn arc_verify(headers: &[String], dns: Rc<DnsResolver>) -> Result<ArcState, ArcError> {
     let mut state = ArcVerifyState::default();
 
     // Step 1: Collect all ARC sets from headers
@@ -1245,14 +1493,16 @@ pub fn arc_verify(headers: &[String]) -> Result<ArcState, ArcError> {
         return Ok(ArcState::Fail);
     }
 
+    let dns_ref = Some(dns.as_ref());
+
     // Steps 2-3: Check chain integrity and verify latest AMS
-    if let Err(e) = arc_headers_check(&mut state) {
+    if let Err(e) = arc_headers_check(&mut state, dns_ref) {
         debug!("ARC verify result: fail ({})", e);
         return Ok(ArcState::Fail);
     }
 
     // Steps 4-5: Verify all seals
-    if let Err(e) = arc_verify_seals(&mut state) {
+    if let Err(e) = arc_verify_seals(&mut state, dns_ref) {
         debug!("ARC verify result: fail ({})", e);
         return Ok(ArcState::Fail);
     }
@@ -1262,6 +1512,20 @@ pub fn arc_verify(headers: &[String]) -> Result<ArcState, ArcError> {
         state.oldest_pass, state.received_instance
     );
     Ok(ArcState::Pass)
+}
+
+/// Internal structural-verification entry point for code paths that parse
+/// the ARC chain only for tag inspection (`fn_arc_domains`, `arc_set_info`,
+/// `arc_arcset_string`) without needing a DNS resolver.
+///
+/// Performs only Step 1 of [`arc_verify`] — header parsing — and returns
+/// the collected chain along with the parse-level state. No DNS lookups,
+/// no cryptographic verification. This is NOT a substitute for
+/// [`arc_verify`] in ACL code paths.
+fn arc_collect_only(headers: &[String]) -> Result<(ArcState, ArcVerifyState), ArcError> {
+    let mut state = ArcVerifyState::default();
+    let collect_result = arc_vfy_collect_hdrs(&mut state, headers)?;
+    Ok((collect_result, state))
 }
 
 /// Feed a header line into ARC processing during message reception.
@@ -1321,13 +1585,19 @@ pub fn arc_sign_init(
     options: &ArcSignOptions,
     existing_headers: &[String],
 ) -> Result<ArcSigningContext, ArcError> {
-    // Parse existing ARC headers to determine next instance number
+    // Parse existing ARC headers to determine next instance number AND
+    // capture the full chain for later AS signing (the seal-signing hdata
+    // must include every prior set's AAR+AMS+AS per RFC 8617 §5.1.2).
     let mut ctx = ArcContext::default();
     for header in existing_headers {
         let _ = arc_try_header(&mut ctx, header, true);
     }
 
     let instance = ctx.last_set().map(|s| s.instance + 1).unwrap_or(1);
+    // Snapshot the chain: arc_sign() needs to walk it when accumulating
+    // the AS signing data, so we move ownership here once and avoid
+    // re-parsing on every sign call.
+    let existing_sets = ctx.arcset_chain;
 
     debug!("ARC: sign_init — new instance {}", instance);
 
@@ -1347,25 +1617,118 @@ pub fn arc_sign_init(
         options: options.clone(),
         bodyhash: Vec::new(), // Will be populated by DKIM body hash
         headers_rlist,
+        existing_sets,
     })
+}
+
+/// Fold a base64-encoded signature over 74-character lines with
+/// `"\r\n\t  "` (CRLF + TAB + two spaces) as the inter-line separator.
+///
+/// This mirrors the C folding loop in `arc_sign_append_sig()` (arc.c
+/// lines 1453–1471) exactly: take up to 74 characters, advance the
+/// pointer, emit a continuation whitespace run, repeat until the
+/// signature is exhausted.  The first line starts flush (no leading
+/// whitespace); subsequent continuation lines are indented with
+/// `TAB + two spaces`, matching the column-4 wrap preferred by Exim's
+/// historical DKIM/ARC output.
+fn arc_fold_signature(sig_b64: &str) -> String {
+    let bytes = sig_b64.as_bytes();
+    // Pre-size: sig length plus one 5-byte continuation per full line.
+    let continuations = bytes.len().saturating_sub(1) / 74;
+    let mut out = String::with_capacity(bytes.len() + continuations * 5);
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let take = (bytes.len() - pos).min(74);
+        // Each chunk is guaranteed ASCII (base64 alphabet), so UTF-8 slicing is safe.
+        // Nonetheless, validate conservatively to avoid panics on unexpected input.
+        match std::str::from_utf8(&bytes[pos..pos + take]) {
+            Ok(chunk) => out.push_str(chunk),
+            Err(_) => {
+                // Fallback: lossily push as bytes via char casts (all base64 = ASCII).
+                for &b in &bytes[pos..pos + take] {
+                    out.push(b as char);
+                }
+            }
+        }
+        pos += take;
+        if pos < bytes.len() {
+            out.push_str("\r\n\t  ");
+        }
+    }
+    out
+}
+
+/// Sign a raw byte slice using the configured private key, returning the
+/// raw signature bytes (not base64-encoded).
+///
+/// The helper wraps the three-step RustCrypto pipeline used everywhere
+/// else in this crate:
+///
+/// 1. `signing::signing_init(private_key, key_type, hash)` — imports the
+///    PEM, detects the actual key type, and prepares a `SigningContext`.
+/// 2. `sctx.data_append(hdata)` — streams the canonicalized header bytes
+///    into the context's buffer.  Unlike the C GnuTLS path, the Rust
+///    backend hashes *internally* from raw data (not from a
+///    pre-computed digest), so we must pass the RAW bytes here.
+/// 3. `signing::sign(&mut sctx)` — produces the raw signature, e.g.
+///    PKCS#1 v1.5 DigestInfo-wrapped for RSA-SHA256 or a fixed 64-byte
+///    Ed25519 signature.
+///
+/// The key type is requested as `Rsa` by default; `signing_init()`
+/// detects the actual type from the PEM headers/length (see
+/// `detect_key_type_from_pem` in `signing.rs`) and overrides as needed,
+/// so Ed25519 ARC keys work without any caller-side handling.
+fn arc_sign_bytes(private_key: &str, hdata: &[u8]) -> Result<Vec<u8>, ArcError> {
+    let mut sctx = signing::signing_init(private_key, KeyType::Rsa, HashAlgorithm::Sha256)?;
+    sctx.data_append(hdata);
+    let sig = signing::sign(&mut sctx)?;
+    Ok(sig)
 }
 
 /// Perform ARC signing, producing the three ARC headers for a new ARC set.
 ///
 /// Creates ARC-Authentication-Results, ARC-Message-Signature, and ARC-Seal
-/// headers with incremented instance number.
+/// headers with incremented instance number.  The AMS and AS headers are
+/// cryptographically signed via RSA-SHA256 (or Ed25519 if the supplied
+/// PEM is an Ed25519 key — detected automatically by `signing_init()`).
 ///
-/// Replaces C `arc_sign()` (arc.c lines 1779–1943).
+/// Replaces C `arc_sign()` / `arc_sign_append_ams()` /
+/// `arc_sign_prepend_as()` / `arc_sign_append_sig()`
+/// (arc.c lines 1453–1780).
+///
+/// # Algorithm (matching C, RFC 8617)
+///
+/// ## ARC-Message-Signature (AMS)
+///
+/// The AMS hashes (1) the relaxed-canonicalized signed headers, in the
+/// reverse order they appear in the `h=` tag, *followed by* (2) the
+/// relaxed-canonicalized AMS header itself with `b=` value empty.
+///
+/// ## ARC-Seal (AS)
+///
+/// The AS hashes the relaxed-canonicalized concatenation of every ARC
+/// set's `AAR`, `AMS`, and `AS` headers, walking the chain in
+/// instance-ascending order.  The final AS (the one being signed) has an
+/// empty `b=;` value and is appended *without* a trailing CRLF, while
+/// all other headers in the accumulator are appended *with* CRLF.
+///
+/// Per RFC 8617 §5.1.2, when the chain validity status is `fail`, the AS
+/// signing accumulator only contains the new (failing) set — prior sets
+/// are excluded.  For `pass` and `none` states, the entire chain is
+/// hashed.
 ///
 /// # Arguments
 ///
-/// * `signing_ctx` — Context from [`arc_sign_init`].
-/// * `auth_results` — Authentication-Results content for the AAR header.
-/// * `sender_ip` — Sender's IP address for the AAR smtp.remote-ip field.
+/// * `signing_ctx` — Context from [`arc_sign_init`], populated with
+///   body hash, header list, and existing chain.
+/// * `auth_results` — Authentication-Results content for the AAR header;
+///   also supplies the `arc=…` fragment used to derive the `cv=` status.
+/// * `sender_ip` — Sender's IP address for the AAR `smtp.remote-ip` field.
 ///
 /// # Returns
 ///
-/// A vector of new header strings (AAR, AMS, AS) to prepend to the message.
+/// A vector of new header strings `[AAR, AMS, AS]` to prepend to the
+/// message.  Each element ends with `\r\n`.
 pub fn arc_sign(
     signing_ctx: &ArcSigningContext,
     auth_results: &str,
@@ -1374,7 +1737,9 @@ pub fn arc_sign(
     let instance = signing_ctx.instance;
     let options = &signing_ctx.options;
 
-    // Validate signing specification
+    // -----------------------------------------------------------------
+    // Input validation — reject malformed specs before doing crypto work
+    // -----------------------------------------------------------------
     if options.domain.is_empty() {
         return Err(ArcError::BadSignSpec("identity empty".to_string()));
     }
@@ -1393,30 +1758,51 @@ pub fn arc_sign(
 
     debug!("ARC: sign for {} (instance {})", options.domain, instance);
 
-    let mut result_headers = Vec::new();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    // 1. Generate AAR (ARC-Authentication-Results)
-    let mut aar = format!(
+    // -----------------------------------------------------------------
+    // 1. Build the AAR (ARC-Authentication-Results) header — unsigned.
+    //
+    //    The AAR carries the prior verifier's results and is not
+    //    cryptographically protected by itself (the AS signs all the
+    //    AARs in the chain collectively).  We build it first because
+    //    the AS signing accumulator will need its canonicalized form.
+    // -----------------------------------------------------------------
+    let mut aar_complete = format!(
         "{} i={}; {}; smtp.remote-ip={};\r\n\t{}",
         ARC_HDR_AAR, instance, options.domain, sender_ip, auth_results
     );
-    if !aar.ends_with("\r\n") {
-        aar.push_str("\r\n");
+    if !aar_complete.ends_with("\r\n") {
+        aar_complete.push_str("\r\n");
     }
-    debug!("ARC: AAR '{}'", aar.trim_end());
-    result_headers.push(aar);
+    debug!("ARC: AAR '{}'", aar_complete.trim_end());
 
-    // 2. Generate AMS (ARC-Message-Signature)
-    let mut ams_header = format!(
+    // -----------------------------------------------------------------
+    // 2. Build the AMS (ARC-Message-Signature) and sign it.
+    //
+    //    Algorithm (see RFC 8617 §5.1.1 and C `arc_sign_append_ams`):
+    //      a. Format AMS header prefix up through "h=".
+    //      b. Walk `headers_rlist` (already reversed — most recent first).
+    //         For each header whose name matches one in the signing set,
+    //         (i) append the case-preserved name + ':' to the `h=` tag,
+    //         (ii) append the relaxed-canonicalized header *with* CRLF
+    //              to the `hdata` signing accumulator.
+    //      c. Trim trailing ':' from `h=`, append `; b=;\r\n`.
+    //      d. Relax-canonicalize the AMS pseudo-header itself *without*
+    //         CRLF and append to `hdata` — this is what makes the AMS
+    //         self-covering (its own `b=` empty value is in the hash).
+    //      e. Hand `hdata` to RustCrypto `signing::sign()`, base64 the
+    //         result, fold over 74-char lines, splice into the `b=`.
+    // -----------------------------------------------------------------
+    let mut ams_pre = format!(
         "{} i={}; a=rsa-sha256; c=relaxed; d={}; s={}",
         ARC_HDR_AMS, instance, options.domain, options.selector
     );
     if options.include_timestamp {
-        ams_header.push_str(&format!("; t={}", now));
+        ams_pre.push_str(&format!("; t={}", now));
     }
     if options.include_expiry {
         let expire = if options.expire_delta > 0 {
@@ -1424,62 +1810,180 @@ pub fn arc_sign(
         } else {
             now + ARC_DEFAULT_EXPIRE_DELTA
         };
-        ams_header.push_str(&format!("; x={}", expire));
+        ams_pre.push_str(&format!("; x={}", expire));
     }
 
-    // Add body hash placeholder
     let bh_b64 = encode_base64(&signing_ctx.bodyhash);
-    ams_header.push_str(&format!(";\r\n\tbh={};\r\n\th=", bh_b64));
+    ams_pre.push_str(&format!(";\r\n\tbh={};\r\n\th=", bh_b64));
 
-    // Add signed header names from the standard DKIM set
+    // Standard DKIM-like signing header set, plus DKIM-Signature itself
+    // (so a DKIM signature added in the same message is also ARC-protected).
     let sign_headers_list = format!("DKIM-Signature:{}", PDKIM_DEFAULT_SIGN_HEADERS);
     let header_names: Vec<&str> = sign_headers_list.split(':').collect();
-    let mut h_tag_parts: Vec<String> = Vec::new();
+
+    // Accumulator for cryptographic signing.  Holds raw canonicalized
+    // bytes; RustCrypto will hash this internally inside `sign()`.
+    let mut ams_hdata: Vec<u8> = Vec::new();
+    let mut matched_any = false;
 
     for entry in &signing_ctx.headers_rlist {
         for name in &header_names {
-            if entry
-                .text
-                .to_ascii_lowercase()
-                .starts_with(&name.to_ascii_lowercase())
+            let nlen = name.len();
+            if entry.text.len() > nlen
                 && entry
                     .text
-                    .as_bytes()
-                    .get(name.len())
-                    .is_some_and(|&b| b == b':')
+                    .get(..nlen)
+                    .is_some_and(|p| p.eq_ignore_ascii_case(name))
+                && entry.text.as_bytes().get(nlen) == Some(&b':')
             {
-                if !h_tag_parts.contains(&format!("{}:", name)) {
-                    h_tag_parts.push(format!("{}:", name));
-                }
+                // (i) Append header name + ':' to `h=` tag.
+                //     Note: matches the C behaviour of emitting each
+                //     matching occurrence (duplicates included), so a
+                //     verifier can replay exactly the same header stream.
+                ams_pre.push_str(name);
+                ams_pre.push(':');
+                // (ii) Canonicalize the *actual* header text and
+                //      accumulate into the signing buffer with CRLF.
+                let relaxed = relax_header_n(&entry.text, entry.len, true);
+                ams_hdata.extend_from_slice(relaxed.as_bytes());
+                matched_any = true;
                 break;
             }
         }
     }
 
-    let h_value = h_tag_parts.join("");
-    let h_value = h_value.trim_end_matches(':');
-    ams_header.push_str(h_value);
-    ams_header.push_str(";\r\n\tb=;\r\n");
+    // Trim trailing ':' left over from the last appended name, then close.
+    if matched_any && ams_pre.ends_with(':') {
+        ams_pre.pop();
+    }
+    ams_pre.push_str(";\r\n\tb=;\r\n");
 
-    debug!("ARC: AMS (pre-sign) '{}'", ams_header.trim_end());
-    result_headers.push(ams_header);
+    debug!("ARC: AMS (pre-sign) '{}'", ams_pre.trim_end());
 
-    // 3. Generate AS (ARC-Seal)
-    // Determine cv= status from auth_results
+    // Canonicalize the AMS pseudo-header itself *without* a trailing
+    // CRLF (parameter `false`) — this is the RFC 6376 §3.5 "b= stripped"
+    // inclusion rule applied to ARC per RFC 8617 §5.1.1.
+    let ams_pseudo_relaxed = relax_header_n(&ams_pre, ams_pre.len(), false);
+    ams_hdata.extend_from_slice(ams_pseudo_relaxed.as_bytes());
+
+    // Sign → base64 → fold → splice into `b=` placeholder.
+    let ams_sig_bytes = arc_sign_bytes(&options.private_key, &ams_hdata)?;
+    let ams_sig_b64 = encode_base64(&ams_sig_bytes);
+    let ams_sig_folded = arc_fold_signature(&ams_sig_b64);
+
+    let ams_complete = splice_signature(&ams_pre, ";\r\n\tb=;\r\n", &ams_sig_folded, ";\r\n\tb=")?;
+
+    debug!("ARC: AMS (signed) '{}'", ams_complete.trim_end());
+
+    // -----------------------------------------------------------------
+    // 3. Build the AS (ARC-Seal) and sign it.
+    //
+    //    Algorithm (RFC 8617 §5.1.2, mirroring C `arc_sign_prepend_as`):
+    //      a. Derive `cv=` status from the auth_results fragment.
+    //         "fail" → seal only the new (failing) set;
+    //         "pass"/"none" → seal the entire chain plus new set.
+    //      b. Format the AS header with `b=;` empty.
+    //      c. Walk the sets in ascending instance order.  For each set,
+    //         append canonicalized `AAR`, `AMS`, `AS` to `as_hdata` —
+    //         always with CRLF, EXCEPT the very last AS (the one being
+    //         signed right now), which has no trailing CRLF.
+    //      d. Sign the accumulator, base64-fold, splice into `b=`.
+    // -----------------------------------------------------------------
     let cv_status = arc_ar_cv_status(auth_results);
-    let mut as_header = format!(
+    let mut as_pre = format!(
         "{} i={}; cv={}; a=rsa-sha256; d={}; s={}",
         ARC_HDR_AS, instance, cv_status, options.domain, options.selector
     );
     if options.include_timestamp {
-        as_header.push_str(&format!("; t={}", now));
+        as_pre.push_str(&format!("; t={}", now));
     }
-    as_header.push_str(";\r\n\t b=;\r\n");
+    as_pre.push_str(";\r\n\t b=;\r\n");
 
-    debug!("ARC: AS (pre-sign) '{}'", as_header.trim_end());
-    result_headers.push(as_header);
+    debug!("ARC: AS (pre-sign) '{}'", as_pre.trim_end());
 
-    Ok(result_headers)
+    // Build the AS signing accumulator.  For every set, we need the
+    // relaxed-canonicalized AAR, AMS, and AS.  For existing sets
+    // (parsed out of the inbound headers), all three have real values.
+    // For the new set we inject here, the AS is the pseudo-header with
+    // empty `b=` and is appended without a trailing CRLF.
+    let seal_all_sets = cv_status != "fail";
+    let mut as_hdata: Vec<u8> = Vec::new();
+
+    if seal_all_sets {
+        for set in &signing_ctx.existing_sets {
+            if let Some(aar) = &set.hdr_aar {
+                let relaxed = relax_header_n(&aar.complete, aar.complete.len(), true);
+                as_hdata.extend_from_slice(relaxed.as_bytes());
+            }
+            if let Some(ams) = &set.hdr_ams {
+                let relaxed = relax_header_n(&ams.complete, ams.complete.len(), true);
+                as_hdata.extend_from_slice(relaxed.as_bytes());
+            }
+            if let Some(as_line) = &set.hdr_as {
+                // Prior sets' AS headers are *complete* (have real
+                // signatures), and since they are never the final item
+                // in the accumulator they are appended with CRLF.
+                let relaxed = relax_header_n(&as_line.complete, as_line.complete.len(), true);
+                as_hdata.extend_from_slice(relaxed.as_bytes());
+            }
+        }
+    }
+    // Now append the new (current) set — always, regardless of
+    // seal_all_sets: even the "fail" path still includes the new set
+    // (it is the *only* thing sealed in that path).
+    let aar_relaxed = relax_header_n(&aar_complete, aar_complete.len(), true);
+    as_hdata.extend_from_slice(aar_relaxed.as_bytes());
+    let ams_relaxed_for_as = relax_header_n(&ams_complete, ams_complete.len(), true);
+    as_hdata.extend_from_slice(ams_relaxed_for_as.as_bytes());
+    // The new AS pseudo-header is the LAST item, so no CRLF.
+    let as_pre_relaxed = relax_header_n(&as_pre, as_pre.len(), false);
+    as_hdata.extend_from_slice(as_pre_relaxed.as_bytes());
+
+    // Sign → base64 → fold → splice.  Note the `b=` placeholder is
+    // `";\r\n\t b=;\r\n"` (space after tab) matching the C code's
+    // historical AS layout — distinct from AMS's `";\r\n\tb=;\r\n"`.
+    let as_sig_bytes = arc_sign_bytes(&options.private_key, &as_hdata)?;
+    let as_sig_b64 = encode_base64(&as_sig_bytes);
+    let as_sig_folded = arc_fold_signature(&as_sig_b64);
+
+    let as_complete = splice_signature(&as_pre, ";\r\n\t b=;\r\n", &as_sig_folded, ";\r\n\t b=")?;
+
+    debug!("ARC: AS (signed) '{}'", as_complete.trim_end());
+
+    Ok(vec![aar_complete, ams_complete, as_complete])
+}
+
+/// Splice a folded base64 signature into a pre-sign header that contains
+/// an empty `b=;` placeholder.
+///
+/// The caller supplies (1) the pre-sign header text with the `b=;`
+/// still empty, (2) the exact placeholder sequence to locate (this
+/// differs between AMS `";\r\n\tb=;\r\n"` and AS `";\r\n\t b=;\r\n"`),
+/// (3) the folded base64 signature payload, and (4) the `b=` prefix
+/// with whitespace context matching the placeholder, used to build the
+/// replacement.
+///
+/// Returns an error if the placeholder cannot be located — this should
+/// never occur because we construct the pre-sign header immediately
+/// before calling this function, but a defensive check prevents silent
+/// corruption if a future refactor changes the layout.
+fn splice_signature(
+    pre_sign: &str,
+    placeholder: &str,
+    folded_sig: &str,
+    b_prefix: &str,
+) -> Result<String, ArcError> {
+    let pos = pre_sign.rfind(placeholder).ok_or_else(|| {
+        ArcError::BadSignSpec(
+            "internal error: b=; placeholder not found in pre-sign header".to_string(),
+        )
+    })?;
+    let mut out = String::with_capacity(pre_sign.len() + folded_sig.len() + 8);
+    out.push_str(&pre_sign[..pos]);
+    out.push_str(b_prefix);
+    out.push_str(folded_sig);
+    out.push_str(";\r\n");
+    Ok(out)
 }
 
 /// Validate an ADMD identity or selector string.
@@ -1520,13 +2024,15 @@ fn arc_ar_cv_status(ar: &str) -> &str {
 
 /// Query ARC set information for expansion variables.
 ///
+/// Parses ARC headers in the given message without performing any DNS
+/// lookups or cryptographic verification — used by expansion variables
+/// and the DMARC history writer which need only structural information.
+///
 /// Replaces C `arc_arcset_string()` (arc.c lines 2102–2134).
 ///
 /// Returns the ARC state string and set info for DMARC history.
 pub fn arc_set_info(headers: &[String]) -> Result<(ArcState, Vec<ArcSet>), ArcError> {
-    let mut state = ArcVerifyState::default();
-
-    let collect_result = arc_vfy_collect_hdrs(&mut state, headers)?;
+    let (collect_result, state) = arc_collect_only(headers)?;
     if collect_result == ArcState::None {
         return Ok((ArcState::None, Vec::new()));
     }
@@ -1536,17 +2042,22 @@ pub fn arc_set_info(headers: &[String]) -> Result<(ArcState, Vec<ArcSet>), ArcEr
 
 /// Generate Authentication-Results header portion for ARC.
 ///
+/// Performs a full ARC verification (including DNS-backed signature
+/// checks) and returns the `arc=pass|fail|none|temperror` fragment to
+/// be included in the Authentication-Results header.
+///
 /// Replaces C `authres_arc()` (arc.c lines 2060–2090).
 ///
 /// # Arguments
 ///
 /// * `headers` — Message headers for ARC verification.
+/// * `dns` — DNS resolver for public-key lookups, shared via `Rc`.
 ///
 /// # Returns
 ///
 /// Authentication-Results fragment string for ARC, or empty if no ARC state.
-pub fn authres_arc(headers: &[String]) -> String {
-    match arc_verify(headers) {
+pub fn authres_arc(headers: &[String], dns: Rc<DnsResolver>) -> String {
+    match arc_verify(headers, dns) {
         Ok(ArcState::Pass) => {
             let result = ";\n\tarc=pass".to_string();
             debug!("ARC:\tauthres '{}'", result.trim());
@@ -1570,6 +2081,8 @@ pub fn authres_arc(headers: &[String]) -> String {
 }
 
 /// Construct the list of domains from the ARC chain.
+///
+/// Parses ARC headers for structural information only — no DNS or crypto.
 ///
 /// Replaces C `fn_arc_domains()` (arc.c lines 2029–2055).
 ///
@@ -1614,16 +2127,21 @@ pub fn fn_arc_domains(headers: &[String]) -> String {
 
 /// Check whether the ARC state is "pass".
 ///
+/// Performs a full ARC verification (including DNS-backed signature
+/// checks) and returns `true` only if the chain verifies successfully.
+///
 /// Replaces C `arc_is_pass()` (arc.c lines 1272–1276).
-pub fn arc_is_pass(headers: &[String]) -> bool {
-    matches!(arc_verify(headers), Ok(ArcState::Pass))
+pub fn arc_is_pass(headers: &[String], dns: Rc<DnsResolver>) -> bool {
+    matches!(arc_verify(headers, dns), Ok(ArcState::Pass))
 }
 
 /// Construct ARC set information string for DMARC history.
 ///
 /// Replaces C `arc_arcset_string()` (arc.c lines 2102–2134).
 ///
-/// Returns a JSON-like structured string with ARC set details.
+/// Returns a JSON-like structured string with ARC set details. This is
+/// a structural-only traversal — it does not perform cryptographic
+/// verification and never queries DNS.
 pub fn arc_arcset_string(headers: &[String]) -> Option<String> {
     let (state, sets) = arc_set_info(headers).ok()?;
 
@@ -1771,11 +2289,27 @@ mod tests {
 
     #[test]
     fn test_arc_verify_no_headers() {
+        // When no ARC headers are present, the verify path returns
+        // `ArcState::None` before touching DNS or crypto — but the
+        // public API still requires a `Rc<DnsResolver>` for type safety.
+        // `from_system()` is cheap (no network I/O until queried) and
+        // succeeds in every environment where `/etc/resolv.conf` exists.
         let headers: Vec<String> = vec![
             "From: sender@example.com\r\n".to_string(),
             "To: recipient@example.com\r\n".to_string(),
         ];
-        let result = arc_verify(&headers);
+        let dns = match DnsResolver::from_system() {
+            Ok(r) => Rc::new(r),
+            Err(_) => {
+                // Environments without `/etc/resolv.conf` (e.g. some
+                // containerized CI runners) cannot construct a system
+                // resolver; skip silently — the early-return path does
+                // not actually use DNS, but we cannot even build one.
+                eprintln!("test_arc_verify_no_headers: /etc/resolv.conf unavailable; skipping");
+                return;
+            }
+        };
+        let result = arc_verify(&headers, dns);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), ArcState::None);
     }
@@ -1803,11 +2337,18 @@ mod tests {
 
     #[test]
     fn test_arc_sign_bad_spec() {
+        // Build a signing context with an empty domain — the spec
+        // validation at the top of `arc_sign()` must reject this
+        // before any crypto work is attempted.  The `existing_sets`
+        // field is required by the struct layout introduced for real
+        // AS chain accumulation; it is safely empty here because the
+        // test exits before the chain is consulted.
         let signing_ctx = ArcSigningContext {
             instance: 1,
             options: ArcSignOptions::default(), // empty domain
             bodyhash: Vec::new(),
             headers_rlist: Vec::new(),
+            existing_sets: Vec::new(),
         };
         let result = arc_sign(&signing_ctx, "dkim=pass", "127.0.0.1");
         assert!(result.is_err());
@@ -1827,8 +2368,18 @@ mod tests {
 
     #[test]
     fn test_arc_is_pass_no_headers() {
+        // Same rationale as `test_arc_verify_no_headers`: we can't
+        // actually reach the crypto path because there are no ARC
+        // headers to verify, but the API still takes a DnsResolver.
         let headers: Vec<String> = vec!["From: test@example.com\r\n".to_string()];
-        assert!(!arc_is_pass(&headers));
+        let dns = match DnsResolver::from_system() {
+            Ok(r) => Rc::new(r),
+            Err(_) => {
+                eprintln!("test_arc_is_pass_no_headers: /etc/resolv.conf unavailable; skipping");
+                return;
+            }
+        };
+        assert!(!arc_is_pass(&headers, dns));
     }
 
     #[test]

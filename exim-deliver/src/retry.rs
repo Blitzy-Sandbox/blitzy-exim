@@ -511,12 +511,18 @@ fn db_delete_retry_record<D: HintsDb>(db: &mut D, key: &str) -> Result<(), Hints
 /// * `domain` — The domain being delivered to.
 /// * `retry_record` — The existing retry record from the database.
 /// * `now` — Current Unix epoch timestamp.
+/// * `sender_address` — The current envelope sender, if known, used to match
+///   retry rules whose `senders` clause filters by originator. Pass `None`
+///   when the sender is unavailable (e.g. on pure host-retry contexts where
+///   no message is being processed); sender-scoped rules will then be
+///   skipped, matching the C behaviour for a null `sender_address` global.
 /// * `config` — Parsed configuration context.
 pub fn retry_ultimate_address_timeout(
     host_key: &str,
     domain: &str,
     retry_record: &RetryRecord,
     now: i64,
+    sender_address: Option<&str>,
     config: &ConfigContext,
 ) -> bool {
     // The C code skips the first 2 characters of the key (the prefix like
@@ -529,7 +535,7 @@ pub fn retry_ultimate_address_timeout(
 
     // Find the matching retry configuration.
     let retry_configs = get_retry_configs(config);
-    let matched = find_config_match(lookup_key, None, 0, 0, &retry_configs);
+    let matched = find_config_match(lookup_key, None, sender_address, 0, 0, &retry_configs);
     let retry_cfg = match matched {
         Some(cfg) => cfg,
         None => {
@@ -583,9 +589,33 @@ fn get_retry_configs(config: &ConfigContext) -> Vec<RetryConfig> {
 ///
 /// Iterates the retry configuration list and returns the first matching entry
 /// based on key pattern, error predicates, and sender matching.
+///
+/// # Arguments
+///
+/// * `key` — The retry database key (or host/address pattern).
+/// * `alternate_domain` — Optional alternate domain for fallback key matching.
+/// * `sender_address` — The current envelope sender address, used to check
+///   retry rules whose `senders` clause filters by originator address. This
+///   corresponds to the C `sender_address` global consulted inside
+///   `retry_find_config()` at `src/src/retry.c:528-535`. Pass `None` when the
+///   sender is unknown (e.g. `-brt` test mode or message-less contexts); in
+///   that case retry rules that declare a `senders` list are skipped to match
+///   the C semantics (`!sender_address || match != OK → continue`).
+/// * `basic_errno` — The delivery error number (errno) for predicate matching.
+/// * `more_errno` — Additional error data for fine-grained predicate matching.
+/// * `configs` — The configured retry rule list to iterate over.
+///
+/// # R1 Fix
+///
+/// The prior implementation skipped every rule whose `senders` clause was set,
+/// regardless of whether the envelope sender actually matched. That caused
+/// sender-scoped retry rules to never apply. The fix threads the envelope
+/// sender through and uses [`match_sender_list`] to implement the C-equivalent
+/// filter semantics.
 fn find_config_match<'a>(
     key: &str,
     alternate_domain: Option<&str>,
+    sender_address: Option<&str>,
     basic_errno: i32,
     more_errno: i32,
     configs: &'a [RetryConfig],
@@ -607,11 +637,37 @@ fn find_config_match<'a>(
             continue;
         }
 
-        // Check sender match if the config specifies a sender filter.
-        if cfg.senders.is_some() {
-            // Skip configs with sender restrictions we can't verify in this
-            // context. The config parser would need to pass sender data.
-            continue;
+        // Check sender-filter match if the config specifies one.
+        //
+        // The C code at `src/src/retry.c:528-535` reads:
+        //
+        // ```c
+        // if (  slist
+        //    && (  !sender_address
+        //      || match_address_list_basic(sender_address, &slist, 0) != OK
+        //    )  )
+        //   continue;
+        // ```
+        //
+        // Translated: if the rule declares a senders list AND
+        //  - the current sender is unknown (e.g. `-brt` test mode), OR
+        //  - the sender does not match any entry in the list,
+        // then the rule does NOT apply — continue to the next rule.
+        if let Some(senders_list) = cfg.senders.as_deref() {
+            let sender_matches = match sender_address {
+                None => false,
+                Some(sender) => match_sender_list(sender, senders_list),
+            };
+            if !sender_matches {
+                tracing::trace!(
+                    key = key,
+                    pattern = cfg.pattern.as_str(),
+                    senders = senders_list,
+                    sender = sender_address.unwrap_or("<none>"),
+                    "retry config skipped: senders filter did not match"
+                );
+                continue;
+            }
         }
 
         // Match the key against the config pattern.
@@ -637,6 +693,12 @@ fn find_config_match<'a>(
 ///
 /// * `key` — The retry database key (without prefix, or full key).
 /// * `alternate_domain` — Optional alternate domain for fallback matching.
+/// * `sender_address` — The envelope sender for sender-filter matching. Pass
+///   `None` when the sender is unknown or irrelevant (e.g. `-brt` test mode,
+///   ultimate timeout checks from [`retry_check_address`]). Retry rules that
+///   declare a `senders` clause are only applied when this value is `Some` and
+///   it matches the list; see [`find_config_match`] for the detailed semantics
+///   and the R1 fix notes.
 /// * `basic_errno` — Error number to match against config predicates.
 /// * `more_errno` — Additional error data for fine-grained matching.
 /// * `config` — Parsed configuration context.
@@ -647,12 +709,21 @@ fn find_config_match<'a>(
 pub fn retry_find_config(
     key: &str,
     alternate_domain: Option<&str>,
+    sender_address: Option<&str>,
     basic_errno: i32,
     more_errno: i32,
     config: &ConfigContext,
 ) -> Option<RetryConfig> {
     let configs = get_retry_configs(config);
-    find_config_match(key, alternate_domain, basic_errno, more_errno, &configs).cloned()
+    find_config_match(
+        key,
+        alternate_domain,
+        sender_address,
+        basic_errno,
+        more_errno,
+        &configs,
+    )
+    .cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -661,32 +732,66 @@ pub fn retry_find_config(
 
 /// Extract the matchable address/host portion from a retry key.
 ///
-/// Handles the three key formats from the C code:
-/// - `"hostname:ip+port"` → returns `"hostname"`
+/// Translates the C logic from `retry_find_config()` in `src/src/retry.c`:
+///
+/// ```text
+/// if (colon)
+///   key = isalnum(*key)
+///     ? string_copyn(key, colon-key)         // the hostname
+///     : *key == '['
+///     ? string_copyn(key+1, Ustrchr(key, ']')-1-key)   // the IP (drops [])
+///     : Ustrrchr(key, ':') + 1;              // take from the last colon
+/// ```
+///
+/// Handles the four key formats:
+/// - `"hostname:ip+port"` → returns `"hostname"` (starts with alnum → first colon)
+/// - `"[ipv6]:port"` → returns `"ipv6"` (starts with `[` → content between brackets)
 /// - `"|path:x@y"` / `"/path:x@y"` / `">path:x@y"` → returns `"x@y"`
-/// - `"user@domain"` → returns `"user@domain"` (unchanged)
+///   (non-alnum, non-`[` prefix → substring after **last** colon)
+/// - `"user@domain"` → returns `"user@domain"` (no colon → unchanged)
+///
+/// **R2 fix:** This function previously returned `"[2001"` for
+/// `"[2001:db8::1]:80"` (first-colon truncation including the leading `[`)
+/// and returned the portion after the **first** colon (instead of last)
+/// for pipe/file/autoreply keys. Both bugs would cause retry records for
+/// IPv6 hosts to either misparse or fail round-trip via the hints DB,
+/// effectively resetting retry backoff on every delivery attempt.
 fn extract_match_key(key: &str) -> &str {
     if key.is_empty() {
         return key;
     }
 
+    // If no colon present, the key is already the matchable form (e.g. `user@domain`).
+    let Some(first_colon) = key.find(':') else {
+        return key;
+    };
+
     let first_byte = key.as_bytes()[0];
 
-    // Pipe/file/autoreply transport keys: |path:addr, /path:addr, >path:addr
-    if first_byte == b'|' || first_byte == b'/' || first_byte == b'>' {
-        if let Some(colon_pos) = key.find(':') {
-            return &key[colon_pos + 1..];
+    // Case 1: bracketed IPv6 literal, e.g. `[2001:db8::1]:port`.
+    // Extract the content between the opening `[` and the matching `]`.
+    if first_byte == b'[' {
+        if let Some(close_pos) = key.find(']') {
+            // Safety: close_pos > 0 since we found `[` at position 0; guarantee
+            // slice bounds are valid by clamping.
+            if close_pos > 1 {
+                return &key[1..close_pos];
+            }
         }
-        return key;
+        // Malformed `[...` with no closing bracket — fall through to last-colon
+        // split behaviour so we still return a non-empty slice.
     }
 
-    // Host:IP+port keys: extract just the hostname part.
-    if let Some(colon_pos) = key.find(':') {
-        // If there's an '@' before the colon, it's an email address not a host key.
-        if key[..colon_pos].contains('@') {
-            return key;
-        }
-        return &key[..colon_pos];
+    // Case 2: key starts with an alphanumeric character (ASCII letter/digit).
+    // Treat as `hostname:ip+port` and return the hostname (up to first colon).
+    if first_byte.is_ascii_alphanumeric() {
+        return &key[..first_colon];
+    }
+
+    // Case 3: pipe/file/autoreply transport keys (|path:addr, /path:addr, >path:addr).
+    // Per C `Ustrrchr(key, ':') + 1`, the address is the portion after the LAST colon.
+    if let Some(last_colon) = key.rfind(':') {
+        return &key[last_colon + 1..];
     }
 
     key
@@ -809,6 +914,113 @@ fn pattern_matches(pattern: &str, key: &str, alternate_domain: Option<&str>) -> 
     false
 }
 
+/// Match an envelope sender address against a retry rule's `senders` clause.
+///
+/// Implements the C `match_address_list_basic()` semantics used by
+/// `retry_find_config()` at `src/src/retry.c:532` in a form sufficient for
+/// retry-rule sender filtering. The `senders` clause in a retry config is a
+/// colon- or comma-separated list of address patterns; the rule applies when
+/// the current envelope sender matches any pattern in the list.
+///
+/// # Pattern syntax (subset used by retry rules)
+///
+/// Each pattern in the list may be one of:
+///   * `*` — matches any sender, including the null envelope sender (`""`).
+///   * `` (empty item, only for the empty envelope sender) — matches iff the
+///     sender address is the empty string (used for bounces / DSNs).
+///   * `*@domain` — matches any local-part at the given domain.
+///   * `user@domain` — exact address match (case-insensitive on domain).
+///   * `domain` — bare domain match (implies `*@domain` per C semantics).
+///   * `*suffix` — leading-wildcard suffix match (e.g. `*@example.com` or
+///     `*.example.com`).
+///
+/// Matching is case-insensitive. Whitespace around list delimiters is
+/// stripped.
+///
+/// # Arguments
+///
+/// * `sender` — The current envelope sender (may be empty for bounce traffic).
+/// * `list` — The raw `senders` clause text from the retry config.
+///
+/// # Returns
+///
+/// `true` if any pattern in `list` matches `sender`; `false` otherwise. An
+/// empty list is treated as "no match" (the caller treats `Some(list) with no
+/// match` identically to a missing match).
+///
+/// # R1 Fix
+///
+/// This helper was added as part of the R1 correction. Prior to the fix the
+/// caller simply skipped any rule whose `senders` field was set, which made
+/// sender-scoped retry rules never fire.
+fn match_sender_list(sender: &str, list: &str) -> bool {
+    let sender_lower = sender.to_ascii_lowercase();
+
+    for raw_pattern in list.split([',', ':']) {
+        let pattern = raw_pattern.trim();
+        if pattern.is_empty() {
+            // Empty item explicitly matches the empty envelope sender
+            // (bounce messages). In C this is represented by a `:` leaving a
+            // zero-length slist entry which match_address_list_basic compares
+            // as equal to an empty sender_address.
+            if sender.is_empty() {
+                return true;
+            }
+            continue;
+        }
+
+        let pattern_lower = pattern.to_ascii_lowercase();
+
+        // Universal wildcard matches any sender, including empty.
+        if pattern_lower == "*" {
+            return true;
+        }
+
+        // Leading `!` means negation in Exim address lists. Retry `senders`
+        // clauses rarely use this but we honour it for correctness.
+        if let Some(negated) = pattern_lower.strip_prefix('!') {
+            if match_single_sender_pattern(&sender_lower, negated) {
+                // Negation matched ⇒ this pattern explicitly excludes the
+                // sender; treat the whole list as non-matching.
+                return false;
+            }
+            continue;
+        }
+
+        if match_single_sender_pattern(&sender_lower, &pattern_lower) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Match a single sender pattern (already lower-cased) against a sender.
+///
+/// Helper for [`match_sender_list`]. Handles the `*`, `*@domain`, `domain`,
+/// `*suffix`, and exact-address cases.
+fn match_single_sender_pattern(sender_lower: &str, pattern_lower: &str) -> bool {
+    // Exact `*` already handled by caller, but preserve universal-wildcard
+    // semantics defensively.
+    if pattern_lower == "*" {
+        return true;
+    }
+
+    // Leading-wildcard suffix match (`*@domain`, `*.example.com`, etc.).
+    if let Some(suffix) = pattern_lower.strip_prefix('*') {
+        return sender_lower.ends_with(suffix);
+    }
+
+    // Bare domain treated as `*@domain`.
+    if !pattern_lower.contains('@') {
+        let at_domain = format!("@{pattern_lower}");
+        return sender_lower.ends_with(&at_domain);
+    }
+
+    // Full `user@domain` — exact case-insensitive match.
+    sender_lower == pattern_lower
+}
+
 // ---------------------------------------------------------------------------
 // retry_add_item — Add retry item to address
 // ---------------------------------------------------------------------------
@@ -889,6 +1101,12 @@ pub struct RetryCheckParams<'a, D: HintsDb> {
     pub deliver_force: bool,
     /// Current Unix epoch timestamp.
     pub now: i64,
+    /// Envelope sender address (if any), used for sender-filter matching in
+    /// retry rules (R1 fix — see [`find_config_match`]). Pass `None` when the
+    /// sender is unknown, which will cause retry rules with a `senders` clause
+    /// to be skipped, matching the C behaviour for a NULL `sender_address`
+    /// global.
+    pub sender_address: Option<&'a str>,
     /// Optional opened hints database handle (read-only).
     pub db: Option<&'a D>,
     /// Parsed configuration context.
@@ -947,6 +1165,7 @@ pub fn retry_check_address<D: HintsDb>(params: &RetryCheckParams<'_, D>) -> Retr
     let message_id = params.message_id;
     let deliver_force = params.deliver_force;
     let now = params.now;
+    let sender_address = params.sender_address;
     let db = params.db;
     let config = params.config;
 
@@ -1016,7 +1235,7 @@ pub fn retry_check_address<D: HintsDb>(params: &RetryCheckParams<'_, D>) -> Retr
             );
 
             // Check ultimate timeout.
-            if retry_ultimate_address_timeout(&host_key, domain, rec, now, config) {
+            if retry_ultimate_address_timeout(&host_key, domain, rec, now, sender_address, config) {
                 result.status = HostStatus::UnusableExpired;
                 result.why = HostWhyUnusable::Retry;
                 result.expired = true;
@@ -1056,7 +1275,7 @@ pub fn retry_check_address<D: HintsDb>(params: &RetryCheckParams<'_, D>) -> Retr
 
             // Check ultimate timeout on message record.
             if let Some(mk) = &message_key {
-                if retry_ultimate_address_timeout(mk, domain, rec, now, config) {
+                if retry_ultimate_address_timeout(mk, domain, rec, now, sender_address, config) {
                     result.status = HostStatus::UnusableExpired;
                     result.why = HostWhyUnusable::Retry;
                     result.expired = true;
@@ -1197,14 +1416,28 @@ enum UpdatePass {
 ///   time out will have their `message` field set to "retry timeout exceeded".
 /// * `now` -- Current Unix epoch timestamp.
 /// * `received_time` -- Message received timestamp (for message age computation).
+/// * `sender_address` -- The envelope sender for the message being delivered
+///   (R1 fix). Used when searching for retry rules with a `senders` clause.
+///   Pass `None` when the sender is unavailable (should be rare in real
+///   delivery; see [`find_config_match`] for the semantics).
 /// * `db` -- Mutable reference to an opened hints database (read-write).
 /// * `config` -- Parsed configuration context.
+// R1 fix added an 8th parameter (`sender_address`) so retry rules with a
+// `senders = ...` filter can be matched against the envelope sender. The C
+// source `retry_update` in `src/src/retry.c` already carried the equivalent
+// information through implicit globals; in Rust the sender is passed
+// explicitly to preserve the "no global mutable state" architectural rule
+// (AAP §0.4.4). A parameter struct was considered but rejected because it
+// would only be used by this one call site and would obscure the call
+// signature in trace logs.
+#[allow(clippy::too_many_arguments)]
 pub fn retry_update<D: HintsDb>(
     addr_succeed: &[(AddressItem, Vec<RetryItem>)],
     addr_failed: &[(AddressItem, Vec<RetryItem>)],
     addr_defer: &mut Vec<(AddressItem, Vec<RetryItem>)>,
     now: i64,
     received_time: i64,
+    sender_address: Option<&str>,
     db: &mut D,
     config: &ConfigContext,
 ) -> Result<(), RetryError> {
@@ -1236,6 +1469,7 @@ pub fn retry_update<D: HintsDb>(
                 message_age,
                 retry_interval_max,
                 retry_data_expire,
+                sender_address,
                 db: &mut *db,
                 config,
             };
@@ -1246,7 +1480,15 @@ pub fn retry_update<D: HintsDb>(
             // For deferred addresses: check if ALL retry items have timed out.
             if pass == UpdatePass::Deferred && !retry_items.is_empty() {
                 let all_timed_out = retry_items.iter().all(|rti| {
-                    check_item_timed_out(rti, now, message_age, retry_data_expire, db, config)
+                    check_item_timed_out(
+                        rti,
+                        now,
+                        message_age,
+                        retry_data_expire,
+                        sender_address,
+                        db,
+                        config,
+                    )
                 });
 
                 if all_timed_out {
@@ -1283,6 +1525,10 @@ struct RetryUpdateCtx<'a, D: HintsDb> {
     message_age: i64,
     retry_interval_max: i64,
     retry_data_expire: i64,
+    /// Envelope sender for the current message (R1 fix). Propagated to
+    /// [`find_config_match`] so that retry rules with a `senders` clause
+    /// are matched correctly. See [`retry_update`] for the full flow.
+    sender_address: Option<&'a str>,
     db: &'a mut D,
     config: &'a ConfigContext,
 }
@@ -1298,6 +1544,7 @@ fn process_retry_item<D: HintsDb>(
     let message_age = ctx.message_age;
     let retry_interval_max = ctx.retry_interval_max;
     let retry_data_expire = ctx.retry_data_expire;
+    let sender_address = ctx.sender_address;
     let db = &mut *ctx.db;
     let config = ctx.config;
     let key = &rti.key;
@@ -1344,6 +1591,7 @@ fn process_retry_item<D: HintsDb>(
     let retry_cfg = match find_config_match(
         lookup_key,
         Some(&addr.domain),
+        sender_address,
         rti.basic_errno,
         rti.more_errno,
         &retry_configs,
@@ -1434,11 +1682,20 @@ fn process_retry_item<D: HintsDb>(
 }
 
 /// Check whether a single retry item has timed out.
+///
+/// # Parameters
+///
+/// * `sender_address` -- Envelope sender for the message under consideration
+///   (R1 fix). Propagated to [`find_config_match`] so retry rules with a
+///   `senders` clause are matched correctly. Callers without sender context
+///   should pass `None` (which matches the C behaviour of treating a NULL
+///   sender as a non-match for rules with a sender filter).
 fn check_item_timed_out<D: HintsDb>(
     rti: &RetryItem,
     now: i64,
     message_age: i64,
     retry_data_expire: i64,
+    sender_address: Option<&str>,
     db: &D,
     config: &ConfigContext,
 ) -> bool {
@@ -1457,6 +1714,7 @@ fn check_item_timed_out<D: HintsDb>(
     let retry_cfg = match find_config_match(
         lookup_key,
         None,
+        sender_address,
         rti.basic_errno,
         rti.more_errno,
         &retry_configs,
@@ -1836,14 +2094,49 @@ mod tests {
 
     #[test]
     fn extract_match_key_ipv6_brackets() {
-        // For "[ipv6]:port", the '[' is not a special prefix, so find
-        // first ':' and return text before it
-        assert_eq!(extract_match_key("[2001:db8::1]:80"), "[2001");
+        // R2 fix: for "[ipv6]:port" keys, extract the IPv6 address from
+        // within the brackets (dropping the brackets).  Mirrors C `retry.c`
+        // `string_copyn(key+1, Ustrchr(key, ']')-1-key)`.
+        assert_eq!(extract_match_key("[2001:db8::1]:80"), "2001:db8::1");
+    }
+
+    #[test]
+    fn extract_match_key_ipv6_brackets_no_port() {
+        assert_eq!(extract_match_key("[::1]:25"), "::1");
+    }
+
+    #[test]
+    fn extract_match_key_ipv6_brackets_full_address() {
+        assert_eq!(
+            extract_match_key("[fe80::1234:5678:9abc:def0]:587"),
+            "fe80::1234:5678:9abc:def0"
+        );
+    }
+
+    #[test]
+    fn extract_match_key_ipv6_brackets_malformed_no_close() {
+        // Malformed `[...` with no closing bracket — fall through to last-colon
+        // split so we still return a sensible slice rather than panicking.
+        // Key doesn't start with alnum so we fall to the last-colon branch.
+        let result = extract_match_key("[2001:db8");
+        // Should return non-empty; the exact form is best-effort for malformed input.
+        assert!(!result.is_empty());
     }
 
     #[test]
     fn extract_match_key_plain() {
         assert_eq!(extract_match_key("user@domain.com"), "user@domain.com");
+    }
+
+    #[test]
+    fn extract_match_key_pipe_path_last_colon() {
+        // R2 fix: pipe-transport keys take the portion after the LAST colon,
+        // per C `Ustrrchr(key, ':') + 1`.  This matters when the path itself
+        // contains colons (common on non-POSIX setups or with weird transports).
+        assert_eq!(
+            extract_match_key("|/usr/bin/fwd:opt:user@example.com"),
+            "user@example.com"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1970,6 +2263,194 @@ mod tests {
             "user@primary.com",
             Some("alt.example.com")
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // R1 fix: sender-filter matching tests
+    // -----------------------------------------------------------------------
+    //
+    // These tests exercise the sender-list matching logic that was missing
+    // from the original Rust port.  See src/src/retry.c lines 528-535 for
+    // the C reference semantics.
+
+    #[test]
+    fn match_sender_list_exact_match() {
+        assert!(match_sender_list("user@example.com", "user@example.com"));
+    }
+
+    #[test]
+    fn match_sender_list_exact_match_case_insensitive() {
+        assert!(match_sender_list("USER@Example.COM", "user@example.com"));
+    }
+
+    #[test]
+    fn match_sender_list_wildcard_domain() {
+        assert!(match_sender_list("user@example.com", "*@example.com"));
+    }
+
+    #[test]
+    fn match_sender_list_bare_domain() {
+        // A bare domain in the sender list is treated as `*@domain`.
+        assert!(match_sender_list("user@example.com", "example.com"));
+    }
+
+    #[test]
+    fn match_sender_list_universal_wildcard() {
+        assert!(match_sender_list("anything@example.com", "*"));
+        assert!(match_sender_list("", "*"));
+    }
+
+    #[test]
+    fn match_sender_list_no_match() {
+        assert!(!match_sender_list("user@other.com", "*@example.com"));
+    }
+
+    #[test]
+    fn match_sender_list_multiple_items_colon() {
+        assert!(match_sender_list(
+            "user@b.com",
+            "*@a.com : *@b.com : *@c.com"
+        ));
+    }
+
+    #[test]
+    fn match_sender_list_multiple_items_comma() {
+        assert!(match_sender_list("user@b.com", "*@a.com, *@b.com, *@c.com"));
+    }
+
+    #[test]
+    fn match_sender_list_empty_matches_bounce() {
+        // Empty sender == the envelope sender for bounce messages (MAIL FROM:<>).
+        // An empty-string item in the list should match the empty sender.
+        assert!(match_sender_list("", ": *@example.com"));
+        assert!(match_sender_list("", "*@example.com :"));
+    }
+
+    #[test]
+    fn match_sender_list_empty_does_not_match_non_empty_patterns() {
+        assert!(!match_sender_list("", "*@example.com"));
+    }
+
+    #[test]
+    fn match_sender_list_negation() {
+        // Negation with `!` — a matching negated pattern causes the list to fail.
+        assert!(!match_sender_list(
+            "admin@example.com",
+            "!admin@example.com : *@example.com"
+        ));
+        // But a non-negated match later in the list applies (processed left-to-right).
+        assert!(match_sender_list(
+            "user@example.com",
+            "!admin@example.com : *@example.com"
+        ));
+    }
+
+    /// Helper to build a minimal RetryConfig for find_config_match tests.
+    fn mk_retry_cfg(pattern: &str, senders: Option<&str>) -> RetryConfig {
+        RetryConfig {
+            pattern: pattern.to_string(),
+            senders: senders.map(|s| s.to_string()),
+            basic_errno: 0,
+            more_errno: 0,
+            rules: Vec::new(),
+            src_file: "<test>".to_string(),
+            src_line: 0,
+        }
+    }
+
+    #[test]
+    fn find_config_match_senders_set_sender_matches() {
+        let configs = vec![mk_retry_cfg("*@example.com", Some("*@sender.com"))];
+        let result = find_config_match(
+            "*@example.com",
+            None,
+            Some("user@sender.com"),
+            0,
+            0,
+            &configs,
+        );
+        assert!(
+            result.is_some(),
+            "rule should apply when sender matches the senders clause"
+        );
+    }
+
+    #[test]
+    fn find_config_match_senders_set_sender_doesnt_match() {
+        let configs = vec![mk_retry_cfg("*@example.com", Some("*@sender.com"))];
+        let result = find_config_match(
+            "*@example.com",
+            None,
+            Some("user@other.com"),
+            0,
+            0,
+            &configs,
+        );
+        assert!(
+            result.is_none(),
+            "rule should be skipped when sender does not match the senders clause"
+        );
+    }
+
+    #[test]
+    fn find_config_match_senders_set_sender_none() {
+        // C semantics (retry.c:528-535): senders clause with NULL sender skips the rule.
+        let configs = vec![mk_retry_cfg("*@example.com", Some("*@sender.com"))];
+        let result = find_config_match("*@example.com", None, None, 0, 0, &configs);
+        assert!(
+            result.is_none(),
+            "rule should be skipped when sender is None (C: NULL sender)"
+        );
+    }
+
+    #[test]
+    fn find_config_match_senders_none_sender_any() {
+        // When senders clause is absent, the rule always applies regardless of sender.
+        let configs = vec![mk_retry_cfg("*@example.com", None)];
+
+        // With a sender
+        let result = find_config_match(
+            "*@example.com",
+            None,
+            Some("user@anywhere.com"),
+            0,
+            0,
+            &configs,
+        );
+        assert!(
+            result.is_some(),
+            "rule without senders clause should apply with any sender"
+        );
+
+        // Without a sender
+        let result = find_config_match("*@example.com", None, None, 0, 0, &configs);
+        assert!(
+            result.is_some(),
+            "rule without senders clause should apply without sender"
+        );
+    }
+
+    #[test]
+    fn find_config_match_senders_first_rule_skipped_second_matches() {
+        // First rule has a senders clause that doesn't match; second rule has no senders
+        // clause so it matches.  Verifies we don't short-circuit on the first pattern match.
+        let configs = vec![
+            mk_retry_cfg("*@example.com", Some("*@priv.com")),
+            mk_retry_cfg("*@example.com", None),
+        ];
+        let result = find_config_match(
+            "*@example.com",
+            None,
+            Some("user@public.com"),
+            0,
+            0,
+            &configs,
+        );
+        assert!(
+            result.is_some(),
+            "should fall through to second rule when first has non-matching senders"
+        );
+        assert_eq!(result.unwrap().senders, None);
     }
 
     // -----------------------------------------------------------------------

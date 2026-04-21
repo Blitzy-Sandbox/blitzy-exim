@@ -118,12 +118,33 @@ nix = { version = "0.31.2", features = ["signal", "process", "socket", "user", "
 bitflags = "2.10.0"
 
 # ── Cryptographic hashing (DKIM body/header hash computation) ─────────
-# sha1: Legacy DKIM hash algorithm (RFC 6376 backward compatibility)
-sha1 = "0.10.6"
-# sha2: Primary DKIM hash algorithms (SHA-256/SHA-512)
-sha2 = "0.10.9"
+# sha1: Legacy DKIM hash algorithm (RFC 6376 backward compatibility).
+# The `oid` feature exposes the `AssociatedOid` trait implementation
+# (OID 1.3.14.3.2.26) needed by `rsa::pkcs1v15::SigningKey::<Sha1>::new`,
+# which prefixes signatures with the DigestInfo ASN.1 structure.
+sha1 = { version = "0.10.6", features = ["oid"] }
+# sha2: Primary DKIM hash algorithms (SHA-256/SHA-512).
+# The `oid` feature provides AssociatedOid implementations for the PKCS#1
+# v1.5 DigestInfo prefix used by RSA signatures.
+sha2 = { version = "0.10.9", features = ["oid"] }
 # base64: DKIM signature/body-hash/public-key base64 encode/decode
 base64 = "0.22.1"
+
+# ── Cryptographic signing / verification (DKIM + ARC) ─────────────────────
+# Pure-Rust implementations satisfy `#![forbid(unsafe_code)]` constraint
+# imposed on exim-miscmods/src/dkim/pdkim/signing.rs (AAP §0.7.2).
+# rsa 0.9.x integrates with the workspace sha2 (0.10) digests via its
+# "sha2" feature. Its default "encoding" feature pulls in pkcs1/pkcs8/spki
+# transitively, so PEM/DER key parsing is supported out-of-the-box.
+rsa = { version = "0.9.10", features = ["sha2"] }
+# ed25519-dalek: RFC 8032 Ed25519 signing/verification
+ed25519-dalek = { version = "2.2.0", features = ["rand_core", "pkcs8", "pem"] }
+# signature: Generic Signer/Verifier traits used by rsa + ed25519-dalek APIs
+signature = "2.2.0"
+# rand / rand_core 0.8.x selected for compatibility with rsa 0.9 and
+# ed25519-dalek 2.2 (their rng trait bounds require rand_core 0.6.x).
+rand = "0.8.5"
+rand_core = "0.6.4"
 
 # ── Pattern matching ──────────────────────────────────────────────────────
 # regex: Rust-native regex for internal use
@@ -164,6 +185,18 @@ ldap3 = "0.12.1"
 
 # ── DNS resolution ────────────────────────────────────────────────────────
 hickory-resolver = "0.25.0"
+
+# ── Public Suffix List (organizational-domain determination) ─────────────
+# Required by DMARC (RFC 7489 §3.2) to correctly identify the organizational
+# domain for sub.example.co.uk (→ example.co.uk, NOT example.co). The naïve
+# "split on first dot" approach fails for multi-label TLDs. The publicsuffix
+# crate consults the compiled-in PSL trie for correct results.
+# Used by:
+#   - exim-lookups/src/psl.rs (feature lookup-psl) — psl/regdom lookup drivers
+#   - exim-miscmods/src/dmarc.rs — DMARC organizational-domain determination
+#     (DM2 fix replacing naïve splitn(2, '.') with proper PSL-aware lookup)
+#   - exim-miscmods/src/dmarc_native.rs — native DMARC backend alternative
+publicsuffix = { version = "2.3.0", features = ["idna"] }
 
 # ── Async runtime ────────────────────────────────────────────────────────
 # CRITICAL: tokio is scoped to lookup execution ONLY via block_on().

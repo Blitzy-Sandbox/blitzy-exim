@@ -949,27 +949,42 @@ fn dkt_direct(
     // C: dkim->dot_stuffed = f.spool_file_wireformat (line 188)
     dkim_opts.dot_stuffed = tctx.spool_wireformat;
 
-    // Step 3: Compute DKIM signatures over headers + body data
-    // Replaces C: dkim_exim_sign(deliver_datafile, offset, hdrs, dkim, &errstr)
-    // at lines 189-190.
+    // Step 3: Compute DKIM signatures over headers + body data.
     //
-    // Combine headers and body for signing.
-    let mut sign_input = Vec::with_capacity(serialized_headers.len() + body_data.len());
-    sign_input.extend_from_slice(&serialized_headers);
-    sign_input.extend_from_slice(body_data);
-
-    let dkim_signature_result = super::dkim_sign(&sign_input);
+    // Replaces C: `dkim_exim_sign(deliver_datafile, offset, hdrs, dkim, &errstr)`
+    // at lines 189-190 of `dkim_transport.c`.
+    //
+    // Before the T1/T2 fix we called `super::dkim_sign(&bytes)`, a simplified
+    // dispatcher that discarded every `DkimTransportOptions` field and always
+    // returned an empty signature regardless of configuration.  That made
+    // transport-level signing silently non-functional: the admin would set
+    // `dkim_domain`, `dkim_selector`, `dkim_private_key`, `dkim_sign_headers`,
+    // `dkim_canon`, `dkim_hash`, `dkim_identity`, and `dkim_timestamps`, but
+    // none of those values ever reached PDKIM.
+    //
+    // The fix is to call `dkim_sign_with_opts(prefix, body, opts)`, which
+    // mirrors `dkim_exim_sign()` in dkim.c: it iterates domain × selector,
+    // honours per-message options, feeds prefix+body through PDKIM with
+    // `init_sign` → `set_optional` → `feed` → `feed_finish`, and drives the
+    // RustCrypto signing layer end-to-end (RSA-SHA1/SHA256 and Ed25519).
+    let dkim_signature_result =
+        super::dkim_sign_with_opts(&serialized_headers, body_data, dkim_opts);
 
     let dkim_signature = match dkim_signature_result {
-        Ok(sig) => {
+        Ok((sig, record)) => {
             if sig.is_empty() {
                 tracing::debug!("DKIM sign returned empty signature — checking strict policy");
                 // Signing produced no signature — check strict policy
                 check_sign_fail(dkim_opts)?;
                 None
             } else {
-                // Record the signing in the audit trail
-                signing_state.signing_record.push_str(&sig);
+                // Record the signing audit trail (domain:selector pairs used).
+                if !record.is_empty() {
+                    if !signing_state.signing_record.is_empty() {
+                        signing_state.signing_record.push(':');
+                    }
+                    signing_state.signing_record.push_str(&record);
+                }
                 Some(sig)
             }
         }
@@ -1199,24 +1214,39 @@ fn create_kfile(
     // The dotstuffed status depends on whether end_dot was in the options.
     dkim_opts.dot_stuffed = tctx.options.contains(TransportOptions::END_DOT);
 
-    // Read the K-file content for signing
+    // Read the K-file content for signing.
+    //
+    // In K-file mode the filtered message (headers + body after any
+    // `transport_filter` has run) is already written to disk as a single
+    // blob.  We read it back and feed it to `dkim_sign_with_opts` as the
+    // prefix (headers+body combined), with an empty body slice — PDKIM
+    // treats the entire prefix as the canonicalizable input stream.
+    //
+    // The T1/T2 fix replaces the prior `super::dkim_sign(&bytes)` call
+    // which ignored every `DkimTransportOptions` field.  See the matching
+    // comment in `dkt_direct` above for background.
     kfile.seek(SeekFrom::Start(0))?;
     let mut kfile_content = Vec::with_capacity(k_file_size as usize);
     kfile.read_to_end(&mut kfile_content)?;
 
-    let dkim_signature_result = super::dkim_sign(&kfile_content);
+    let dkim_signature_result = super::dkim_sign_with_opts(&kfile_content, &[], dkim_opts);
 
     let mut dkim_signature_bytes: Vec<u8> = Vec::new();
 
     match dkim_signature_result {
-        Ok(sig) => {
+        Ok((sig, record)) => {
             if sig.is_empty() {
                 tracing::debug!(
                     "DKIM sign returned empty signature for K-file — checking strict policy"
                 );
                 check_sign_fail(dkim_opts)?;
             } else {
-                signing_state.signing_record.push_str(&sig);
+                if !record.is_empty() {
+                    if !signing_state.signing_record.is_empty() {
+                        signing_state.signing_record.push(':');
+                    }
+                    signing_state.signing_record.push_str(&record);
+                }
                 dkim_signature_bytes = sig.into_bytes();
             }
         }

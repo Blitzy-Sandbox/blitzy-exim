@@ -259,15 +259,18 @@ pub use dmarc_native::{
 
 #[cfg(feature = "exim-filter")]
 pub use exim_filter::{
-    exim_interpret, is_personal_filter, FilterCommand, FilterError, FilterOptions, FilterResult,
+    exim_interpret, exim_interpret_outcome, is_personal_filter, FilterCommand, FilterError,
+    FilterOptions, FilterOutcome, FilterResult, GeneratedMessage as FilterGeneratedMessage,
+    GeneratedMessageKind as FilterGeneratedMessageKind,
 };
 
 // ── Sieve filter re-exports ─────────────────────────────────────────────────
 
 #[cfg(feature = "sieve-filter")]
 pub use sieve_filter::{
-    sieve_extensions, sieve_interpret, Comparator, MatchType, SieveCapabilities, SieveCommand,
-    SieveError, SieveResult, SieveTest,
+    sieve_extensions, sieve_interpret, sieve_interpret_with_context, Comparator, GeneratedAction,
+    GeneratedMessage, GeneratedMessageKind, MatchType, NotifyAction, SieveCapabilities,
+    SieveCommand, SieveContext, SieveError, SieveOutcome, SieveResult, SieveTest, VacationAction,
 };
 
 // ── Proxy re-exports ─────────────────────────────────────────────────────────

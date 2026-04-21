@@ -78,6 +78,7 @@ use crate::spf::SpfResult;
 // Imports — External crates
 // ---------------------------------------------------------------------------
 
+use rand::Rng;
 use regex::Regex;
 use std::fmt;
 use std::sync::LazyLock;
@@ -977,6 +978,96 @@ fn dmarc_get_dns_policy_record(from_domain: &str, dns: &DnsResolver) -> Option<(
 // Core DMARC Processing
 // ===========================================================================
 
+/// Apply the DMARC `pct=` sampling tag to an effective policy.
+///
+/// Implements RFC 7489 §6.6.4 "`pct` Rollout".  The `pct` tag
+/// specifies the percentage of messages (0–100) subject to the
+/// enforcement policy declared by `p=`/`sp=`.  Messages that are not
+/// sampled receive a softer outcome:
+///
+/// | Declared policy | Sampled (lucky draw) | Not sampled (downgrade) |
+/// |-----------------|----------------------|-------------------------|
+/// | `none`          | `none`               | `none`                  |
+/// | `quarantine`    | `quarantine`         | `none`                  |
+/// | `reject`        | `reject`             | `quarantine`            |
+///
+/// # Arguments
+///
+/// * `policy` — The effective policy (after subdomain-vs-domain
+///   resolution) declared by the publisher.
+/// * `pct` — The `pct=` tag value, clamped to 0–100 by parsing.
+///
+/// # Returns
+///
+/// The *actual* policy to apply to this message after sampling.
+///
+/// # Randomness
+///
+/// Uses [`rand::thread_rng()`] which is seeded from OS entropy on
+/// first use. This is cryptographically non-secure but appropriate
+/// for policy sampling; a predictable RNG would be exploitable only
+/// in an academic sense (an attacker cannot retry messages to game
+/// the sampling).
+///
+/// # Edge cases
+///
+/// * `pct = 0` → always return the downgrade (no message ever enforced)
+/// * `pct = 100` → always return the declared policy (all messages enforced)
+/// * `pct > 100` (shouldn't occur due to parser clamping) → treated as 100
+///
+/// # DN1 remediation
+///
+/// Prior to this function existing, the pct value parsed from the
+/// DMARC record was stored in [`DmarcPolicyRecord::pct`] but never
+/// consulted during enforcement, causing domains in gradual rollout
+/// (e.g. `pct=10`) to have 100% of messages enforced.
+fn apply_pct_sampling(policy: DmarcPolicy, pct: u8) -> DmarcPolicy {
+    // Early exits: avoid invoking the RNG when the outcome is
+    // deterministic, reducing syscall pressure on high-volume paths.
+    if pct >= 100 {
+        return policy;
+    }
+    if policy == DmarcPolicy::None || policy == DmarcPolicy::Unspecified {
+        // `none` policy has no "softer" version; `unspecified` is a
+        // defect condition that will be handled upstream as temperror.
+        return policy;
+    }
+    if pct == 0 {
+        // 0% enforcement → always downgrade.
+        return downgrade_policy(policy);
+    }
+
+    // `gen_range(0..100)` returns [0, 100) uniformly.  If the draw
+    // falls strictly below `pct`, the message is "sampled" (enforced).
+    //
+    // Boundary examples:
+    //   pct=50, draw=49 → 49 < 50  → sampled (enforce)
+    //   pct=50, draw=50 → 50 < 50? → NO → downgrade
+    //   pct=10, draw=0  → sampled (enforce)  (≈10% of calls)
+    //   pct=10, draw=99 → downgrade          (≈90% of calls)
+    let draw: u8 = rand::thread_rng().gen_range(0..100);
+    if draw < pct {
+        policy
+    } else {
+        downgrade_policy(policy)
+    }
+}
+
+/// Downgrade a DMARC policy by one level per RFC 7489 §6.6.4.
+///
+/// * `reject` → `quarantine`
+/// * `quarantine` → `none`
+/// * `none` → `none`  (already minimal)
+/// * `unspecified` → `unspecified`  (error condition preserved)
+fn downgrade_policy(policy: DmarcPolicy) -> DmarcPolicy {
+    match policy {
+        DmarcPolicy::Reject => DmarcPolicy::Quarantine,
+        DmarcPolicy::Quarantine => DmarcPolicy::None,
+        DmarcPolicy::None => DmarcPolicy::None,
+        DmarcPolicy::Unspecified => DmarcPolicy::Unspecified,
+    }
+}
+
 /// Main DMARC processing entry point.
 ///
 /// Evaluates DMARC policy for the current message by:
@@ -1133,9 +1224,28 @@ pub fn dmarc_process(
         state.status_text = String::from("Accept");
         state.result = DmarcResult::Accept;
     } else {
-        // RFC 7489 §6.6.2 step 6: dispose per discovered policy
-        state.status = effective_policy.as_str().to_string();
-        match effective_policy {
+        // RFC 7489 §6.6.4: apply `pct=` sampling BEFORE enforcement.
+        //
+        // The `pct=` tag specifies the percentage of messages subject
+        // to policy enforcement (0-100, default 100).  Domains in a
+        // slow rollout typically set `pct=10` during initial
+        // deployment: 10% of messages get the declared `p=` policy,
+        // while the remaining 90% get a weaker policy (`p=reject` →
+        // quarantine, `p=quarantine` → none).
+        //
+        // Prior to DN1 this sampling logic was missing entirely — the
+        // `pct` field was parsed from the record but never consulted,
+        // causing 100% of messages to receive the declared policy
+        // regardless of rollout intent. This defeated the purpose of
+        // DMARC's staged-rollout design.
+        //
+        // DN1 fix: draw a single random integer in [0, 100) and
+        // compare against `dmarc_record.pct`. If the draw falls below
+        // `pct`, apply the effective policy as declared; otherwise,
+        // downgrade one level per §6.6.4 step 3.
+        let sampled_policy = apply_pct_sampling(effective_policy, dmarc_record.pct);
+        state.status = sampled_policy.as_str().to_string();
+        match sampled_policy {
             DmarcPolicy::None => {
                 state.policy = DmarcPolicy::None;
                 state.pass_fail = String::from("none");
@@ -1671,5 +1781,168 @@ mod tests {
         let fail = DmarcAlignmentOutcome::Fail;
         assert_ne!(pass, fail);
         assert_eq!(pass, DmarcAlignmentOutcome::Pass);
+    }
+
+    // =======================================================================
+    // DN1 (pct= sampling) tests
+    // =======================================================================
+
+    #[test]
+    fn test_downgrade_policy_levels() {
+        // RFC 7489 §6.6.4: each policy downgrades by exactly one level.
+        assert_eq!(
+            downgrade_policy(DmarcPolicy::Reject),
+            DmarcPolicy::Quarantine
+        );
+        assert_eq!(downgrade_policy(DmarcPolicy::Quarantine), DmarcPolicy::None);
+        // `none` has no softer policy; preserve it.
+        assert_eq!(downgrade_policy(DmarcPolicy::None), DmarcPolicy::None);
+        // `unspecified` is an error condition and must be preserved so
+        // the caller can generate a temperror result.
+        assert_eq!(
+            downgrade_policy(DmarcPolicy::Unspecified),
+            DmarcPolicy::Unspecified
+        );
+    }
+
+    #[test]
+    fn test_apply_pct_sampling_full_enforcement() {
+        // pct=100 (default) MUST always enforce the declared policy.
+        // We iterate many times to verify the RNG branch is never
+        // taken; if it is, the test fails.
+        for _ in 0..1000 {
+            assert_eq!(
+                apply_pct_sampling(DmarcPolicy::Reject, 100),
+                DmarcPolicy::Reject
+            );
+            assert_eq!(
+                apply_pct_sampling(DmarcPolicy::Quarantine, 100),
+                DmarcPolicy::Quarantine
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_pct_sampling_zero_enforcement() {
+        // pct=0 MUST always downgrade, deterministically (no RNG).
+        for _ in 0..1000 {
+            assert_eq!(
+                apply_pct_sampling(DmarcPolicy::Reject, 0),
+                DmarcPolicy::Quarantine
+            );
+            assert_eq!(
+                apply_pct_sampling(DmarcPolicy::Quarantine, 0),
+                DmarcPolicy::None
+            );
+            // `none` with pct=0 remains `none` (no softer policy).
+            assert_eq!(apply_pct_sampling(DmarcPolicy::None, 0), DmarcPolicy::None);
+        }
+    }
+
+    #[test]
+    fn test_apply_pct_sampling_none_policy_never_downgrades() {
+        // `none` has no softer policy; apply_pct_sampling MUST return
+        // `none` regardless of pct value.  This is both correct per
+        // the table in apply_pct_sampling()'s doc-comment and also an
+        // early-exit optimization that avoids RNG calls.
+        for pct in [0u8, 1, 25, 50, 75, 99, 100] {
+            assert_eq!(
+                apply_pct_sampling(DmarcPolicy::None, pct),
+                DmarcPolicy::None
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_pct_sampling_unspecified_preserved() {
+        // `unspecified` is preserved to let caller emit temperror.
+        for pct in [0u8, 50, 100] {
+            assert_eq!(
+                apply_pct_sampling(DmarcPolicy::Unspecified, pct),
+                DmarcPolicy::Unspecified
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_pct_sampling_distribution() {
+        // Statistical test: pct=50 should yield approximately 50% of
+        // samples as "enforced".  We draw 10,000 samples and verify
+        // the enforced count falls within [4500, 5500], which is
+        // ±5σ of the expected 5000 (σ ≈ 50 for n=10,000 p=0.5).
+        // This is a wide tolerance to make test flake probability
+        // negligible (approximately 1 in 10^6 of a false failure).
+        let mut enforced_count = 0;
+        for _ in 0..10_000 {
+            if apply_pct_sampling(DmarcPolicy::Reject, 50) == DmarcPolicy::Reject {
+                enforced_count += 1;
+            }
+        }
+        assert!(
+            (4500..=5500).contains(&enforced_count),
+            "pct=50 enforcement count {} out of expected range [4500, 5500]",
+            enforced_count
+        );
+    }
+
+    #[test]
+    fn test_apply_pct_sampling_low_percentage() {
+        // pct=10: expected ~10% enforcement, tolerance ±3% absolute.
+        let mut enforced_count = 0;
+        for _ in 0..10_000 {
+            if apply_pct_sampling(DmarcPolicy::Reject, 10) == DmarcPolicy::Reject {
+                enforced_count += 1;
+            }
+        }
+        assert!(
+            (700..=1300).contains(&enforced_count),
+            "pct=10 enforcement count {} out of expected range [700, 1300]",
+            enforced_count
+        );
+    }
+
+    #[test]
+    fn test_apply_pct_sampling_high_percentage() {
+        // pct=99: expected ~99% enforcement; out of 10,000 we expect
+        // approximately 100 downgrades.  Tolerance [50, 200].
+        let mut downgraded_count = 0;
+        for _ in 0..10_000 {
+            if apply_pct_sampling(DmarcPolicy::Reject, 99) == DmarcPolicy::Quarantine {
+                downgraded_count += 1;
+            }
+        }
+        assert!(
+            (50..=200).contains(&downgraded_count),
+            "pct=99 downgrade count {} out of expected range [50, 200]",
+            downgraded_count
+        );
+    }
+
+    #[test]
+    fn test_apply_pct_sampling_downgrade_targets() {
+        // When pct=0 (always downgrade), verify the correct target
+        // policy is applied: reject→quarantine, quarantine→none.
+        assert_eq!(
+            apply_pct_sampling(DmarcPolicy::Reject, 0),
+            DmarcPolicy::Quarantine
+        );
+        assert_eq!(
+            apply_pct_sampling(DmarcPolicy::Quarantine, 0),
+            DmarcPolicy::None
+        );
+    }
+
+    #[test]
+    fn test_apply_pct_sampling_over_100_treated_as_full() {
+        // Parser clamps pct to 0–100, but defensive programming:
+        // values >100 should behave like 100 (full enforcement).
+        for pct in [101u8, 127, 200, 255] {
+            assert_eq!(
+                apply_pct_sampling(DmarcPolicy::Reject, pct),
+                DmarcPolicy::Reject,
+                "pct={} should enforce fully",
+                pct
+            );
+        }
     }
 }

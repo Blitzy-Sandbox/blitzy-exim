@@ -462,7 +462,16 @@ impl SpfState {
         }
     }
 
-    /// Set a custom DNS resolver hook for this SPF session.
+    /// Stash a custom DNS resolver hook on this state for later retrieval.
+    ///
+    /// **SP1 NOTE:** As of the SP1 remediation, this setter is **only**
+    /// useful for callers that want to stash a hook for inspection or
+    /// transfer. The **preferred** way to install a DNS hook that is
+    /// actually consulted by libspf2 is to pass the hook as the
+    /// `dns_hook` parameter to [`spf_conn_init`]. The hook stored via
+    /// this setter is **not** wired into the SPF server — doing so
+    /// would require tearing down and rebuilding the `SpfServer` which
+    /// would invalidate any in-flight SPF requests.
     ///
     /// The hook function receives a domain name and query type (rr_type),
     /// and returns a vector of [`DnsRecord`] entries. This bridges the
@@ -470,9 +479,25 @@ impl SpfState {
     ///
     /// Replaces C: `SPF_dns_exim_new()` (spf.c lines 211-239) which
     /// registers `SPF_dns_exim_lookup` as the custom DNS callback.
+    ///
+    /// # See also
+    ///
+    /// * [`spf_conn_init`] — the correct entry point for installing a
+    ///   DNS hook into a working SPF server.
+    /// * [`SpfServer::new_with_dns_hook`](exim_ffi::spf::SpfServer::new_with_dns_hook)
+    ///   — the underlying FFI constructor.
     pub fn set_dns_hook(&mut self, hook: DnsLookupFn) {
-        debug!("SPF: custom DNS resolver hook registered");
+        debug!("SPF: DNS resolver hook stored on SpfState (not wired to libspf2)");
         self.dns_hook = Some(hook);
+    }
+
+    /// Take ownership of the DNS hook stored on this state, leaving
+    /// `None` behind.
+    ///
+    /// Useful for moving a hook that was stashed via [`set_dns_hook`]
+    /// into a subsequent call to [`spf_conn_init`].
+    pub fn take_dns_hook(&mut self) -> Option<DnsLookupFn> {
+        self.dns_hook.take()
     }
 
     /// Get the taint state of the current SPF data.
@@ -526,11 +551,12 @@ impl SpfState {
 /// Initialize SPF processing for a new SMTP connection.
 ///
 /// Creates the libspf2 server and request objects, hooks Exim's DNS resolver
-/// as the custom DNS backend, and sets the connecting client's IP address.
+/// as the custom DNS backend (SP1), sets the receiving domain for `%{r}`
+/// macro expansion (SP2), and sets the connecting client's IP address.
 ///
 /// Replaces C: `spf_conn_init()` (spf.c lines 301-349) which:
 /// 1. Calls `spf_init()` to create SPF server with DNS cache
-/// 2. Sets the receiving domain via `SPF_server_set_rec_dom()`
+/// 2. Sets the receiving domain via `SPF_server_set_rec_dom()`  ← **SP2 wired**
 /// 3. Creates an SPF request via `SPF_request_new()`
 /// 4. Sets the client IP (IPv4 or IPv6) via `SPF_request_set_ipv4_str()`
 ///    or `SPF_request_set_ipv6_str()`
@@ -543,21 +569,41 @@ impl SpfState {
 /// - `store` — Per-message allocation context for SPF data
 /// - `spf_guess` — Optional custom SPF guess record (from config)
 /// - `smtp_comment_template` — Optional custom SMTP comment template (from config)
+/// - `rec_dom` — **SP2**: Optional receiving domain (typically
+///   `primary_hostname`). When `Some`, libspf2 will expand the `%{r}`
+///   macro in SPF records to this value. When `None`, libspf2 uses its
+///   built-in default (typically `""`).
+/// - `dns_hook` — **SP1**: Optional custom DNS resolver hook. When
+///   `Some`, libspf2 will dispatch ALL DNS queries (MX, A, AAAA, TXT,
+///   PTR) to the provided closure via a C-callable trampoline. When
+///   `None`, libspf2 uses its built-in DNS resolver (res_query).
+///   Providing a hook is the production path — it bridges libspf2 to
+///   Exim's `hickory-resolver`, preserves DNSSEC validation, and allows
+///   SPF tests to stub DNS responses via test fixtures.
 ///
 /// ## Returns
 ///
 /// A new [`SpfState`] initialized with the connection parameters, or an
 /// [`SpfError`] if initialization fails.
+#[allow(clippy::too_many_arguments)]
+// Justification: this function mirrors the parameters of the C-side
+// `spf_conn_init()` in spf.c:301 which also accepts many discrete inputs.
+// Consolidating them into a config struct would obscure the direct
+// source-correspondence documented above.
 pub fn spf_conn_init(
     sender_host_address: &TaintedString,
     sender_helo_name: &TaintedString,
     _store: &MessageStore,
     spf_guess: Option<&str>,
     smtp_comment_template: Option<&str>,
+    rec_dom: Option<&str>,
+    dns_hook: Option<DnsLookupFn>,
 ) -> Result<SpfState, SpfError> {
     debug!(
         address = %sender_host_address,
         helo = %sender_helo_name,
+        rec_dom = ?rec_dom,
+        dns_hook = dns_hook.is_some(),
         "SPF: connection init"
     );
 
@@ -571,13 +617,41 @@ pub fn spf_conn_init(
         state.smtp_comment_template = template.to_string();
     }
 
-    // Create the SPF server with DNS caching.
+    // SP1: Create the SPF server with our custom DNS resolver hook if
+    // provided, or the default libspf2 DNS resolver otherwise.
+    //
     // Replaces C: spf_init() -> SPF_dns_exim_new() -> SPF_dns_cache_new() ->
-    // SPF_server_new_dns() (spf.c lines 248-275)
-    let server = SpfServer::new().map_err(|e| {
-        error!("SPF_server_new() failed: {}", e);
-        SpfError::InitFailed(format!("SPF server creation failed: {e}"))
-    })?;
+    // SPF_server_new_dns() (spf.c lines 248-275). Note: C Exim always used
+    // its custom DNS resolver; the Rust port makes this optional to
+    // preserve backward compatibility with callers that don't yet have
+    // a hickory-resolver context available.
+    let server = match dns_hook {
+        Some(hook) => SpfServer::new_with_dns_hook(hook).map_err(|e| {
+            error!("SPF_server_new_dns() with custom hook failed: {}", e);
+            SpfError::InitFailed(format!("SPF server creation with DNS hook failed: {e}"))
+        })?,
+        Option::None => SpfServer::new().map_err(|e| {
+            error!("SPF_server_new() failed: {}", e);
+            SpfError::InitFailed(format!("SPF server creation failed: {e}"))
+        })?,
+    };
+
+    // SP2: Set the receiving domain for `%{r}` macro expansion, if the
+    // caller has provided one (typically `primary_hostname`).
+    //
+    // Replaces C: SPF_server_set_rec_dom(spf_server, CS primary_hostname)
+    // (spf.c line 314) which always sets the receiving domain to the
+    // configured hostname.
+    if let Some(dom) = rec_dom {
+        server.set_rec_dom(dom).map_err(|e| {
+            error!("SPF_server_set_rec_dom({}) failed: {}", dom, e);
+            SpfError::InitFailed(format!(
+                "failed to set SPF receiving domain '{}': {}",
+                dom, e
+            ))
+        })?;
+        debug!(rec_dom = %dom, "SPF: receiving domain set");
+    }
 
     // Create SPF request from the server for initial IP/HELO setup.
     // Replaces C: SPF_request_new(spf_server) (spf.c line 323)
@@ -1654,4 +1728,211 @@ mod tests {
     // ---- set_request_ip_address (tested indirectly) ----
     // Direct testing requires FFI server, so we test via spf_conn_init flow.
     // The function's logic is verified through integration tests.
+
+    // -----------------------------------------------------------------------
+    // SP1/SP2 integration tests — verify that spf_conn_init correctly wires
+    // up the custom DNS hook and receiving domain via the new FFI bindings.
+    //
+    // These tests use the `#[cfg(feature = "spf")]` gate transitively
+    // through spf_conn_init which requires a live libspf2. They run with
+    // `cargo test -p exim-miscmods --features spf`.
+    // -----------------------------------------------------------------------
+
+    fn make_tainted_string(s: &str) -> TaintedString {
+        Tainted::new(s.to_string())
+    }
+
+    fn dummy_store() -> MessageStore {
+        MessageStore::new()
+    }
+
+    /// SP2: `spf_conn_init` with `rec_dom = Some(...)` must call
+    /// `SPF_server_set_rec_dom` on the created server.
+    ///
+    /// We verify success at the call-site (no error returned); the
+    /// underlying FFI behavior is covered by the unit tests in
+    /// `exim-ffi/src/spf.rs` (`spf_server_set_rec_dom_*`).
+    #[test]
+    fn spf_conn_init_accepts_rec_dom() {
+        let host = make_tainted_string("127.0.0.1");
+        let helo = make_tainted_string("client.example.com");
+        let store = dummy_store();
+
+        let result = spf_conn_init(
+            &host,
+            &helo,
+            &store,
+            Option::None, // spf_guess
+            Option::None, // smtp_comment_template
+            Some("receiver.example.com"),
+            Option::None, // dns_hook
+        );
+
+        assert!(
+            result.is_ok(),
+            "spf_conn_init should accept rec_dom and succeed: {:?}",
+            result.as_ref().err()
+        );
+        let state = result.unwrap();
+        assert!(state.server_initialized);
+    }
+
+    /// SP2: `spf_conn_init` with `rec_dom = None` must succeed (no-op
+    /// on the rec_dom setter).
+    #[test]
+    fn spf_conn_init_without_rec_dom_succeeds() {
+        let host = make_tainted_string("127.0.0.1");
+        let helo = make_tainted_string("client.example.com");
+        let store = dummy_store();
+
+        let result = spf_conn_init(
+            &host,
+            &helo,
+            &store,
+            Option::None,
+            Option::None,
+            Option::None, // rec_dom = None
+            Option::None, // dns_hook = None
+        );
+
+        assert!(
+            result.is_ok(),
+            "spf_conn_init with no rec_dom should succeed"
+        );
+    }
+
+    /// SP2: `spf_conn_init` rejects a rec_dom containing an embedded NUL
+    /// byte by propagating the SpfError from `set_rec_dom`.
+    #[test]
+    fn spf_conn_init_rejects_embedded_nul_in_rec_dom() {
+        let host = make_tainted_string("127.0.0.1");
+        let helo = make_tainted_string("client.example.com");
+        let store = dummy_store();
+
+        let result = spf_conn_init(
+            &host,
+            &helo,
+            &store,
+            Option::None,
+            Option::None,
+            Some("bad\0domain"),
+            Option::None,
+        );
+
+        assert!(result.is_err(), "spf_conn_init must reject NUL in rec_dom");
+    }
+
+    /// SP1: `spf_conn_init` with a DNS hook creates a server that will
+    /// dispatch DNS queries to the hook.
+    ///
+    /// We can't directly verify the hook is called without an SPF query,
+    /// but we verify the server is created successfully and the
+    /// `server_initialized` flag is set.
+    #[test]
+    fn spf_conn_init_accepts_dns_hook() {
+        let host = make_tainted_string("127.0.0.1");
+        let helo = make_tainted_string("client.example.com");
+        let store = dummy_store();
+
+        let hook: DnsLookupFn = Box::new(|_domain: &str, _rr_type: u16| {
+            // Synthetic: always return empty (NO_DATA)
+            Ok(Vec::new())
+        });
+
+        let result = spf_conn_init(
+            &host,
+            &helo,
+            &store,
+            Option::None,
+            Option::None,
+            Option::None,
+            Some(hook),
+        );
+
+        assert!(
+            result.is_ok(),
+            "spf_conn_init with DNS hook should succeed: {:?}",
+            result.as_ref().err()
+        );
+        let state = result.unwrap();
+        assert!(state.server_initialized);
+    }
+
+    /// SP1 + SP2: `spf_conn_init` accepts both `rec_dom` AND `dns_hook`
+    /// simultaneously (the production configuration).
+    #[test]
+    fn spf_conn_init_with_rec_dom_and_dns_hook() {
+        let host = make_tainted_string("127.0.0.1");
+        let helo = make_tainted_string("client.example.com");
+        let store = dummy_store();
+
+        let hook: DnsLookupFn = Box::new(|_domain, _rr_type| Ok(Vec::new()));
+
+        let result = spf_conn_init(
+            &host,
+            &helo,
+            &store,
+            Option::None,
+            Option::None,
+            Some("receiver.example.com"),
+            Some(hook),
+        );
+
+        assert!(
+            result.is_ok(),
+            "spf_conn_init with both rec_dom + dns_hook should succeed: {:?}",
+            result.as_ref().err()
+        );
+    }
+
+    /// SP1: `SpfState::take_dns_hook` returns the stashed hook and
+    /// leaves `None` behind (useful for moving a hook into a subsequent
+    /// `spf_conn_init` call).
+    #[test]
+    fn spf_state_take_dns_hook() {
+        let mut state = SpfState::new();
+        assert!(state.take_dns_hook().is_none());
+
+        let hook: DnsLookupFn = Box::new(|_, _| Ok(Vec::new()));
+        state.set_dns_hook(hook);
+        assert!(state.dns_hook.is_some());
+
+        let taken = state.take_dns_hook();
+        assert!(
+            taken.is_some(),
+            "take_dns_hook must return the stashed hook"
+        );
+        assert!(
+            state.dns_hook.is_none(),
+            "take_dns_hook must leave None behind"
+        );
+    }
+
+    /// SP1: `spf_conn_init` with a malformed sender IP returns an error
+    /// regardless of whether a DNS hook is installed (the hook is
+    /// installed before IP parsing).
+    #[test]
+    fn spf_conn_init_rejects_malformed_ip_with_dns_hook() {
+        let host = make_tainted_string("not-an-ip");
+        let helo = make_tainted_string("client.example.com");
+        let store = dummy_store();
+
+        let hook: DnsLookupFn = Box::new(|_, _| Ok(Vec::new()));
+
+        let result = spf_conn_init(
+            &host,
+            &helo,
+            &store,
+            Option::None,
+            Option::None,
+            Option::None,
+            Some(hook),
+        );
+
+        // Malformed IP should cause set_request_ip_address to fail.
+        assert!(
+            result.is_err(),
+            "spf_conn_init must reject malformed IP 'not-an-ip'"
+        );
+    }
 }
