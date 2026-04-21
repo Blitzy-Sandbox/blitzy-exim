@@ -94,6 +94,12 @@ install:        all
 		@cd build-$(buildname); \
 		build=$(build) $(SHELL) ../scripts/exim_install $(INSTALL_ARG)
 
+# Rust workspace build (C-to-Rust migration)
+# Invokes cargo build --release from the repository root (one level up from src/)
+
+rust:
+	cd ..; cargo build --release --target-dir target
+
 # For testing only; the version number is a dummy.
 # The build for release is done by the release-process script "mk_exim_release"
 
@@ -113,12 +119,15 @@ clean_doc: FRC
 	cd ../doc/doc-docbook; \
 	$(RM_COMMAND) -f {filter,spec}*.{pdf,ps,txt,html,xml}
 
-clean:	clean_exim clean_doc
+clean_rust:
+	cd ..; cargo clean
+
+clean:	clean_exim clean_doc clean_rust
 	@echo ""; echo '*** "make clean" just removes all .o and .a files'
 	@echo '*** Use "make makefile" to force a rebuild of the makefile'
 	@echo ""
 
-distclean: clean_doc
+distclean: clean_doc clean_rust
 	$(RM_COMMAND) -rf build-* cscope*
 
 cscope.files: FRC

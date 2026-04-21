@@ -1,0 +1,235 @@
+# =============================================================================
+# exim-routers — Router Driver Implementations for Exim MTA
+# =============================================================================
+#
+# This crate replaces the entire src/src/routers/ directory (7 C router drivers
+# + 10 rf_* shared helper files + Makefile) with Rust implementations of the
+# RouterDriver trait from exim-drivers.
+#
+# Router drivers evaluate addresses against routing rules and determine which
+# transport should deliver each message.  The 7 routers are:
+#
+#   accept.rs        — Catch-all local delivery router (always accepts)
+#   dnslookup.rs     — DNS MX/A/AAAA/SRV lookup routing
+#   ipliteral.rs     — IP-literal domain routing (e.g., user@[192.168.1.1])
+#   iplookup.rs      — External host query routing via UDP/TCP
+#   manualroute.rs   — Admin-defined explicit route lists
+#   queryprogram.rs  — External program routing via pipe
+#   redirect.rs      — Alias/forward/filter/Sieve redirect
+#
+# Shared helper functions (replacing rf_*.c):
+#
+#   helpers/queue_add.rs        — rf_queue_add: add address to delivery queue
+#   helpers/self_action.rs      — rf_self_action: handle self-referencing routes
+#   helpers/change_domain.rs    — rf_change_domain: domain rewriting
+#   helpers/expand_data.rs      — rf_expand_data: router option expansion
+#   helpers/get_transport.rs    — rf_get_transport: transport lookup by name
+#   helpers/get_errors_address.rs — rf_get_errors_address: bounce address
+#   helpers/get_munge_headers.rs  — rf_get_munge_headers: header manipulation
+#   helpers/lookup_hostlist.rs  — rf_lookup_hostlist: host list DNS resolution
+#   helpers/ugid.rs             — rf_get_ugid + rf_set_ugid: UID/GID handling
+#
+# Each router implements the RouterDriver trait and uses inventory::submit!
+# for compile-time registration (AAP §0.4.2), replacing the C drtables.c
+# static registration tables.
+#
+# Feature flags replace C preprocessor conditionals (#ifdef ROUTER_ACCEPT,
+# #ifdef ROUTER_DNSLOOKUP, etc.) per AAP §0.7.3.
+#
+# Source origin: src/src/routers/ (7 .c drivers + 10 rf_*.c helpers + 8 .h
+# headers + rf_functions.h + Makefile → compiled into routers.a)
+#
+# This crate contains ZERO unsafe code (per AAP §0.7.2).
+
+[package]
+name = "exim-routers"
+version = "0.1.0"
+edition = "2021"
+description = "Router driver implementations for Exim MTA — 7 routers (accept, dnslookup, ipliteral, iplookup, manualroute, queryprogram, redirect) plus shared helpers"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+#
+# Workspace-shared dependencies use { workspace = true } to reference the root
+# Cargo.toml [workspace.dependencies] section, ensuring version consistency
+# across all 18 crates.
+#
+# Path dependencies reference sibling crates in the workspace:
+#   exim-drivers — RouterDriver trait definition + inventory registration
+#   exim-store   — Tainted<T>/Clean<T> newtypes, arena allocation, MessageArena
+#   exim-dns     — DNS resolution for dnslookup router (MX/A/AAAA/SRV queries)
+#   exim-expand  — String expansion engine for router option expansion
+
+[dependencies]
+
+# ── Workspace sibling crates ─────────────────────────────────────────────────
+
+# RouterDriver trait definition and inventory-based compile-time registration.
+# Every router driver implements RouterDriver and registers via
+# inventory::submit! for runtime discovery by name from configuration.
+# Also provides RouterResult enum (Accept/Pass/Decline/Fail/Defer) and
+# RouterInstanceConfig for driver instantiation.
+exim-drivers = { path = "../exim-drivers" }
+
+# Tainted<T>/Clean<T> newtype wrappers for compile-time taint tracking,
+# bumpalo::Bump per-message arena allocation, and MessageArena scoped storage.
+# Replaces the C store.c 5-pool allocator for router-local allocations.
+# Router address data arrives from untrusted sources and must be wrapped in
+# Tainted<T> until validated by the routing decision.
+exim-store = { path = "../exim-store" }
+
+# DNS resolution for the dnslookup router. Provides A/AAAA/MX/SRV/PTR
+# resolution via hickory-resolver, replacing the C dns.c/host.c calls used
+# by dnslookup.c for MX preference resolution and host finding.
+# Also used by rf_lookup_hostlist helper for host list DNS lookups.
+exim-dns = { path = "../exim-dns" }
+
+# String expansion engine for router option expansion. All configurable
+# router options (e.g., transport, errors_to, headers_add, headers_remove,
+# local_parts, domains, senders) go through ${...} expansion at route time.
+# Replaces the C expand_string() calls scattered through all router drivers.
+exim-expand = { path = "../exim-expand" }
+
+# ── Compile-time driver registration ────────────────────────────────────────
+
+# Each router driver uses inventory::submit! to register itself at compile
+# time, replacing the C drtables.c static registration tables. The exim-config
+# crate resolves router names to registered implementations at config parse.
+# Version 0.3.22 per AAP §0.6.1.
+inventory = { workspace = true }
+
+# ── Error handling ───────────────────────────────────────────────────────────
+
+# Derive macro for router-specific error types. Each router defines its own
+# error enum (e.g., DnslookupRouterError, RedirectRouterError) with thiserror
+# providing Display + Error trait implementations.
+thiserror = { workspace = true }
+
+# ── Logging and tracing ─────────────────────────────────────────────────────
+
+# Structured logging replacing C DEBUG(D_route) macro calls. Router operations
+# emit tracing spans for routing decisions, DNS lookups, host list evaluation,
+# transport assignment, and redirect/alias resolution.
+tracing = { workspace = true }
+
+# Logging facade for compatibility with crates that use the log API.
+log = { workspace = true }
+
+# ── Pattern matching ────────────────────────────────────────────────────────
+
+# Rust-native regex for PCRE-compatible pattern matching used in router
+# option evaluation. The iplookup router uses response_pattern for parsing
+# external query responses.  Also used for domain/sender/local_part matching
+# in router precondition evaluation.
+regex = { workspace = true }
+
+# ── Serialization ────────────────────────────────────────────────────────────
+
+# Serialization framework for router option block serialization and structured
+# data handling in router configuration contexts.  Enables derive macros for
+# Serialize/Deserialize on router option structs.
+serde = { workspace = true }
+
+# ── System interfaces ───────────────────────────────────────────────────────
+
+# C type definitions and low-level system call bindings for POSIX operations
+# required by router helpers: struct passwd interactions in rf_queue_add
+# (uid_t, gid_t types), and queryprogram router process management.
+libc = { workspace = true }
+
+# Safe POSIX API wrappers for uid/gid operations (rf_get_ugid, rf_set_ugid),
+# user lookups (getpwnam), and process management in queryprogram router
+# (fork/exec, pipe operations). Provides safe abstractions over libc without
+# requiring unsafe blocks (AAP §0.7.2 compliance).
+nix = { workspace = true }
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Feature flags replace ALL C preprocessor conditionals from the router source
+# tree per AAP §0.7.3. Each C #ifdef maps to a semantically named Cargo
+# feature using kebab-case naming:
+#
+#   C Preprocessor Define      →  Cargo Feature
+#   ──────────────────────────────────────────────
+#   #ifdef ROUTER_ACCEPT       →  router-accept
+#   #ifdef ROUTER_DNSLOOKUP    →  router-dnslookup
+#   #ifdef ROUTER_IPLITERAL    →  router-ipliteral
+#   #ifdef ROUTER_IPLOOKUP     →  router-iplookup
+#   #ifdef ROUTER_MANUALROUTE  →  router-manualroute
+#   #ifdef ROUTER_QUERYPROGRAM →  router-queryprogram
+#   #ifdef ROUTER_REDIRECT     →  router-redirect
+#
+# All 7 routers are enabled by default, matching the typical Exim build
+# configuration where all ROUTER_* defines are set.
+
+[features]
+
+# Default features enable ALL 7 router drivers, matching the standard Exim
+# build configuration.  In typical C builds, all ROUTER_* preprocessor defines
+# are enabled.  Individual routers can be disabled by building with
+# --no-default-features and selectively enabling only the needed routers.
+default = [
+  "router-accept",
+  "router-dnslookup",
+  "router-ipliteral",
+  "router-iplookup",
+  "router-manualroute",
+  "router-queryprogram",
+  "router-redirect",
+]
+
+# ── Individual router driver features ────────────────────────────────────────
+# One feature per driver, gating compilation of the corresponding module.
+# Maps directly to C ROUTER_* preprocessor defines.
+
+# Catch-all local delivery router. Unconditionally accepts addresses for
+# local delivery when no other router has claimed them.
+# Replaces accept.c (simplest router — ~100 lines of C).
+# C guard: #ifdef ROUTER_ACCEPT
+router-accept = []
+
+# DNS MX/A/AAAA/SRV lookup routing. Resolves destination domains via DNS
+# to find mail exchangers or direct-to-host addresses. The most commonly
+# used router for outbound email delivery.
+# Replaces dnslookup.c (~500 lines of C).
+# C guard: #ifdef ROUTER_DNSLOOKUP
+router-dnslookup = []
+
+# IP-literal domain routing. Handles addresses with explicit IP addresses
+# in the domain part, e.g., user@[192.168.1.1] or user@[IPv6:::1].
+# Replaces ipliteral.c (~100 lines of C).
+# C guard: #ifdef ROUTER_IPLITERAL
+router-ipliteral = []
+
+# External host query routing. Sends the address to an external host via
+# UDP or TCP and parses the response to determine routing.  Uses a
+# configurable response_pattern (regex) for reply parsing.
+# Replaces iplookup.c (~300 lines of C).
+# C guard: #ifdef ROUTER_IPLOOKUP
+router-iplookup = []
+
+# Admin-defined explicit route lists. Allows administrators to define
+# static host routes, bypassing DNS. Supports route_list and route_data
+# options with wildcard domain matching.
+# Replaces manualroute.c (~500 lines of C).
+# C guard: #ifdef ROUTER_MANUALROUTE
+router-manualroute = []
+
+# External program routing. Runs an external program via pipe and uses its
+# output to determine routing decisions.  Supports configurable command_group,
+# command_user, and timeout settings.
+# Replaces queryprogram.c (~400 lines of C).
+# C guard: #ifdef ROUTER_QUERYPROGRAM
+router-queryprogram = []
+
+# Alias/forward/filter/Sieve redirect routing. The most complex router,
+# handling alias file lookups, .forward file processing, Exim filter
+# interpretation, and RFC 5228 Sieve filter evaluation.
+# Replaces redirect.c (~1,000 lines of C).
+# C guard: #ifdef ROUTER_REDIRECT
+router-redirect = []

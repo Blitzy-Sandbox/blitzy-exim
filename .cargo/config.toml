@@ -1,0 +1,242 @@
+# =============================================================================
+# Cargo Build Configuration for the Exim Rust Workspace
+# =============================================================================
+#
+# Copyright (c) The Exim Maintainers 2024 - 2025
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# This file is the Cargo-side equivalent of what `src/src/EDITME` provides for
+# the C build: compiler flags, linker search paths, and library linking
+# configuration. It configures the Cargo build environment for the entire Exim
+# Rust workspace (18 crates).
+#
+# Unlike the C build, which relies on hand-edited `Local/Makefile` overrides
+# and `scripts/Configure-Makefile` to discover libraries, the Rust build uses:
+#
+#   1. This config file         — Compiler flags and environment variables
+#   2. exim-ffi/build.rs        — Runtime library detection via pkg-config / cc
+#   3. Cargo feature flags      — Compile-time feature selection (replaces #ifdef)
+#   4. Cargo.toml [dependencies] — Version-pinned crate dependencies
+#
+# Customization:
+#   Users can override settings here by setting environment variables before
+#   invoking `cargo build`. Environment variable overrides follow Cargo's
+#   standard precedence rules:
+#
+#     CARGO_ENCODED_RUSTFLAGS  >  RUSTFLAGS  >  target.*.rustflags  >  build.rustflags
+#
+#   See: https://doc.rust-lang.org/cargo/reference/config.html
+#
+# NOTE: This file does NOT affect the existing C build in any way. It is
+# read exclusively by Cargo. The C build continues to use `src/Makefile`,
+# `Local/Makefile`, and `src/src/EDITME` (AAP §0.3.2, §0.7.3).
+#
+# =============================================================================
+
+
+# =============================================================================
+# [build] — Global Compiler Settings
+# =============================================================================
+#
+# AAP §0.7.2 (MANDATORY — Validation Gate 2: Zero-Warning Build):
+#
+#   "RUSTFLAGS='-D warnings' and cargo clippy -- -D warnings MUST produce
+#    zero diagnostics — builds that emit warnings must fail."
+#
+# The -D warnings flag promotes ALL Rust compiler warnings to hard errors.
+# This ensures the same strict standard as the C build's -Wall -Werror usage,
+# preventing warning accumulation that degrades code quality over time.
+#
+# IMPORTANT: On Unix targets (the only platform Exim supports), the
+# [target.'cfg(unix)'] section below takes precedence over this section for
+# rustflags. The -D warnings flag is duplicated there to maintain the Gate 2
+# requirement regardless of which section Cargo selects. This [build] section
+# serves as a baseline safety net.
+#
+# Anti-patterns:
+#   - Do NOT add optimization flags here (those belong in Cargo.toml [profile])
+#   - Do NOT add feature flags here (those belong in Cargo.toml [features])
+#   - Do NOT remove -D warnings under any circumstances
+
+[build]
+rustflags = ["-D", "warnings"]
+
+
+# =============================================================================
+# [env] — Build Environment Variables
+# =============================================================================
+#
+# These environment variables are available to all build.rs scripts and
+# compilation processes within the workspace. They serve a similar role to
+# the `INCLUDE`, `LOOKUP_INCLUDE`, `TLS_INCLUDE`, and `AUTH_INCLUDE`
+# variables in the C build's EDITME configuration.
+#
+# All variables use `force = false` semantics by default, meaning they are
+# only set if not already present in the user's environment. This allows
+# overrides without editing this file, matching Exim's tradition of
+# `Local/Makefile` overrides that never require editing distributed files.
+#
+# Customization example (shell):
+#   export EXIM_C_SRC=/opt/exim/src/src
+#   export EXIM_FFI_LIB_DIR=/opt/exim/lib
+#   cargo build --release
+
+[env]
+
+# EXIM_C_SRC — Path to the C source tree
+#
+# Used by exim-ffi/build.rs to locate C header files for bindgen FFI
+# generation. Points to the directory containing store.h, structs.h,
+# globals.h, and other headers needed for C library interop.
+#
+# Default: "src/src" relative to the workspace root (repository layout)
+# Override: Set EXIM_C_SRC environment variable to an absolute path
+#
+# C build equivalent: Implicit — the C build always knows where its own
+# source tree is. In the Rust build, we need this because exim-ffi's
+# build.rs runs from a different working directory.
+EXIM_C_SRC = { value = "src/src", relative = true }
+
+
+# =============================================================================
+# [target.'cfg(unix)'] — POSIX Target Configuration
+# =============================================================================
+#
+# Exim is exclusively a Unix/POSIX application (AAP §0.3.2). This section
+# applies to all Unix-like targets (Linux, FreeBSD, macOS, etc.) and provides:
+#
+#   1. -D warnings    — All warnings are compile errors (Gate 2)
+#   2. -rdynamic      — Export symbols for dynamic function loading
+#
+# The -rdynamic linker flag is required for ${dlfunc} dynamic function call
+# support via the `libloading` crate. It instructs the linker to export all
+# symbols from the executable, allowing dynamically loaded libraries to
+# resolve symbols from the host binary.
+#
+# C build equivalent (EDITME lines 321-324):
+#   "You need to add -export-dynamic -rdynamic to EXTRALIBS. You may also
+#    need to add -ldl to EXTRALIBS so that dlopen() is available to Exim."
+#
+# NOTE: Cargo does NOT merge rustflags between [build] and [target.'cfg(...)']
+# sections. The target-specific section completely overrides the [build]
+# section for matching targets. Therefore, -D warnings MUST be repeated here
+# to maintain the Gate 2 requirement on Unix targets.
+#
+# The -rdynamic flag is passed as a linker argument via -C link-args. It only
+# takes effect during the final link step (producing the exim binary) and is
+# harmlessly ignored for library crate compilation.
+
+[target.'cfg(unix)']
+rustflags = [
+    "-D", "warnings",
+    "-C", "link-args=-rdynamic",
+]
+
+
+# =============================================================================
+# FFI Library Dependencies Reference
+# =============================================================================
+#
+# The exim-ffi crate wraps the following C libraries that have no viable
+# Rust-native replacement (AAP §0.6.2). Library detection and linking is
+# handled by exim-ffi/build.rs using pkg-config where available, with
+# fallback to manual configuration via environment variables.
+#
+# Each library is feature-gated in exim-ffi/Cargo.toml. Only libraries
+# whose features are enabled will be linked. Consumer crates opt into
+# specific FFI modules via their own Cargo.toml dependencies.
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Library        │ Feature Flag   │ pkg-config Name  │ C Build Variable  │
+# ├────────────────┼────────────────┼──────────────────┼───────────────────┤
+# │ libpam         │ ffi-pam        │ pam              │ SUPPORT_PAM       │
+# │ libradius      │ ffi-radius     │ radiusclient-ng  │ RADIUS_CONFIG_FILE│
+# │ libperl        │ ffi-perl       │ perl             │ EXIM_PERL         │
+# │ libgsasl       │ ffi-gsasl      │ libgsasl         │ AUTH_GSASL_PC     │
+# │ libkrb5        │ ffi-krb5       │ heimdal-gssapi   │ AUTH_HEIMDAL_*_PC │
+# │ libspf2        │ ffi-spf        │ libspf2          │ SUPPORT_SPF       │
+# │ Berkeley DB    │ hintsdb-bdb    │ (none — manual)  │ USE_DB / DBMLIB   │
+# │ libgdbm        │ hintsdb-gdbm   │ (none — manual)  │ USE_GDBM / DBMLIB │
+# │ libndbm        │ hintsdb-ndbm   │ (none — manual)  │ USE_NDBM / DBMLIB │
+# │ libtdb         │ hintsdb-tdb    │ tdb              │ USE_TDB / DBMLIB  │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# Overriding library locations:
+#
+#   If pkg-config cannot find a library, or if libraries are installed in
+#   non-standard locations, set the following environment variables before
+#   building (these are consumed by exim-ffi/build.rs, not by this config):
+#
+#     # General override for all FFI libraries:
+#     export EXIM_FFI_LIB_DIR=/usr/local/lib
+#
+#     # Per-library overrides (highest priority):
+#     export EXIM_PAM_LIB_DIR=/usr/lib/x86_64-linux-gnu
+#     export EXIM_PERL_LIB_DIR=/usr/lib/x86_64-linux-gnu/perl/5.38
+#     export EXIM_GSASL_LIB_DIR=/usr/lib
+#     export EXIM_KRB5_LIB_DIR=/usr/lib/x86_64-linux-gnu
+#     export EXIM_SPF_LIB_DIR=/usr/lib
+#     export EXIM_DB_LIB_DIR=/usr/lib
+#     export EXIM_GDBM_LIB_DIR=/usr/lib
+#     export EXIM_TDB_LIB_DIR=/usr/lib
+#
+#   C build equivalent (EDITME):
+#     TLS_LIBS=-L/usr/local/openssl/lib -lssl -lcrypto
+#     AUTH_LIBS=-lsasl2
+#     LOOKUP_LIBS=-L/usr/local/lib -lldap -llber -lmysqlclient -lpq
+#     DBMLIB=-lgdbm
+#     EXTRALIBS_EXIM=-L/usr/local/lib -liconv
+#
+# Common system library paths (for reference):
+#
+#   Debian/Ubuntu (multiarch):
+#     /usr/lib/x86_64-linux-gnu   — 64-bit libraries
+#     /usr/lib/aarch64-linux-gnu  — ARM64 libraries
+#     /usr/include                — System headers
+#
+#   Red Hat/CentOS/Fedora:
+#     /usr/lib64                  — 64-bit libraries
+#     /usr/include                — System headers
+#
+#   FreeBSD:
+#     /usr/local/lib              — Ports/packages libraries
+#     /usr/local/include          — Ports/packages headers
+#
+#   Manual installation:
+#     /usr/local/lib              — Locally compiled libraries
+#     /usr/local/include          — Locally compiled headers
+#
+# NOTE: The SQLite hints backend does NOT require FFI — it uses the pure-Rust
+# `rusqlite` crate (with bundled SQLite) instead of C bindings.
+#
+# =============================================================================
+
+
+# =============================================================================
+# Additional Notes
+# =============================================================================
+#
+# Build commands (reference):
+#   cargo build --workspace                    # Build all crates (dev profile)
+#   cargo build --release                      # Optimized binary (LTO enabled)
+#   cargo check --workspace                    # Type-check only
+#   cargo clippy --workspace -- -D warnings    # Lint (zero diagnostics required)
+#   cargo fmt --check                          # Format verification
+#   cargo test --workspace                     # Run all tests
+#
+# Feature-gated builds:
+#   cargo build --release -p exim-core \
+#     --features "exim-tls/tls-openssl" \
+#     --features "exim-lookups/lookup-pgsql,exim-lookups/lookup-redis"
+#
+# The `make rust` target in src/Makefile provides a convenience wrapper:
+#   cd src && make rust
+#
+# See also:
+#   Cargo.toml              — Workspace manifest, shared dependencies, features
+#   rust-toolchain.toml     — Rust toolchain pinning (stable + rustfmt + clippy)
+#   exim-ffi/Cargo.toml     — FFI crate feature flags and C library dependencies
+#   exim-ffi/build.rs       — C library detection and Rust binding generation
+#   src/src/EDITME          — C build equivalent of this file
+#
+# =============================================================================

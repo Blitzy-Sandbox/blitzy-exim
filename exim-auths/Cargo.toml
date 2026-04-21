@@ -1,0 +1,217 @@
+# =============================================================================
+# exim-auths — Authentication Driver Implementations for Exim MTA
+# =============================================================================
+#
+# This crate replaces the entire src/src/auths/ directory (26 C/H files) with
+# Rust implementations of all 9 authenticator drivers plus shared helper
+# functions.  Each auth driver implements the `AuthDriver` trait from
+# `exim-drivers` and registers via `inventory::submit!` for compile-time
+# collection (replacing the C `drtables.c` linked-list registration).
+#
+# Auth drivers implemented:
+#   • CRAM-MD5          (cram_md5.c/.h)           — HMAC-MD5 challenge-response
+#   • Cyrus SASL        (cyrus_sasl.c/.h)         — libsasl2 via exim-ffi
+#   • Dovecot           (dovecot.c/.h)             — Unix socket auth protocol
+#   • EXTERNAL          (external.c/.h)            — SASL EXTERNAL (RFC 4422 §A)
+#   • GSASL             (gsasl.c/.h)               — GNU SASL (SCRAM, etc.) via exim-ffi
+#   • Heimdal GSSAPI    (heimdal_gssapi.c/.h)      — Kerberos GSSAPI via exim-ffi
+#   • PLAIN/LOGIN       (plaintext.c/.h)           — server prompts / client send
+#   • SPA/NTLM          (spa.c/.h + auth-spa.c/.h) — built-in MD4/DES primitives
+#   • TLS cert          (tls.c/.h)                 — TLS client certificate auth
+#
+# Shared helpers (always compiled, not feature-gated):
+#   • helpers/base64_io.rs        — replaces get_data.c + get_no64_data.c
+#   • helpers/server_condition.rs — replaces check_serv_cond.c
+#   • helpers/saslauthd.rs        — replaces call_saslauthd.c + pwcheck.c
+#
+# Feature flag mapping from C preprocessor macros (AAP §0.7.3):
+#   AUTH_CRAM_MD5       → auth-cram-md5       (pure Rust)
+#   AUTH_CYRUS_SASL     → auth-cyrus-sasl     (FFI: libsasl2)
+#   AUTH_DOVECOT        → auth-dovecot        (pure Rust)
+#   AUTH_EXTERNAL       → auth-external       (pure Rust)
+#   AUTH_GSASL          → auth-gsasl          (FFI: libgsasl)
+#   AUTH_HEIMDAL_GSSAPI → auth-heimdal-gssapi (FFI: libkrb5)
+#   AUTH_PLAINTEXT      → auth-plaintext      (pure Rust)
+#   AUTH_SPA            → auth-spa            (pure Rust)
+#   AUTH_TLS            → auth-tls            (pure Rust)
+#
+# Safety: This crate contains ZERO unsafe code (per AAP §0.7.2).
+# All unsafe C library interactions are confined to the exim-ffi crate.
+
+[package]
+name = "exim-auths"
+version = "0.1.0"
+edition = "2021"
+description = "Authentication driver implementations for Exim MTA — CRAM-MD5, Cyrus SASL, Dovecot, EXTERNAL, GSASL, Heimdal GSSAPI, PLAIN/LOGIN, SPA/NTLM, TLS cert auth"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Cargo feature flags replace ALL C AUTH_* preprocessor conditionals
+# (per AAP §0.7.3).  Each flag controls compilation of its corresponding
+# auth driver module via `#[cfg(feature = "auth-...")]`.
+#
+# Pure-Rust drivers have no additional dependency requirements.
+# FFI-dependent drivers gate on `dep:exim-ffi` so the FFI crate is only
+# compiled when needed (Cyrus SASL, GSASL, Heimdal GSSAPI).
+#
+# Default features match the most common Exim build configuration, enabling
+# the two most universally deployed auth mechanisms.
+
+[features]
+default = ["auth-cram-md5", "auth-plaintext"]
+
+# ── Individual auth driver features ──────────────────────────────────────────
+
+# CRAM-MD5: HMAC-MD5 challenge-response authentication (RFC 2195).
+# Pure Rust implementation using the RustCrypto hmac + md-5 crates.
+# Replaces AUTH_CRAM_MD5 / cram_md5.c from the C build.
+auth-cram-md5 = []
+
+# Cyrus SASL: Delegates authentication to the Cyrus SASL library (libsasl2).
+# Requires FFI bindings from exim-ffi for libsasl2 interop.
+# Replaces AUTH_CYRUS_SASL / cyrus_sasl.c from the C build.
+auth-cyrus-sasl = ["dep:exim-ffi", "exim-ffi/ffi-cyrus-sasl"]
+
+# Dovecot: Authenticates via the Dovecot auth socket protocol.
+# Pure Rust implementation using Unix domain socket I/O.
+# Replaces AUTH_DOVECOT / dovecot.c from the C build.
+auth-dovecot = []
+
+# EXTERNAL: SASL EXTERNAL mechanism — identity from TLS client certificate.
+# Pure Rust implementation; no external library dependencies.
+# Replaces AUTH_EXTERNAL / external.c from the C build.
+auth-external = []
+
+# GSASL: GNU SASL library integration for SCRAM and other mechanisms.
+# Requires FFI bindings from exim-ffi for libgsasl interop.
+# Replaces AUTH_GSASL / gsasl.c from the C build.
+auth-gsasl = ["dep:exim-ffi", "exim-ffi/ffi-gsasl"]
+
+# Heimdal GSSAPI: Kerberos/GSSAPI authentication via Heimdal libraries.
+# Requires FFI bindings from exim-ffi for libkrb5/libgssapi interop.
+# Replaces AUTH_HEIMDAL_GSSAPI / heimdal_gssapi.c from the C build.
+auth-heimdal-gssapi = ["dep:exim-ffi", "exim-ffi/ffi-krb5"]
+
+# PLAIN/LOGIN: Cleartext PLAIN and LOGIN SASL mechanisms.
+# Pure Rust implementation with multi-prompt server support.
+# Replaces AUTH_PLAINTEXT / plaintext.c from the C build.
+auth-plaintext = []
+
+# SPA/NTLM: Microsoft Secure Password Authentication (NTLM).
+# Pure Rust implementation with built-in MD4 and DES primitives
+# (replaces the C auth-spa.c inline MD4/DES).
+# Replaces AUTH_SPA / spa.c + auth-spa.c from the C build.
+auth-spa = []
+
+# TLS: Authentication based on TLS client certificate parameters.
+# Pure Rust implementation; reads TLS session info from exim-tls context.
+# Replaces AUTH_TLS / tls.c (auth driver, not the TLS engine) from the C build.
+auth-tls = []
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+[dependencies]
+
+# ── Internal workspace crate dependencies ────────────────────────────────────
+
+# AuthDriver trait, AuthInstanceConfig, AuthDriverFactory, DriverRegistry,
+# DriverError — the core trait system that all auth drivers implement.
+# Each driver struct implements AuthDriver and registers via inventory::submit!.
+exim-drivers = { path = "../exim-drivers" }
+
+# Tainted<T>/Clean<T> newtypes for compile-time taint tracking, plus arena
+# allocation primitives for per-message memory management.
+exim-store = { path = "../exim-store" }
+
+# String expansion engine — provides expand_string() and ExpandError used by
+# the server_condition helper (helpers/server_condition.rs) to evaluate
+# authorization conditions after SASL exchange completes.
+exim-expand = { path = "../exim-expand" }
+
+# FFI bindings for C libraries without viable Rust alternatives.
+# OPTIONAL: only compiled when an FFI-dependent auth feature is enabled.
+# Used by: auth-cyrus-sasl (libsasl2), auth-gsasl (libgsasl),
+#          auth-heimdal-gssapi (libkrb5/libgssapi)
+exim-ffi = { path = "../exim-ffi", optional = true }
+
+# ── Workspace-level shared dependencies ──────────────────────────────────────
+# Versions are pinned in the root Cargo.toml [workspace.dependencies] section
+# (per AAP §0.6.1) and referenced here via `workspace = true`.
+
+# Compile-time driver registration — version 0.3.22 per AAP §0.6.1.
+# Each auth driver uses inventory::submit! to register its factory with the
+# global driver registry, replacing the C drtables.c linked-list pattern.
+inventory = { workspace = true }
+
+# Error type derivation for AuthError and driver-specific error enums.
+thiserror = { workspace = true }
+
+# Structured logging and debugging — replaces C debug_printf / log_write.
+# Auth drivers emit tracing spans and events for authentication flow tracking.
+tracing = { workspace = true }
+
+# Logging facade for compatibility with crates that use the `log` API.
+log = { workspace = true }
+
+# Serialization support for auth driver option structures.
+# Used for config parsing and -bP option printing.
+serde = { workspace = true }
+
+# Pattern matching for server_condition evaluation, string matching in
+# auth driver option processing, and saslauthd response parsing.
+regex = { workspace = true }
+
+# C type definitions for low-level socket operations used by Dovecot
+# socket auth protocol and saslauthd Unix domain socket integration.
+libc = { workspace = true }
+
+# ── Direct dependencies (auth-specific) ─────────────────────────────────────
+
+# Base64 encoding/decoding for SMTP AUTH challenge-response exchange.
+# CRITICAL: Heavily used by shared helpers (base64_io.rs) which implement
+# auth_get_data(), auth_read_input(), auth_client_item() from C get_data.c
+# and auth_get_no64_data() from C get_no64_data.c.
+base64 = "0.22"
+
+# ── RustCrypto stack for CRAM-MD5 HMAC computation ──────────────────────────
+# Replaces the inline #include "md5.c" and hand-rolled HMAC in C cram_md5.c.
+# Uses the well-audited RustCrypto ecosystem (hmac 0.12 + md-5 0.10 + digest
+# 0.10) rather than the standalone md5 crate, for better trait interop.
+
+# HMAC (Keyed-Hash Message Authentication Code) — RFC 2104.
+# Core primitive for CRAM-MD5 authentication challenge verification.
+hmac = "0.12"
+
+# MD5 hash function (RustCrypto implementation, crate name: md-5).
+# Provides the Digest trait impl consumed by the hmac crate for HMAC-MD5.
+md-5 = "0.10"
+
+# Digest trait — shared interface for cryptographic hash functions.
+# Required by hmac and md-5 for trait-based hash algorithm selection.
+digest = "0.10"
+
+# ── RustCrypto stack for SPA/NTLM ───────────────────────────────────────────
+# Replaces the built-in MD4 and DES implementations in C auth-spa.c.
+# The original C code included inline MD4 and DES for the NTLM protocol;
+# this Rust implementation uses audited RustCrypto crates instead.
+
+# MD4 hash function — used for NTLM password hashing (NT hash).
+md4 = "0.10"
+
+# DES block cipher — used for NTLM LM hash computation.
+des = "0.8"
+
+# ── Constant-time primitives for credential comparison ──────────────────────
+# The `subtle` crate provides constant-time equality operations that prevent
+# network-observable timing side-channel attacks (CWE-208) when comparing
+# authentication hashes or digests. CRAM-MD5 relies on this indirectly via
+# `hmac::Mac::verify_slice()`; SPA/NTLM consumes it directly for NT-hash
+# verification in spa.rs. Already present as a transitive dependency via
+# `hmac`, declared explicitly here for visibility and version stability.
+subtle = "2.6"

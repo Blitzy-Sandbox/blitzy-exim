@@ -1,0 +1,148 @@
+# =============================================================================
+# exim-ffi — Minimal C FFI Shim Layer for Exim
+# =============================================================================
+#
+# This is the ONLY crate in the workspace permitted to contain `unsafe` code
+# (per AAP §0.7.2). It wraps C libraries that have no viable Rust-native
+# replacement, exposing safe Rust interfaces consumed by other exim-* crates.
+#
+# Wrapped C libraries (per AAP §0.6.2):
+#   • libpam        — PAM authentication (no mature Rust PAM crate)
+#   • libradius     — RADIUS authentication (no stable Rust RADIUS client)
+#   • libperl       — Embedded Perl interpreter (inherently FFI)
+#   • libgsasl      — GNU SASL / SCRAM (no comprehensive Rust equivalent)
+#   • libkrb5       — Kerberos GSSAPI via Heimdal (no mature Rust client)
+#   • libspf2       — SPF validation with DNS callback (no drop-in Rust lib)
+#   • Berkeley DB   — BDB hintsdb backend (no Rust BDB bindings)
+#   • libgdbm       — GDBM hintsdb backend (no Rust GDBM bindings)
+#   • libndbm       — NDBM hintsdb backend (no Rust NDBM bindings)
+#   • libtdb        — TDB hintsdb backend (no Rust TDB bindings)
+#
+# NOTE: SQLite hints backend is NOT wrapped here — it uses the `rusqlite`
+# pure-Rust crate in `exim-lookups` instead.
+#
+# This crate is a leaf dependency: it does NOT depend on any other exim-*
+# workspace crate. Consumer crates (exim-auths, exim-miscmods, exim-lookups,
+# exim-core, exim-expand) opt into specific FFI modules via feature flags.
+#
+# Build commands:
+#   cargo check -p exim-ffi                          # Type-check
+#   cargo check -p exim-ffi --all-features           # Check all FFI modules
+#   cargo build -p exim-ffi --features ffi-pam       # Build with PAM support
+# =============================================================================
+
+[package]
+name = "exim-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal C FFI shim layer for Exim — wraps C libraries without viable Rust alternatives"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Each FFI module is individually feature-gated, replacing the C preprocessor
+# conditionals from the original Exim source. No features are enabled by
+# default — consumer crates opt in to the specific FFI modules they require.
+#
+# Feature flag → C preprocessor conditional mapping:
+#   ffi-pam       → SUPPORT_PAM           (src/src/miscmods/pam.c)
+#   ffi-radius    → RADIUS_CONFIG_FILE    (src/src/miscmods/radius.c)
+#   ffi-perl      → EXIM_PERL             (src/src/miscmods/perl.c)
+#   ffi-gsasl     → AUTH_GSASL            (src/src/auths/gsasl.c)
+#   ffi-krb5      → AUTH_HEIMDAL_GSSAPI   (src/src/auths/heimdal_gssapi.c)
+#   ffi-spf       → SUPPORT_SPF           (src/src/miscmods/spf.c)
+#   hintsdb-bdb   → USE_DB               (src/src/hintsdb/hints_bdb.h)
+#   hintsdb-gdbm  → USE_GDBM             (src/src/hintsdb/hints_gdbm.h)
+#   hintsdb-ndbm  → USE_NDBM             (src/src/hintsdb/hints_ndbm.h)
+#   hintsdb-tdb   → USE_TDB              (src/src/hintsdb/hints_tdb.h)
+
+[features]
+default = []
+
+# Individual FFI module features — C library wrappers
+ffi-pam = []           # libpam — PAM authentication (replaces SUPPORT_PAM)
+ffi-radius = []        # libradius/radiusclient — RADIUS authentication (replaces RADIUS_CONFIG_FILE)
+ffi-perl = []          # libperl — embedded Perl interpreter (replaces EXIM_PERL)
+ffi-gsasl = []         # libgsasl — GNU SASL (replaces AUTH_GSASL)
+ffi-krb5 = []          # libkrb5/Heimdal — Kerberos GSSAPI (replaces AUTH_HEIMDAL_GSSAPI)
+ffi-spf = []           # libspf2 — SPF validation (replaces SUPPORT_SPF)
+ffi-dmarc = []         # libopendmarc — DMARC policy evaluation (replaces SUPPORT_DMARC)
+ffi-oracle = []        # libclntsh — Oracle OCI v2 FFI for Oracle SQL lookups (replaces LOOKUP_ORACLE)
+ffi-whoson = []        # libwhoson — WHOSON dynamic IP tracking (replaces LOOKUP_WHOSON)
+ffi-nisplus = []       # libnsl — NIS+ directory service lookups (replaces LOOKUP_NISPLUS)
+ffi-nis = []           # libnsl — NIS (YP) directory service lookups (replaces LOOKUP_NIS)
+ffi-cyrus-sasl = []   # libsasl2 — Cyrus SASL server authentication (replaces AUTH_CYRUS_SASL)
+ffi-lmdb = ["dep:heed"]  # LMDB safe open wrapper — centralises the unsafe mmap call from heed
+
+# Hints database backend features
+# These are mutually exclusive at runtime but can all be compiled simultaneously.
+# The active backend is selected via Exim configuration at startup.
+hintsdb-bdb = []       # Berkeley DB (replaces USE_DB in C build)
+hintsdb-gdbm = []      # GDBM (replaces USE_GDBM in C build)
+hintsdb-ndbm = []      # NDBM (replaces USE_NDBM in C build)
+hintsdb-tdb = []       # TDB (replaces USE_TDB in C build)
+
+# =============================================================================
+# Runtime Dependencies
+# =============================================================================
+
+[dependencies]
+# C type definitions and system call bindings — required for all FFI operations.
+# Version pinned via workspace (0.2.183 per AAP §0.6.1).
+libc = { workspace = true }
+
+# Dynamic library loading — replaces dlopen/dlsym for ${dlfunc} dynamic
+# function calls and optional runtime library loading.
+# Version pinned via workspace (0.9.0 per AAP §0.6.1).
+libloading = { workspace = true }
+
+# Structured logging/tracing — used by FFI modules that register C-level
+# logging callbacks (e.g., Cyrus SASL log callback) to route library
+# diagnostic messages through the Rust tracing framework.
+# Version pinned via workspace (0.1.44 per AAP §0.6.1).
+tracing = { workspace = true }
+
+# Safe POSIX API wrappers — required for the `signal` module which provides
+# safe wrappers around nix::sys::signal::sigaction(). The nix crate exposes
+# sigaction as unsafe because callers must guarantee async-signal-safety of
+# handlers; this crate centralises that unsafe boundary per AAP §0.7.2.
+# Version pinned via workspace (0.31.2 per AAP §0.6.1).
+nix = { workspace = true }
+
+# LMDB environment wrapper — heed::EnvOpenOptions::open() requires `unsafe`
+# due to LMDB's memory-mapped I/O. This crate centralises that unsafety so
+# exim-lookups/src/lmdb.rs remains 100% safe Rust.
+# Only compiled when the ffi-lmdb feature is enabled.
+heed = { version = "0.22.0", optional = true }
+
+# Error type derivation — used by the dlfunc module (DlfuncError) and
+# by the LMDB module (LmdbEnvError). Always compiled because the dlfunc
+# module is always available. Version pinned via workspace for consistency.
+thiserror = { workspace = true }
+
+# =============================================================================
+# Build Dependencies
+# =============================================================================
+#
+# These are used by build.rs to generate Rust FFI bindings from C library
+# headers at compile time:
+#   • bindgen    — Parses C headers and generates Rust FFI type/function bindings
+#   • cc         — Compiles C glue code when needed for complex library interfaces
+#   • pkg-config — Detects system library locations for correct linking
+
+[build-dependencies]
+# C header → Rust FFI binding generation (per AAP §0.6.1: 0.72.1).
+# Version pinned via workspace for consistency.
+bindgen = { workspace = true }
+
+# C compilation orchestration for optional glue code (per AAP §0.6.1: 1.2.56).
+# Version pinned via workspace for consistency.
+cc = { workspace = true }
+
+# System library detection — probes pkg-config for installed C libraries
+# (libpam, libgsasl, krb5-gssapi, libspf2, libdb, libgdbm, libtdb) to
+# obtain include paths, library paths, and linker flags.
+pkg-config = "0.3"
