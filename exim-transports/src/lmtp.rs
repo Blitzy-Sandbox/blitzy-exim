@@ -1309,7 +1309,10 @@ mod tests {
 
     #[test]
     fn default_trait_works() {
-        let t = LmtpTransport::default();
+        // LmtpTransport is a unit struct, so Default::default() returns the
+        // same value as the struct literal `LmtpTransport`. Using the literal
+        // form avoids clippy::default_constructed_unit_structs.
+        let t = LmtpTransport;
         assert_eq!(t.driver_name(), "lmtp");
     }
 

@@ -1532,22 +1532,24 @@ fn acl_verify_csa_address(resolver: &DnsResolver, target: &str, client_ip: &str)
         return false;
     }
 
-    // Try A records first, then AAAA
+    // Try A records first, then AAAA.
+    //
+    // Note: we use match guards (`DnsRecordData::A(addr) if addr.to_string() == client_ip`)
+    // rather than nested `if` inside each arm. This satisfies clippy::collapsible_match,
+    // required because exim-acl/src/lib.rs sets `#![deny(clippy::all)]`. Behaviour is
+    // identical: when the guard fails, control falls through to the wildcard arm `_ => {}`
+    // and the iteration continues without returning true.
     for rtype in &[DnsRecordType::A, DnsRecordType::Aaaa] {
         match resolver.dns_basic_lookup(target, *rtype) {
             Ok(response) => {
                 if response.result == DnsResult::Succeed {
                     for record in &response.records {
                         match &record.data {
-                            DnsRecordData::A(addr) => {
-                                if addr.to_string() == client_ip {
-                                    return true;
-                                }
+                            DnsRecordData::A(addr) if addr.to_string() == client_ip => {
+                                return true;
                             }
-                            DnsRecordData::Aaaa(addr) => {
-                                if addr.to_string() == client_ip {
-                                    return true;
-                                }
+                            DnsRecordData::Aaaa(addr) if addr.to_string() == client_ip => {
+                                return true;
                             }
                             _ => {}
                         }

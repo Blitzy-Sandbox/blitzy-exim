@@ -332,6 +332,11 @@ mod tests {
     }
 
     #[test]
+    // This test intentionally invokes `.clone()` on a `Copy` enum to verify
+    // the `Clone` trait is derived (in addition to `Copy`). The clippy
+    // `clone_on_copy` lint is suppressed because the redundancy is the
+    // point of the test.
+    #[allow(clippy::clone_on_copy)]
     fn dns_result_copy_and_clone() {
         let a = DnsResult::Succeed;
         let b = a; // Copy

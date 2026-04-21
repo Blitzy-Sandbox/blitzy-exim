@@ -318,15 +318,18 @@ pub fn address_test_mode(
                         print_routing_result(address, &result, &addr_item);
                         // Set exit code based on routing result:
                         // FAIL or Error → 2, Defer → 1 (unless already 2)
+                        // Note: the Defer arm uses a match guard (`if exit_value == 0`)
+                        // rather than a nested `if`. This satisfies clippy::collapsible_match.
+                        // Behaviour is identical: when the guard fails (exit_value != 0), control
+                        // falls through to the wildcard arm `_ => {}` and the existing exit_value
+                        // (typically 2 from a previous Fail/Error) is preserved.
                         match result {
                             exim_deliver::RoutingResult::Fail
                             | exim_deliver::RoutingResult::Error => {
                                 exit_value = 2;
                             }
-                            exim_deliver::RoutingResult::Defer => {
-                                if exit_value == 0 {
-                                    exit_value = 1;
-                                }
+                            exim_deliver::RoutingResult::Defer if exit_value == 0 => {
+                                exit_value = 1;
                             }
                             _ => {}
                         }
@@ -1772,19 +1775,22 @@ pub fn test_rewrite_mode(args: &[String], config: &Arc<exim_config::Config>) -> 
     let address = &args[0];
     let flag_str = args.get(1).map(|s| s.as_str()).unwrap_or("E");
 
-    // Interpret the flag character (matching C rewrite flag constants from
-    // src/src/rewrite.c rewrite_one_header() / rewrite_one() — the same
-    // flag bits used by C Exim -brw mode):
-    //   E / S = envelope sender (rewrite_envfrom = 0x01)
-    //   T     = envelope recipient (rewrite_envto = 0x02)
-    //   H     = header rewrite (all header-class bits: 0x3C)
-    //   *     = all flags (0xFF)
+    // Interpret the flag character.  Bit values MUST match the canonical C
+    // definitions from `src/src/macros.h:791-813`:
+    //   E / S = envelope sender  → rewrite_envfrom       = 0x0040
+    //   T     = envelope recipient → rewrite_envto       = 0x0080
+    //   H     = header rewrite     → rewrite_all_headers = 0x003F
+    //   *     = all rewrite bits   → rewrite_all (headers | envelope | smtp
+    //                                           | qualify | repeat)
+    //
+    // Callers of `-brw` may pass any of these letters; any other letter
+    // defaults to envelope-sender context (matching the C convention).
     let flag_value: u32 = match flag_str.chars().next().unwrap_or('E') {
-        'E' | 'S' => 0x01, // rewrite_envfrom
-        'T' => 0x02,       // rewrite_envto
-        'H' => 0x3C,       // rewrite_headers (all header subtypes)
-        '*' => 0xFF,       // match all rules
-        _ => 0x01,
+        'E' | 'S' => 0x0040, // rewrite_envfrom
+        'T' => 0x0080,       // rewrite_envto
+        'H' => 0x003F,       // rewrite_all_headers
+        '*' => 0x0FFF,       // union of all currently-used flag bits
+        _ => 0x0040,
     };
 
     // Retrieve rewrite rules from the parsed configuration.
@@ -1813,10 +1819,13 @@ pub fn test_rewrite_mode(args: &[String], config: &Arc<exim_config::Config>) -> 
     let mut result_address = address.clone();
     let mut rewritten = false;
 
-    // Flag bit for "continue processing" (C: rewrite_continue = 0x40)
-    const REWRITE_CONTINUE: u32 = 0x40;
-    // Flag bit for "whole address" matching (C: rewrite_whole = 0x100)
-    const REWRITE_WHOLE: u32 = 0x100;
+    // Flag bit for "repeat"/continue processing — C: rewrite_repeat = 0x0800.
+    // (C Exim has no distinct "continue" flag; the `R` rewrite flag causes
+    // the rewriter to loop over the rules again after a successful match,
+    // which is the closest analog to a "continue" bit.)
+    const REWRITE_CONTINUE: u32 = 0x0800;
+    // Flag bit for "whole address" matching — C: rewrite_whole = 0x1000.
+    const REWRITE_WHOLE: u32 = 0x1000;
 
     for rule in rewrite_rules {
         // Check that the rule's flags apply to the requested context

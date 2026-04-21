@@ -2238,9 +2238,11 @@ mod tests {
 
     #[test]
     fn test_check_min_keysize() {
-        let mut sig = PdkimSignature::default();
-        sig.keytype = 0; // RSA
-        sig.keybits = 2048;
+        let mut sig = PdkimSignature {
+            keytype: 0, // RSA
+            keybits: 2048,
+            ..Default::default()
+        };
         assert!(check_min_keysize("rsa=1024 ed25519=250", &sig));
 
         sig.keybits = 512;
@@ -2305,13 +2307,15 @@ mod tests {
 
     #[test]
     fn test_smtp_reset() {
-        let mut state = DkimState::default();
-        state.cur_signer = Some("test".to_string());
-        state.key_length = 2048;
-        state.signers = Some("a:b".to_string());
-        state.collect_input = 1;
-        state.signing_record = "record".to_string();
-        state.vdom_firstpass = Some("example.com".to_string());
+        let mut state = DkimState {
+            cur_signer: Some("test".to_string()),
+            key_length: 2048,
+            signers: Some("a:b".to_string()),
+            collect_input: 1,
+            signing_record: "record".to_string(),
+            vdom_firstpass: Some("example.com".to_string()),
+            ..Default::default()
+        };
 
         smtp_reset(&mut state);
 
@@ -2327,8 +2331,10 @@ mod tests {
 
     #[test]
     fn test_verify_pause_resume() {
-        let mut state = DkimState::default();
-        state.collect_input = 1;
+        let mut state = DkimState {
+            collect_input: 1,
+            ..Default::default()
+        };
 
         verify_pause(&mut state, true);
         assert_eq!(state.collect_input, 0);
@@ -2341,8 +2347,10 @@ mod tests {
 
     #[test]
     fn test_verify_pause_when_not_collecting() {
-        let mut state = DkimState::default();
-        state.collect_input = 0;
+        let mut state = DkimState {
+            collect_input: 0,
+            ..Default::default()
+        };
 
         // Pausing when not collecting should be a no-op
         verify_pause(&mut state, true);
@@ -2360,22 +2368,26 @@ mod tests {
 
     #[test]
     fn test_expand_query_with_sig() {
-        let mut state = DkimState::default();
-        let mut sig = PdkimSignature::default();
-        sig.domain = Some("example.com".to_string());
-        sig.selector = Some("sel".to_string());
-        sig.identity = Some("@example.com".to_string());
-        sig.canon_headers = Canon::Relaxed;
-        sig.canon_body = Canon::Relaxed;
-        sig.created = 1000000;
-        sig.expires = 2000000;
-        sig.bodylength = 42;
-        sig.headernames = Some("from:to:subject".to_string());
-        sig.verify_status = VerifyStatus::Pass;
-        sig.verify_ext_status = VerifyExtStatus::None;
+        let sig = PdkimSignature {
+            domain: Some("example.com".to_string()),
+            selector: Some("sel".to_string()),
+            identity: Some("@example.com".to_string()),
+            canon_headers: Canon::Relaxed,
+            canon_body: Canon::Relaxed,
+            created: 1000000,
+            expires: 2000000,
+            bodylength: 42,
+            headernames: Some("from:to:subject".to_string()),
+            verify_status: VerifyStatus::Pass,
+            verify_ext_status: VerifyExtStatus::None,
+            ..Default::default()
+        };
 
-        state.signatures.push(sig);
-        state.cur_sig = Some(0);
+        let state = DkimState {
+            signatures: vec![sig],
+            cur_sig: Some(0),
+            ..Default::default()
+        };
 
         assert_eq!(
             expand_query(&state, DkimQueryCode::Identity),
@@ -2401,15 +2413,19 @@ mod tests {
 
     #[test]
     fn test_authres_dkim_with_signatures() {
-        let mut state = DkimState::default();
-        let mut sig = PdkimSignature::default();
-        sig.domain = Some("example.com".to_string());
-        sig.selector = Some("sel".to_string());
-        sig.verify_status = VerifyStatus::Pass;
-        sig.verify_ext_status = VerifyExtStatus::None;
-        sig.rawsig_no_b_val = Some("v=1; a=rsa-sha256; b=abcdefghij123456".to_string());
+        let sig = PdkimSignature {
+            domain: Some("example.com".to_string()),
+            selector: Some("sel".to_string()),
+            verify_status: VerifyStatus::Pass,
+            verify_ext_status: VerifyExtStatus::None,
+            rawsig_no_b_val: Some("v=1; a=rsa-sha256; b=abcdefghij123456".to_string()),
+            ..Default::default()
+        };
 
-        state.signatures.push(sig);
+        let state = DkimState {
+            signatures: vec![sig],
+            ..Default::default()
+        };
 
         let result = authres_dkim(&state);
         assert!(result.contains("dkim=pass"));

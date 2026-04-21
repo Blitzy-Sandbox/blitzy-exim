@@ -1587,10 +1587,12 @@ mod tests {
 
     #[test]
     fn new_with_custom_options() {
-        let mut opts = PipeTransportOptions::default();
-        opts.cmd = Some("/usr/bin/procmail".to_string());
-        opts.timeout = 120;
-        opts.use_shell = true;
+        let opts = PipeTransportOptions {
+            cmd: Some("/usr/bin/procmail".to_string()),
+            timeout: 120,
+            use_shell: true,
+            ..Default::default()
+        };
 
         let transport = PipeTransport::new(opts);
         assert_eq!(transport.options.cmd.as_deref(), Some("/usr/bin/procmail"));
@@ -1604,9 +1606,11 @@ mod tests {
 
     #[test]
     fn validate_restrict_to_path_and_use_shell_conflict() {
-        let mut opts = PipeTransportOptions::default();
-        opts.restrict_to_path = true;
-        opts.use_shell = true;
+        let opts = PipeTransportOptions {
+            restrict_to_path: true,
+            use_shell: true,
+            ..Default::default()
+        };
         let mut transport = PipeTransport::new(opts);
         let config = TransportInstanceConfig::new("test_pipe", "pipe");
 
@@ -1620,9 +1624,11 @@ mod tests {
 
     #[test]
     fn validate_allow_commands_and_use_shell_conflict() {
-        let mut opts = PipeTransportOptions::default();
-        opts.allow_commands = Some("procmail:maildrop".to_string());
-        opts.use_shell = true;
+        let opts = PipeTransportOptions {
+            allow_commands: Some("procmail:maildrop".to_string()),
+            use_shell: true,
+            ..Default::default()
+        };
         let mut transport = PipeTransport::new(opts);
         let config = TransportInstanceConfig::new("test_pipe", "pipe");
 
@@ -1699,8 +1705,10 @@ mod tests {
 
     #[test]
     fn validate_invalid_temp_errors() {
-        let mut opts = PipeTransportOptions::default();
-        opts.temp_errors = Some("75:abc".to_string());
+        let opts = PipeTransportOptions {
+            temp_errors: Some("75:abc".to_string()),
+            ..Default::default()
+        };
         let mut transport = PipeTransport::new(opts);
         let config = TransportInstanceConfig::new("test_pipe", "pipe");
 
@@ -1713,8 +1721,10 @@ mod tests {
 
     #[test]
     fn validate_star_temp_errors_accepted() {
-        let mut opts = PipeTransportOptions::default();
-        opts.temp_errors = Some("*".to_string());
+        let opts = PipeTransportOptions {
+            temp_errors: Some("*".to_string()),
+            ..Default::default()
+        };
         let mut transport = PipeTransport::new(opts);
         let config = TransportInstanceConfig::new("test_pipe", "pipe");
 
@@ -1724,8 +1734,10 @@ mod tests {
 
     #[test]
     fn validate_bsmtp_sets_check_escape_strings() {
-        let mut opts = PipeTransportOptions::default();
-        opts.use_bsmtp = true;
+        let opts = PipeTransportOptions {
+            use_bsmtp: true,
+            ..Default::default()
+        };
         let mut transport = PipeTransport::new(opts);
         let config = TransportInstanceConfig::new("test_pipe", "pipe");
 
@@ -1822,8 +1834,10 @@ mod tests {
 
     #[test]
     fn parse_star_temp_errors() {
-        let mut opts = PipeTransportOptions::default();
-        opts.temp_errors = Some("*".to_string());
+        let opts = PipeTransportOptions {
+            temp_errors: Some("*".to_string()),
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let config = transport.parse_temp_errors();
         assert!(matches!(config, TempErrorConfig::All));
@@ -1831,8 +1845,10 @@ mod tests {
 
     #[test]
     fn parse_custom_temp_errors() {
-        let mut opts = PipeTransportOptions::default();
-        opts.temp_errors = Some("1:2:3".to_string());
+        let opts = PipeTransportOptions {
+            temp_errors: Some("1:2:3".to_string()),
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let config = transport.parse_temp_errors();
         match config {
@@ -1871,8 +1887,10 @@ mod tests {
 
     #[test]
     fn interpret_ignore_status() {
-        let mut opts = PipeTransportOptions::default();
-        opts.ignore_status = true;
+        let opts = PipeTransportOptions {
+            ignore_status: true,
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let result = transport.interpret_exit_status(1, "test", "test_pipe");
         assert!(result.is_ok());
@@ -1887,8 +1905,10 @@ mod tests {
 
     #[test]
     fn interpret_freeze_signal() {
-        let mut opts = PipeTransportOptions::default();
-        opts.freeze_signal = true;
+        let opts = PipeTransportOptions {
+            freeze_signal: true,
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let result = transport.interpret_exit_status(-9, "test", "test_pipe");
         assert!(result.is_deferred());
@@ -1896,8 +1916,10 @@ mod tests {
 
     #[test]
     fn interpret_freeze_exec_fail() {
-        let mut opts = PipeTransportOptions::default();
-        opts.freeze_exec_fail = true;
+        let opts = PipeTransportOptions {
+            freeze_exec_fail: true,
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let result = transport.interpret_exit_status(EX_EXECFAILED, "test", "test_pipe");
         assert!(result.is_deferred());
@@ -1905,8 +1927,10 @@ mod tests {
 
     #[test]
     fn interpret_timeout_defer() {
-        let mut opts = PipeTransportOptions::default();
-        opts.timeout_defer = true;
+        let opts = PipeTransportOptions {
+            timeout_defer: true,
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let result = transport.interpret_exit_status(CHILD_TIMEOUT_RC, "test", "test_pipe");
         assert!(result.is_deferred());
@@ -1921,8 +1945,10 @@ mod tests {
 
     #[test]
     fn interpret_star_temp_errors_all_deferred() {
-        let mut opts = PipeTransportOptions::default();
-        opts.temp_errors = Some("*".to_string());
+        let opts = PipeTransportOptions {
+            temp_errors: Some("*".to_string()),
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let result = transport.interpret_exit_status(42, "test", "test_pipe");
         assert!(result.is_deferred());
@@ -1949,8 +1975,10 @@ mod tests {
 
     #[test]
     fn build_env_with_custom_environment() {
-        let mut opts = PipeTransportOptions::default();
-        opts.environment = Some("FOO=bar:BAZ=qux".to_string());
+        let opts = PipeTransportOptions {
+            environment: Some("FOO=bar:BAZ=qux".to_string()),
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let config = TransportInstanceConfig::new("test_pipe", "pipe");
         let env = transport.build_environment(&config, "user@example.com");
@@ -1986,8 +2014,10 @@ mod tests {
 
     #[test]
     fn direct_command_restrict_to_path_with_slash() {
-        let mut opts = PipeTransportOptions::default();
-        opts.restrict_to_path = true;
+        let opts = PipeTransportOptions {
+            restrict_to_path: true,
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let cmd = Clean::new("/usr/bin/procmail".to_string());
         let result = transport.set_up_direct_command(&cmd, "test_pipe");
@@ -1996,8 +2026,10 @@ mod tests {
 
     #[test]
     fn direct_command_allow_commands_reject() {
-        let mut opts = PipeTransportOptions::default();
-        opts.allow_commands = Some("procmail:maildrop".to_string());
+        let opts = PipeTransportOptions {
+            allow_commands: Some("procmail:maildrop".to_string()),
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let cmd = Clean::new("badcommand".to_string());
         let result = transport.set_up_direct_command(&cmd, "test_pipe");
@@ -2024,9 +2056,11 @@ mod tests {
 
     #[test]
     fn transport_entry_with_echo_command() {
-        let mut opts = PipeTransportOptions::default();
-        opts.cmd = Some("/bin/echo test".to_string());
-        opts.timeout = 10;
+        let opts = PipeTransportOptions {
+            cmd: Some("/bin/echo test".to_string()),
+            timeout: 10,
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let config = TransportInstanceConfig::new("test_pipe", "pipe");
 
@@ -2050,9 +2084,11 @@ mod tests {
 
     #[test]
     fn transport_entry_nonexistent_command_fails() {
-        let mut opts = PipeTransportOptions::default();
-        opts.cmd = Some("/nonexistent/command".to_string());
-        opts.timeout = 5;
+        let opts = PipeTransportOptions {
+            cmd: Some("/nonexistent/command".to_string()),
+            timeout: 5,
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let config = TransportInstanceConfig::new("test_pipe", "pipe");
 
@@ -2063,9 +2099,11 @@ mod tests {
 
     #[test]
     fn transport_entry_false_command_fails() {
-        let mut opts = PipeTransportOptions::default();
-        opts.cmd = Some("/bin/false".to_string());
-        opts.timeout = 5;
+        let opts = PipeTransportOptions {
+            cmd: Some("/bin/false".to_string()),
+            timeout: 5,
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let config = TransportInstanceConfig::new("test_pipe", "pipe");
 
@@ -2079,9 +2117,11 @@ mod tests {
 
     #[test]
     fn transport_entry_true_command_succeeds() {
-        let mut opts = PipeTransportOptions::default();
-        opts.cmd = Some("/bin/true".to_string());
-        opts.timeout = 5;
+        let opts = PipeTransportOptions {
+            cmd: Some("/bin/true".to_string()),
+            timeout: 5,
+            ..Default::default()
+        };
         let transport = PipeTransport::new(opts);
         let config = TransportInstanceConfig::new("test_pipe", "pipe");
 

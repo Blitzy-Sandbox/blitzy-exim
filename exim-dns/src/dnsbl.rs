@@ -1510,7 +1510,7 @@ mod tests {
         cache.insert("expired".to_string(), expired);
         cache.evict_expired();
         assert!(cache.get("valid").is_some());
-        assert!(cache.entries.get("expired").is_none()); // fully removed
+        assert!(!cache.entries.contains_key("expired")); // fully removed
     }
 
     // ── Parsing helper tests ───────────────────────────────────────────────

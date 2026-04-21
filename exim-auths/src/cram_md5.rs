@@ -1308,7 +1308,10 @@ mod tests {
 
     #[test]
     fn test_driver_default() {
-        let driver = CramMd5Auth::default();
+        // CramMd5Auth is a unit struct, so Default::default() returns the same
+        // value as the struct literal `CramMd5Auth`. Using the literal form
+        // avoids clippy::default_constructed_unit_structs.
+        let driver = CramMd5Auth;
         assert_eq!(driver.driver_name(), "cram_md5");
     }
 
@@ -1378,9 +1381,12 @@ mod tests {
             AuthInstanceConfig::new("test_cram_md5", "cram_md5", "CRAM-MD5", Box::new(opts));
 
         let result = driver.verify_response(&config, "<challenge>", "nospacehere");
-        match result {
-            Ok(AuthServerResult::Failed) => {} // Expected: no space separator
-            _ => {} // Expansion may fail in test context, that's acceptable
+        // Expected: either Ok(Failed) (no space separator) or an error from
+        // expansion failing in the test context — both are acceptable. Using
+        // `if let` avoids clippy::single_match for a match with only a unit
+        // body arm.
+        if let Ok(AuthServerResult::Failed) = result {
+            // Expected: no space separator
         }
     }
 
@@ -1399,9 +1405,11 @@ mod tests {
 
         // Digest is too short (only 16 hex chars instead of 32)
         let result = driver.verify_response(&config, "<challenge>", "joe 0123456789abcdef");
-        match result {
-            Ok(AuthServerResult::Failed) => {} // Expected: digest too short
-            _ => {}                            // Expansion may fail in test context
+        // Expected: either Ok(Failed) (digest too short) or expansion failure
+        // in the test context — both are acceptable. Using `if let` avoids
+        // clippy::single_match for a match with only a unit body arm.
+        if let Ok(AuthServerResult::Failed) = result {
+            // Expected: digest too short
         }
     }
 

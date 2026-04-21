@@ -2850,24 +2850,30 @@ mod tests {
 
     #[test]
     fn test_quota_check_within_limit() {
-        let mut opts = AppendfileTransportOptions::default();
-        opts.quota_value = 10000;
+        let opts = AppendfileTransportOptions {
+            quota_value: 10000,
+            ..Default::default()
+        };
         assert!(check_quota(&opts, 5000, 2000, 0).is_ok());
     }
 
     #[test]
     fn test_quota_check_exceeded() {
-        let mut opts = AppendfileTransportOptions::default();
-        opts.quota_value = 10000;
+        let opts = AppendfileTransportOptions {
+            quota_value: 10000,
+            ..Default::default()
+        };
         let result = check_quota(&opts, 9000, 2000, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_quota_check_disabled() {
-        let mut opts = AppendfileTransportOptions::default();
-        opts.quota_value = 100;
-        opts.quota_no_check = true;
+        let opts = AppendfileTransportOptions {
+            quota_value: 100,
+            quota_no_check: true,
+            ..Default::default()
+        };
         // Should pass even though we'd exceed quota
         assert!(check_quota(&opts, 200, 100, 0).is_ok());
     }

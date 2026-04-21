@@ -753,21 +753,26 @@ pub fn list_queue(option: QueueListOption, config: &ConfigContext) -> Result<()>
 
         let all_delivered: BTreeSet<String> = delivered_set.union(&j_delivered).cloned().collect();
 
-        // Print each recipient with delivery status marker
+        // Print each recipient with delivery status marker.
+        //
+        // Note: match guards (`if is_delivered`, `if !is_delivered`) are used instead of
+        // nested `if/else` inside each arm to satisfy clippy::collapsible_match. The arm
+        // ordering matters: the `PlusGenerated | Basic if is_delivered` guarded arm must
+        // precede the wildcard arm so that the "    D   " prefix is chosen when applicable,
+        // and the wildcard arm catches both the non-delivered case for PlusGenerated/Basic
+        // AND any future QueueListOption variants, preserving the original `_ => { ... }`
+        // semantic of the untouched indent-only line.
         for recip in &hdr.recipients {
             let is_delivered = all_delivered.contains(&recip.address);
             match effective_option {
-                QueueListOption::UndeliveredOnly => {
-                    if !is_delivered {
-                        let _ = writeln!(writer, "        {}", recip.address);
-                    }
+                QueueListOption::UndeliveredOnly if !is_delivered => {
+                    let _ = writeln!(writer, "        {}", recip.address);
                 }
-                QueueListOption::PlusGenerated | QueueListOption::Basic => {
-                    if is_delivered {
-                        let _ = writeln!(writer, "    D   {}", recip.address);
-                    } else {
-                        let _ = writeln!(writer, "        {}", recip.address);
-                    }
+                QueueListOption::UndeliveredOnly => {
+                    // Delivered recipients are suppressed in UndeliveredOnly mode.
+                }
+                QueueListOption::PlusGenerated | QueueListOption::Basic if is_delivered => {
+                    let _ = writeln!(writer, "    D   {}", recip.address);
                 }
                 _ => {
                     let _ = writeln!(writer, "        {}", recip.address);
@@ -1903,7 +1908,9 @@ mod tests {
 
     #[test]
     fn test_queue_list_option_variants() {
-        let opts = vec![
+        // Using a fixed-size array instead of `vec!` avoids a heap allocation
+        // for a list with a statically-known size (clippy::useless_vec).
+        let opts = [
             QueueListOption::Basic,
             QueueListOption::Unsorted,
             QueueListOption::UndeliveredOnly,

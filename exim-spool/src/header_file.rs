@@ -1900,17 +1900,22 @@ mod tests {
 
     #[test]
     fn test_write_and_read_with_tls() {
-        let mut hdr = SpoolHeaderFile::default();
-        hdr.message_id = "1pBnKl-003F4x-Tw".to_string();
-        hdr.originator_login = "testuser".to_string();
-        hdr.originator_uid = 1000;
-        hdr.originator_gid = 1000;
-        hdr.sender_address = "sender@example.com".to_string();
-        hdr.received_time_sec = 1700000000;
-        hdr.received_time_complete_sec = 1700000000;
-        hdr.tls.certificate_verified = true;
-        hdr.tls.cipher = Some("TLS_AES_256_GCM_SHA384".to_string());
-        hdr.tls.ver = Some("TLSv1.3".to_string());
+        let mut hdr = SpoolHeaderFile {
+            message_id: "1pBnKl-003F4x-Tw".to_string(),
+            originator_login: "testuser".to_string(),
+            originator_uid: 1000,
+            originator_gid: 1000,
+            sender_address: "sender@example.com".to_string(),
+            received_time_sec: 1700000000,
+            received_time_complete_sec: 1700000000,
+            tls: TlsInfo {
+                certificate_verified: true,
+                cipher: Some("TLS_AES_256_GCM_SHA384".to_string()),
+                ver: Some("TLSv1.3".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         hdr.recipients.push(Recipient {
             address: "rcpt@example.com".to_string(),
             pno: -1,
@@ -2013,14 +2018,16 @@ mod tests {
 
     #[test]
     fn test_acl_variable_roundtrip() {
-        let mut hdr = SpoolHeaderFile::default();
-        hdr.message_id = "1pBnKl-003F4x-Tw".to_string();
-        hdr.originator_login = "testuser".to_string();
-        hdr.originator_uid = 1000;
-        hdr.originator_gid = 1000;
-        hdr.sender_address = "sender@example.com".to_string();
-        hdr.received_time_sec = 1700000000;
-        hdr.received_time_complete_sec = 1700000000;
+        let mut hdr = SpoolHeaderFile {
+            message_id: "1pBnKl-003F4x-Tw".to_string(),
+            originator_login: "testuser".to_string(),
+            originator_uid: 1000,
+            originator_gid: 1000,
+            sender_address: "sender@example.com".to_string(),
+            received_time_sec: 1700000000,
+            received_time_complete_sec: 1700000000,
+            ..Default::default()
+        };
         hdr.acl_c_vars
             .insert("myvar".to_string(), "hello world".to_string());
         hdr.acl_m_vars
@@ -2103,27 +2110,29 @@ mod tests {
 
     #[test]
     fn test_complex_tree_roundtrip() {
-        let mut hdr = SpoolHeaderFile::default();
-        hdr.message_id = "1pBnKl-003F4x-Tw".to_string();
-        hdr.originator_login = "testuser".to_string();
-        hdr.originator_uid = 1000;
-        hdr.originator_gid = 1000;
-        hdr.sender_address = "sender@example.com".to_string();
-        hdr.received_time_sec = 1700000000;
-        hdr.received_time_complete_sec = 1700000000;
-        hdr.non_recipients = Some(NonRecipientNode {
-            address: "bounce@example.com".to_string(),
-            left: Some(Box::new(NonRecipientNode {
-                address: "a@example.com".to_string(),
-                left: None,
-                right: None,
-            })),
-            right: Some(Box::new(NonRecipientNode {
-                address: "c@example.com".to_string(),
-                left: None,
-                right: None,
-            })),
-        });
+        let mut hdr = SpoolHeaderFile {
+            message_id: "1pBnKl-003F4x-Tw".to_string(),
+            originator_login: "testuser".to_string(),
+            originator_uid: 1000,
+            originator_gid: 1000,
+            sender_address: "sender@example.com".to_string(),
+            received_time_sec: 1700000000,
+            received_time_complete_sec: 1700000000,
+            non_recipients: Some(NonRecipientNode {
+                address: "bounce@example.com".to_string(),
+                left: Some(Box::new(NonRecipientNode {
+                    address: "a@example.com".to_string(),
+                    left: None,
+                    right: None,
+                })),
+                right: Some(Box::new(NonRecipientNode {
+                    address: "c@example.com".to_string(),
+                    left: None,
+                    right: None,
+                })),
+            }),
+            ..Default::default()
+        };
         hdr.recipients.push(Recipient {
             address: "rcpt@example.com".to_string(),
             pno: -1,
@@ -2142,16 +2151,20 @@ mod tests {
 
     #[test]
     fn test_i18n_roundtrip() {
-        let mut hdr = SpoolHeaderFile::default();
-        hdr.message_id = "1pBnKl-003F4x-Tw".to_string();
-        hdr.originator_login = "testuser".to_string();
-        hdr.originator_uid = 1000;
-        hdr.originator_gid = 1000;
-        hdr.sender_address = "sender@example.com".to_string();
-        hdr.received_time_sec = 1700000000;
-        hdr.received_time_complete_sec = 1700000000;
-        hdr.i18n.smtputf8 = true;
-        hdr.i18n.utf8_downconvert = -1;
+        let mut hdr = SpoolHeaderFile {
+            message_id: "1pBnKl-003F4x-Tw".to_string(),
+            originator_login: "testuser".to_string(),
+            originator_uid: 1000,
+            originator_gid: 1000,
+            sender_address: "sender@example.com".to_string(),
+            received_time_sec: 1700000000,
+            received_time_complete_sec: 1700000000,
+            i18n: I18nInfo {
+                smtputf8: true,
+                utf8_downconvert: -1,
+            },
+            ..Default::default()
+        };
         hdr.recipients.push(Recipient {
             address: "rcpt@example.com".to_string(),
             pno: -1,
@@ -2168,16 +2181,18 @@ mod tests {
 
     #[test]
     fn test_dsn_roundtrip() {
-        let mut hdr = SpoolHeaderFile::default();
-        hdr.message_id = "1pBnKl-003F4x-Tw".to_string();
-        hdr.originator_login = "testuser".to_string();
-        hdr.originator_uid = 1000;
-        hdr.originator_gid = 1000;
-        hdr.sender_address = "sender@example.com".to_string();
-        hdr.received_time_sec = 1700000000;
-        hdr.received_time_complete_sec = 1700000000;
-        hdr.dsn_envid = Some("myenvid".to_string());
-        hdr.dsn_ret = 2;
+        let mut hdr = SpoolHeaderFile {
+            message_id: "1pBnKl-003F4x-Tw".to_string(),
+            originator_login: "testuser".to_string(),
+            originator_uid: 1000,
+            originator_gid: 1000,
+            sender_address: "sender@example.com".to_string(),
+            received_time_sec: 1700000000,
+            received_time_complete_sec: 1700000000,
+            dsn_envid: Some("myenvid".to_string()),
+            dsn_ret: 2,
+            ..Default::default()
+        };
         hdr.recipients.push(Recipient {
             address: "rcpt@example.com".to_string(),
             pno: -1,

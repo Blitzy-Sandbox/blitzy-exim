@@ -680,6 +680,7 @@ dependencies = [
  "md4",
  "regex",
  "serde",
+ "subtle",
  "thiserror 2.0.18",
  "tracing",
 ]

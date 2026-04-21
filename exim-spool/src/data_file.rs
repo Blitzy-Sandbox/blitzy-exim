@@ -1327,7 +1327,7 @@ mod tests {
             SpoolWriteContext::Receiving,
             "test-file",
             None,
-            io::Error::new(io::ErrorKind::Other, "disk full"),
+            io::Error::other("disk full"),
         );
         match err {
             SpoolError::FormatError { context } => {
@@ -1345,7 +1345,7 @@ mod tests {
             SpoolWriteContext::Delivering,
             "deliver-file",
             None,
-            io::Error::new(io::ErrorKind::Other, "io error"),
+            io::Error::other("io error"),
         );
         match err {
             SpoolError::FormatError { context } => {
@@ -1361,7 +1361,7 @@ mod tests {
             SpoolWriteContext::Modifying,
             "mod-file",
             None,
-            io::Error::new(io::ErrorKind::Other, "fail"),
+            io::Error::other("fail"),
         );
         match err {
             SpoolError::FormatError { context } => {
@@ -1382,7 +1382,7 @@ mod tests {
             SpoolWriteContext::Receiving,
             "test",
             Some(&temp_file),
-            io::Error::new(io::ErrorKind::Other, "err"),
+            io::Error::other("err"),
         );
         // The temp file should be cleaned up.
         assert!(!temp_file.exists());

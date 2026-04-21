@@ -850,7 +850,7 @@ mod tests {
         let slice = smtp_getbuf(&mut io, &mut len);
         assert!(slice.is_some());
         assert_eq!(len, 2);
-        assert_eq!(slice.unwrap(), &[b'X', b'Y']);
+        assert_eq!(slice.unwrap(), b"XY");
         assert_eq!(io.inptr, 2);
     }
 
@@ -979,10 +979,17 @@ mod tests {
     }
 
     /// Verify WBR constants have correct values.
+    ///
+    /// These are constant-time assertions, so clippy's
+    /// `assertions_on_constants` lint would flag them. We move them into
+    /// a `const` block, which statically verifies the values at compile
+    /// time and silences the lint while preserving documentation intent.
     #[test]
     fn test_wbr_constants() {
-        assert!(!WBR_DATA_ONLY);
-        assert!(WBR_DATA_OR_EOF);
+        const {
+            assert!(!WBR_DATA_ONLY);
+            assert!(WBR_DATA_OR_EOF);
+        }
     }
 
     /// Verify SmtpSyncConfig can be constructed and accessed.
@@ -1028,7 +1035,7 @@ mod tests {
         let slice = smtp_getbuf(&mut io, &mut len);
         assert!(slice.is_some());
         assert_eq!(len, 1);
-        assert_eq!(slice.unwrap(), &[b'Q']);
+        assert_eq!(slice.unwrap(), b"Q");
     }
 
     /// Verify smtp_getc then smtp_ungetc round-trips correctly.

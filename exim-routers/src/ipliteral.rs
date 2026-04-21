@@ -988,12 +988,22 @@ mod tests {
     }
 
     #[test]
+    // This test intentionally calls `::default()` on a unit struct to
+    // verify the `Default` trait is implemented. Clippy's
+    // `default_constructed_unit_structs` lint is suppressed because the
+    // redundancy is the point of the test.
+    #[allow(clippy::default_constructed_unit_structs)]
     fn test_default_trait() {
         let router = IpLiteralRouter::default();
         assert_eq!(router.driver_name(), "ipliteral");
     }
 
     #[test]
+    // This test intentionally calls `::default()` on a unit struct to
+    // verify the `Default` trait is implemented. Clippy's
+    // `default_constructed_unit_structs` lint is suppressed because the
+    // redundancy is the point of the test.
+    #[allow(clippy::default_constructed_unit_structs)]
     fn test_options_struct_default() {
         let opts = IpLiteralRouterOptions::default();
         // Options struct is empty — just verify it's constructible

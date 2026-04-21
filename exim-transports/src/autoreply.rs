@@ -2021,7 +2021,10 @@ mod tests {
 
     #[test]
     fn test_default_trait() {
-        let t = AutoreplyTransport::default();
+        // AutoreplyTransport is a unit struct, so Default::default() returns
+        // the same value as the struct literal `AutoreplyTransport`. Using the
+        // literal form avoids clippy::default_constructed_unit_structs.
+        let t = AutoreplyTransport;
         assert_eq!(t.driver_name(), "autoreply");
         assert!(t.is_local());
     }

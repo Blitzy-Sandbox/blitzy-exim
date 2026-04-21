@@ -2911,9 +2911,11 @@ mod tests {
 
     #[test]
     fn test_sig_to_a_tag() {
-        let mut sig = PdkimSignature::default();
-        sig.keytype = 0;
-        sig.hashtype = 1;
+        let mut sig = PdkimSignature {
+            keytype: 0,
+            hashtype: 1,
+            ..Default::default()
+        };
         assert_eq!(sig_to_a_tag(&sig), "rsa-sha256");
         sig.keytype = 1;
         sig.hashtype = 2;
@@ -3127,15 +3129,17 @@ mod tests {
 
     #[test]
     fn test_create_header_basic() {
-        let mut sig = PdkimSignature::default();
-        sig.keytype = 0;
-        sig.hashtype = 1;
-        sig.domain = Some("example.com".to_string());
-        sig.selector = Some("sel".to_string());
-        sig.canon_headers = Canon::Relaxed;
-        sig.canon_body = Canon::Relaxed;
-        sig.headernames = Some("from:to:subject".to_string());
-        sig.bodyhash = vec![1, 2, 3, 4];
+        let mut sig = PdkimSignature {
+            keytype: 0,
+            hashtype: 1,
+            domain: Some("example.com".to_string()),
+            selector: Some("sel".to_string()),
+            canon_headers: Canon::Relaxed,
+            canon_body: Canon::Relaxed,
+            headernames: Some("from:to:subject".to_string()),
+            bodyhash: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
         // Non-final: includes bh= but b= is empty (b=;)
         let hdr = create_header(&sig, false);
         assert!(hdr.starts_with("DKIM-Signature: v=1"));
@@ -3161,9 +3165,11 @@ mod tests {
     fn test_header_complete_signing() {
         let mut ctx = PdkimContext::new();
         ctx.flags.insert(PdkimFlags::MODE_SIGN);
-        let mut sig = PdkimSignature::default();
-        sig.keytype = 0;
-        sig.hashtype = 1;
+        let sig = PdkimSignature {
+            keytype: 0,
+            hashtype: 1,
+            ..Default::default()
+        };
         ctx.sig.push(sig);
         ctx.cur_header = "From: test@example.com".to_string();
         let result = header_complete(&mut ctx);
@@ -3294,10 +3300,12 @@ mod tests {
     #[test]
     fn test_set_sig_bodyhash_links() {
         let mut ctx = PdkimContext::new();
-        let mut sig = PdkimSignature::default();
-        sig.hashtype = 1;
-        sig.canon_body = Canon::Relaxed;
-        sig.bodylength = -1;
+        let sig = PdkimSignature {
+            hashtype: 1,
+            canon_body: Canon::Relaxed,
+            bodylength: -1,
+            ..Default::default()
+        };
         ctx.sig.push(sig);
         let bh_idx = set_sig_bodyhash(&mut ctx, 0).unwrap();
         assert_eq!(ctx.sig[0].calc_body_hash, Some(bh_idx));
@@ -3364,9 +3372,11 @@ mod tests {
     fn test_feed_header_mode_to_body() {
         let mut ctx = PdkimContext::new();
         ctx.flags.insert(PdkimFlags::MODE_SIGN);
-        let mut sig = PdkimSignature::default();
-        sig.keytype = 0;
-        sig.hashtype = 1;
+        let sig = PdkimSignature {
+            keytype: 0,
+            hashtype: 1,
+            ..Default::default()
+        };
         ctx.sig.push(sig);
 
         // Feed a header followed by blank line (end of headers)

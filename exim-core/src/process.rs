@@ -1173,8 +1173,10 @@ mod tests {
     #[test]
     fn test_child_exec_exim_return_argv_with_kill_v() {
         let config_ctx = test_config_ctx();
-        let mut server_ctx = ServerContext::default();
-        server_ctx.debug_selector = D_V; // Only -v is set.
+        let server_ctx = ServerContext {
+            debug_selector: D_V, // Only -v is set.
+            ..Default::default()
+        };
 
         let argv_no_kill = child_exec_exim(
             &config_ctx,
@@ -1210,8 +1212,10 @@ mod tests {
     #[test]
     fn test_child_exec_exim_minimal() {
         let config_ctx = test_config_ctx();
-        let mut server_ctx = ServerContext::default();
-        server_ctx.debug_selector = 0xFFFF; // Should be suppressed in minimal mode.
+        let server_ctx = ServerContext {
+            debug_selector: 0xFFFF, // Should be suppressed in minimal mode.
+            ..Default::default()
+        };
 
         let argv = child_exec_exim(
             &config_ctx,
@@ -1261,8 +1265,10 @@ mod tests {
     #[test]
     fn test_child_exec_exim_debug_hex() {
         let config_ctx = test_config_ctx();
-        let mut server_ctx = ServerContext::default();
-        server_ctx.debug_selector = 0x0ABC; // Non-trivial debug selector.
+        let server_ctx = ServerContext {
+            debug_selector: 0x0ABC, // Non-trivial debug selector.
+            ..Default::default()
+        };
 
         let argv = child_exec_exim(
             &config_ctx,
@@ -1292,13 +1298,15 @@ mod tests {
 
     #[test]
     fn test_record_smtp_slot_empty() {
-        let mut server_ctx = ServerContext::default();
-        server_ctx.smtp_slots = vec![SmtpSlot {
-            pid: 0,
-            host_address: None,
-            host_name: None,
-            interface_address: None,
-        }];
+        let mut server_ctx = ServerContext {
+            smtp_slots: vec![SmtpSlot {
+                pid: 0,
+                host_address: None,
+                host_name: None,
+                interface_address: None,
+            }],
+            ..Default::default()
+        };
 
         record_smtp_slot(&mut server_ctx, Pid::from_raw(123), "10.0.0.1");
 
@@ -1311,13 +1319,15 @@ mod tests {
 
     #[test]
     fn test_record_smtp_slot_all_full_grows() {
-        let mut server_ctx = ServerContext::default();
-        server_ctx.smtp_slots = vec![SmtpSlot {
-            pid: 100,
-            host_address: Some("10.0.0.1".to_string()),
-            host_name: None,
-            interface_address: None,
-        }];
+        let mut server_ctx = ServerContext {
+            smtp_slots: vec![SmtpSlot {
+                pid: 100,
+                host_address: Some("10.0.0.1".to_string()),
+                host_name: None,
+                interface_address: None,
+            }],
+            ..Default::default()
+        };
 
         record_smtp_slot(&mut server_ctx, Pid::from_raw(200), "10.0.0.2");
 

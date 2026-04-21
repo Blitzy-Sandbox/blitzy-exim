@@ -1672,8 +1672,10 @@ mod tests {
             OptionType::StringPtr,
             OptionFlags::SECURE,
         );
-        let mut ctx = ConfigContext::default();
-        ctx.spool_directory = "/var/spool/exim".to_string();
+        let ctx = ConfigContext {
+            spool_directory: "/var/spool/exim".to_string(),
+            ..Default::default()
+        };
         let mut buf = Vec::new();
         let result = print_option(&entry, "spool_directory", &ctx, true, false, &mut buf);
         assert!(result.is_ok());
@@ -1714,8 +1716,10 @@ mod tests {
     #[test]
     fn test_print_option_no_labels() {
         let entry = OptionEntry::simple("spool_directory", OptionType::StringPtr);
-        let mut ctx = ConfigContext::default();
-        ctx.spool_directory = "/var/spool/exim".to_string();
+        let ctx = ConfigContext {
+            spool_directory: "/var/spool/exim".to_string(),
+            ..Default::default()
+        };
         let mut buf = Vec::new();
         let _ = print_option(&entry, "spool_directory", &ctx, true, true, &mut buf);
         let output = String::from_utf8(buf).unwrap();
@@ -1734,18 +1738,22 @@ mod tests {
 
     #[test]
     fn test_validate_config_ok() {
-        let mut ctx = ConfigContext::default();
-        ctx.spool_directory = "/var/spool/exim".to_string();
-        ctx.log_file_path = "/var/log/exim/%s.log".to_string();
+        let ctx = ConfigContext {
+            spool_directory: "/var/spool/exim".to_string(),
+            log_file_path: "/var/log/exim/%s.log".to_string(),
+            ..Default::default()
+        };
         let result = validate_config(&ctx);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_print_config_option_config_file() {
-        let mut ctx = ConfigContext::default();
-        ctx.config_filename = "/etc/exim/configure".to_string();
-        ctx.spool_directory = "/var/spool/exim".to_string();
+        let ctx = ConfigContext {
+            config_filename: "/etc/exim/configure".to_string(),
+            spool_directory: "/var/spool/exim".to_string(),
+            ..Default::default()
+        };
         let store = ConfigLineStore::new();
         let mut buf = Vec::new();
         let result = print_config_option("config_file", None, &ctx, true, false, &store, &mut buf);
@@ -1756,9 +1764,11 @@ mod tests {
 
     #[test]
     fn test_print_config_option_configure_file() {
-        let mut ctx = ConfigContext::default();
-        ctx.config_filename = "/etc/exim/configure".to_string();
-        ctx.spool_directory = "/var/spool/exim".to_string();
+        let ctx = ConfigContext {
+            config_filename: "/etc/exim/configure".to_string(),
+            spool_directory: "/var/spool/exim".to_string(),
+            ..Default::default()
+        };
         let store = ConfigLineStore::new();
         let mut buf = Vec::new();
         let result =

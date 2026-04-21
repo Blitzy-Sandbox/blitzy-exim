@@ -1326,19 +1326,19 @@ mod tests {
 
     #[test]
     fn test_smtp_reset_clears_state() {
-        let mut message_ctx = MessageContext::default();
-        message_ctx.sender_address = "test@example.com".to_string();
-        message_ctx
-            .recipients_list
-            .push(command_loop::RecipientItem {
+        let mut message_ctx = MessageContext {
+            sender_address: "test@example.com".to_string(),
+            recipients_list: vec![command_loop::RecipientItem {
                 address: "rcpt@example.com".to_string(),
                 dsn_flags: 0,
                 orcpt: None,
                 errors_to: None,
-            });
-        message_ctx.recipients_count = 1;
-        message_ctx.authenticated_sender = Some("auth@example.com".to_string());
-        message_ctx.dsn_envid = Some("ENVID123".to_string());
+            }],
+            recipients_count: 1,
+            authenticated_sender: Some("auth@example.com".to_string()),
+            dsn_envid: Some("ENVID123".to_string()),
+            ..Default::default()
+        };
 
         let mut arena = MessageArena::new();
         let _rp = smtp_reset(&mut message_ctx, &mut arena);

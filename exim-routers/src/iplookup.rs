@@ -1730,7 +1730,7 @@ mod tests {
         let result = router.route(&config, "user@example.com", None);
         // Optional failure should return Ok(Pass {...})
         match result {
-            Ok(RouterResult::Pass { .. }) => {}
+            Ok(RouterResult::Pass) => {}
             other => {
                 // Also acceptable: an error if the host can't be resolved
                 // at all (depends on network configuration)

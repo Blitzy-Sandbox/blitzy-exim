@@ -59,6 +59,7 @@ use des::cipher::{BlockEncrypt, KeyInit};
 use des::Des;
 use digest::Digest;
 use md4::Md4;
+use subtle::ConstantTimeEq;
 use tracing::{debug, trace};
 
 use exim_drivers::auth_driver::{
@@ -1670,8 +1671,22 @@ impl SpaAuth {
 
         let received_nt = &response_bytes[nt_offset..nt_offset + 24];
 
-        // Compare NT hashes
-        if expected_nt == received_nt {
+        // Compare NT hashes in constant time.
+        //
+        // Security note (CWE-208 mitigation):
+        // The default `PartialEq` impl for byte slices short-circuits on the
+        // first differing byte, which is a network-observable timing side
+        // channel. An attacker issuing many authentication attempts could,
+        // in principle, infer bytes of the expected NT hash (and thereby the
+        // password-derived NT-Hash) by measuring response latency. We use
+        // `subtle::ConstantTimeEq` (the same primitive used by
+        // `hmac::Mac::verify_slice()` in cram_md5.rs) to guarantee that the
+        // comparison time is independent of the byte contents. Both slices
+        // are the 16-byte NTLMv1 NT-response (DES-encrypted triple, packed
+        // into a 24-byte buffer), so `ct_eq` operates on fixed-length input
+        // and Choice conversion via `bool::from()` is constant-time.
+        let nt_hashes_match: bool = expected_nt.ct_eq(received_nt).into();
+        if nt_hashes_match {
             debug!("SPA server: NT hash match — authentication successful");
 
             // Check server_condition authorization

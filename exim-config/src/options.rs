@@ -2325,22 +2325,40 @@ pub fn parse_rewrite_rule(input: &str) -> Result<RewriteRule, ConfigError> {
     let (replacement, flags_str) = read_name_or_token(rest);
 
     // Parse flags — in C these are single-character flags packed into an int.
-    // Here we store them as a raw u32 bitmask for compatibility.
+    // Here we store them as a raw u32 bitmask for compatibility.  Bit values
+    // MUST match the canonical C definitions from `src/src/macros.h:791-813`
+    // and the `readconf_one_rewrite()` switch in
+    // `src/src/readconf.c:1584-1619`.  The C mapping is **case-sensitive**:
+    // lowercase letters control header rewrites, uppercase letters control
+    // envelope rewrites, and the remaining control flags (`S`, `Q`, `R`,
+    // `w`, `q`) have dedicated bits.
     let mut flags: u32 = 0;
     for ch in flags_str.trim().bytes() {
         match ch {
-            b'S' => flags |= 0x0001, // rewrite_sender
-            b'F' => flags |= 0x0002, // rewrite_from
-            b'T' => flags |= 0x0004, // rewrite_to
-            b'C' => flags |= 0x0008, // rewrite_cc
-            b'B' => flags |= 0x0010, // rewrite_bcc
-            b'R' => flags |= 0x0020, // rewrite_replyto
-            b'E' => flags |= 0x0040, // rewrite_all_envelope (expand)
-            b'Q' => flags |= 0x0080, // rewrite_qualify
-            b'q' => flags |= 0x0100, // rewrite_qualify_to_local
-            b'r' => flags |= 0x0200, // rewrite_repeat
-            b'h' => flags |= 0x0400, // rewrite_all_headers
-            b' ' | b'\t' => break,
+            // Header rewrites (lowercase)
+            b'h' => flags |= 0x003F, // rewrite_all_headers
+            b's' => flags |= 0x0001, // rewrite_sender
+            b'f' => flags |= 0x0002, // rewrite_from
+            b't' => flags |= 0x0004, // rewrite_to
+            b'c' => flags |= 0x0008, // rewrite_cc
+            b'b' => flags |= 0x0010, // rewrite_bcc
+            b'r' => flags |= 0x0020, // rewrite_replyto
+
+            // Envelope rewrites (uppercase)
+            b'E' => flags |= 0x00C0, // rewrite_all_envelope
+            b'F' => flags |= 0x0040, // rewrite_envfrom
+            b'T' => flags |= 0x0080, // rewrite_envto
+
+            // Control flags
+            b'S' => flags |= 0x0100, // rewrite_smtp (requires regex key in C)
+            b'Q' => flags |= 0x0400, // rewrite_qualify
+            b'R' => flags |= 0x0800, // rewrite_repeat
+            b'w' => flags |= 0x1000, // rewrite_whole
+            b'q' => flags |= 0x2000, // rewrite_quit
+
+            // Whitespace is permitted between flags in C; continue rather
+            // than break so that e.g. "t f" is accepted as (to | from).
+            b' ' | b'\t' => continue,
             _ => {
                 trace!(char = ?ch, "ignoring unknown rewrite flag");
             }

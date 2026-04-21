@@ -1197,6 +1197,10 @@ mod tests {
     }
 
     #[test]
+    // This test intentionally exercises the Clone impl on a Copy type to
+    // verify Clone is implemented in addition to Copy. The clippy
+    // `clone_on_copy` lint is suppressed because the redundancy is the point.
+    #[allow(clippy::clone_on_copy)]
     fn ocsp_status_clone_and_debug() {
         let status = OcspStatus::Verified;
         let cloned = status.clone();
@@ -1207,7 +1211,9 @@ mod tests {
 
     #[test]
     fn ocsp_status_all_variants() {
-        let variants = vec![
+        // Using a fixed-size array instead of `vec!` avoids a heap allocation
+        // for a list with a statically-known size (clippy::useless_vec).
+        let variants = [
             OcspStatus::NotRequested,
             OcspStatus::NotResponded,
             OcspStatus::VerifyNotTried,

@@ -1234,25 +1234,44 @@ fn parse_rewrite_line(line: &str) -> Result<RewriteRule, ConfigError> {
 
 /// Parses rewrite flag characters into a bitmask.
 ///
-/// Matching the C rewrite flag definitions from readconf.c.
+/// Bit values MUST match the canonical C definitions from
+/// `src/src/macros.h:791-813` and the `readconf_one_rewrite()` switch in
+/// `src/src/readconf.c:1584-1619`.  Note that the C mapping is
+/// **case-sensitive**: lowercase letters control header rewrites
+/// (`rewrite_all_headers` = 0x003F), uppercase letters control envelope
+/// rewrites (`rewrite_all_envelope` = 0x00C0), and the remaining
+/// control flags (`S`, `Q`, `R`, `w`, `q`) have dedicated bits.
+///
+/// Whitespace characters are silently skipped to match C's behaviour of
+/// explicit `case ' ': case '\t': break;` inside the flag loop.
 fn parse_rewrite_flags(flags_str: &str) -> u32 {
     let mut flags: u32 = 0;
     for ch in flags_str.chars() {
         match ch {
-            'T' => flags |= 0x0001, // rewrite_to
-            'F' => flags |= 0x0002, // rewrite_from
-            'C' => flags |= 0x0004, // rewrite_cc
-            'B' => flags |= 0x0008, // rewrite_bcc
-            'R' => flags |= 0x0010, // rewrite_replyto
-            'S' => flags |= 0x0020, // rewrite_sender
-            'E' => flags |= 0x0040, // rewrite_envfrom
-            'f' => flags |= 0x0080, // rewrite_envfrom_received
-            's' => flags |= 0x0100, // rewrite_smtp
-            'Q' => flags |= 0x0200, // rewrite_qualify
-            'q' => flags |= 0x0400, // rewrite_qualify_donor
-            'r' => flags |= 0x0800, // rewrite_repeat
-            'h' => flags |= 0x0003, // rewrite_all_headers (To+From)
-            'H' => flags |= 0x003F, // rewrite_all (all header flags)
+            // Header rewrites (lowercase) — rewrite_all_headers = 0x003F
+            'h' => flags |= 0x003F, // rewrite_all_headers
+            's' => flags |= 0x0001, // rewrite_sender
+            'f' => flags |= 0x0002, // rewrite_from
+            't' => flags |= 0x0004, // rewrite_to
+            'c' => flags |= 0x0008, // rewrite_cc
+            'b' => flags |= 0x0010, // rewrite_bcc
+            'r' => flags |= 0x0020, // rewrite_replyto
+
+            // Envelope rewrites (uppercase) — rewrite_all_envelope = 0x00C0
+            'E' => flags |= 0x00C0, // rewrite_all_envelope
+            'F' => flags |= 0x0040, // rewrite_envfrom
+            'T' => flags |= 0x0080, // rewrite_envto
+
+            // Control flags
+            'S' => flags |= 0x0100, // rewrite_smtp (requires regex key in C)
+            'Q' => flags |= 0x0400, // rewrite_qualify
+            'R' => flags |= 0x0800, // rewrite_repeat
+            'w' => flags |= 0x1000, // rewrite_whole
+            'q' => flags |= 0x2000, // rewrite_quit
+
+            // Whitespace is explicitly permitted between flags in C.
+            ' ' | '\t' => continue,
+
             _ => {
                 tracing::warn!(flag = %ch, "ignoring unknown rewrite flag character");
             }
@@ -2558,19 +2577,32 @@ mod tests {
 
     #[test]
     fn test_rewrite_flags_parsing() {
-        assert_eq!(parse_rewrite_flags("T"), 0x0001);
-        assert_eq!(parse_rewrite_flags("TF"), 0x0003);
-        assert_eq!(parse_rewrite_flags("H"), 0x003F);
+        // Bit values match C macros.h / readconf.c exactly.
+        assert_eq!(parse_rewrite_flags("t"), 0x0004); // rewrite_to (lowercase)
+        assert_eq!(parse_rewrite_flags("tf"), 0x0006); // to + from
+        assert_eq!(parse_rewrite_flags("h"), 0x003F); // rewrite_all_headers
+        assert_eq!(parse_rewrite_flags("T"), 0x0080); // rewrite_envto (uppercase)
+        assert_eq!(parse_rewrite_flags("F"), 0x0040); // rewrite_envfrom (uppercase)
+        assert_eq!(parse_rewrite_flags("E"), 0x00C0); // rewrite_all_envelope
+        assert_eq!(parse_rewrite_flags("S"), 0x0100); // rewrite_smtp
+        assert_eq!(parse_rewrite_flags("Q"), 0x0400); // rewrite_qualify
+        assert_eq!(parse_rewrite_flags("R"), 0x0800); // rewrite_repeat
+        assert_eq!(parse_rewrite_flags("w"), 0x1000); // rewrite_whole
+        assert_eq!(parse_rewrite_flags("q"), 0x2000); // rewrite_quit
         assert_eq!(parse_rewrite_flags(""), 0);
-        assert_eq!(parse_rewrite_flags("Ss"), 0x0120);
+        // Combined flags: rewrite_smtp (0x0100) | rewrite_sender (0x0001)
+        assert_eq!(parse_rewrite_flags("Ss"), 0x0101);
+        // Whitespace between flags is permitted and ignored.
+        assert_eq!(parse_rewrite_flags("t f"), 0x0006);
     }
 
     #[test]
     fn test_rewrite_line_parsing() {
+        // T = uppercase envelope-to flag → rewrite_envto = 0x0080
         let rule = parse_rewrite_line("*@old.example.com  ${1}@new.example.com  T").unwrap();
         assert_eq!(rule.key, "*@old.example.com");
         assert_eq!(rule.replacement, "${1}@new.example.com");
-        assert_eq!(rule.flags, 0x0001);
+        assert_eq!(rule.flags, 0x0080);
     }
 
     #[test]

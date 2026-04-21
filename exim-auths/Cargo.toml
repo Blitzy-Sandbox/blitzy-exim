@@ -206,3 +206,12 @@ md4 = "0.10"
 
 # DES block cipher — used for NTLM LM hash computation.
 des = "0.8"
+
+# ── Constant-time primitives for credential comparison ──────────────────────
+# The `subtle` crate provides constant-time equality operations that prevent
+# network-observable timing side-channel attacks (CWE-208) when comparing
+# authentication hashes or digests. CRAM-MD5 relies on this indirectly via
+# `hmac::Mac::verify_slice()`; SPA/NTLM consumes it directly for NT-hash
+# verification in spa.rs. Already present as a transitive dependency via
+# `hmac`, declared explicitly here for visibility and version stability.
+subtle = "2.6"

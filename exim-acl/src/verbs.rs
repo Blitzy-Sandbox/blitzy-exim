@@ -907,8 +907,10 @@ mod tests {
 
     #[test]
     fn test_acl_warn_log_message_basic() {
-        let mut ctx = MessageContext::default();
-        ctx.host_and_ident = "[127.0.0.1]".to_owned();
+        let mut ctx = MessageContext {
+            host_and_ident: "[127.0.0.1]".to_owned(),
+            ..Default::default()
+        };
 
         acl_warn(&mut ctx, None, Some("test warning"), AclWhere::Rcpt);
 
@@ -920,8 +922,10 @@ mod tests {
 
     #[test]
     fn test_acl_warn_log_message_dedup() {
-        let mut ctx = MessageContext::default();
-        ctx.host_and_ident = "[127.0.0.1]".to_owned();
+        let mut ctx = MessageContext {
+            host_and_ident: "[127.0.0.1]".to_owned(),
+            ..Default::default()
+        };
 
         // Log the same message twice
         acl_warn(&mut ctx, None, Some("dup msg"), AclWhere::Rcpt);
@@ -965,8 +969,10 @@ mod tests {
 
     #[test]
     fn test_acl_warn_both_messages() {
-        let mut ctx = MessageContext::default();
-        ctx.host_and_ident = "H=test [10.0.0.1]".to_owned();
+        let mut ctx = MessageContext {
+            host_and_ident: "H=test [10.0.0.1]".to_owned(),
+            ..Default::default()
+        };
 
         acl_warn(
             &mut ctx,

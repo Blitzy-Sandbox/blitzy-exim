@@ -753,6 +753,11 @@ mod tests {
     }
 
     #[test]
+    // This test intentionally invokes `.clone()` on a `Copy` type to verify
+    // the `Clone` trait is derived (in addition to `Copy`). The clippy
+    // `clone_on_copy` lint is suppressed because the redundancy is the
+    // point of the test.
+    #[allow(clippy::clone_on_copy)]
     fn arena_stats_derive_traits() {
         let stats_a = ArenaStats {
             allocated_bytes: 1024,

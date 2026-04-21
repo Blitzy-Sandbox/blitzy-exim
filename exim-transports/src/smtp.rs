@@ -2994,8 +2994,10 @@ mod tests {
         };
         assert!(transport.smtp_transport_init(&config).is_ok());
 
-        let mut bad_opts = SmtpTransportOptions::default();
-        bad_opts.command_timeout = 0;
+        let bad_opts = SmtpTransportOptions {
+            command_timeout: 0,
+            ..Default::default()
+        };
         let bad_config = TransportInstanceConfig {
             name: "bad".to_string(),
             driver_name: "smtp".to_string(),

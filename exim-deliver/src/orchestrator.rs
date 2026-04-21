@@ -3873,9 +3873,11 @@ mod tests {
 
     #[test]
     fn test_deliver_set_expansions_clear() {
-        let mut ctx = DeliveryContext::default();
-        ctx.deliver_domain = "test.com".to_string();
-        ctx.deliver_localpart = "user".to_string();
+        let mut ctx = DeliveryContext {
+            deliver_domain: "test.com".to_string(),
+            deliver_localpart: "user".to_string(),
+            ..Default::default()
+        };
 
         deliver_set_expansions(None, &mut ctx);
         assert!(ctx.deliver_domain.is_empty());

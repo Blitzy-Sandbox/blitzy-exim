@@ -714,6 +714,11 @@ mod tests {
     }
 
     #[test]
+    // This test intentionally invokes `.clone()` on a Copy type to verify the
+    // `Clone` trait is implemented (in addition to `Copy`). The clippy
+    // `clone_on_copy` lint is suppressed because the redundancy is the point
+    // of the test.
+    #[allow(clippy::clone_on_copy)]
     fn test_spool_read_result_clone_copy() {
         let a = SpoolReadResult::EnvError;
         let b = a; // Copy
@@ -723,6 +728,10 @@ mod tests {
     }
 
     #[test]
+    // Same rationale as test_spool_read_result_clone_copy: verify that both
+    // Copy and Clone are implemented. The explicit `.clone()` call exercises
+    // the Clone impl independently of the implicit Copy semantics.
+    #[allow(clippy::clone_on_copy)]
     fn test_spool_write_context_clone_copy() {
         let a = SpoolWriteContext::Modifying;
         let b = a; // Copy

@@ -459,6 +459,11 @@ mod tests {
     // ─── AcceptRouterOptions Tests ──────────────────────────────────────
 
     #[test]
+    // This test intentionally calls `::default()` on a unit struct to
+    // verify the `Default` trait is implemented. Clippy's
+    // `default_constructed_unit_structs` lint is suppressed because the
+    // redundancy is the point of the test.
+    #[allow(clippy::default_constructed_unit_structs)]
     fn test_accept_router_options_default() {
         let opts = AcceptRouterOptions::default();
         // Verify it's a unit struct — Debug formatting should work.
@@ -482,6 +487,11 @@ mod tests {
     }
 
     #[test]
+    // This test intentionally calls `::default()` on a unit struct to
+    // verify the `Default` trait is implemented. Clippy's
+    // `default_constructed_unit_structs` lint is suppressed because the
+    // redundancy is the point of the test.
+    #[allow(clippy::default_constructed_unit_structs)]
     fn test_accept_router_default() {
         let router = AcceptRouter::default();
         assert_eq!(router.driver_name(), "accept");

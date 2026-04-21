@@ -2690,7 +2690,7 @@ mod tests {
         for (name, expected) in &cases {
             assert_eq!(
                 item_name_to_kind(name),
-                Some(expected.clone()),
+                Some(*expected),
                 "item_name_to_kind({name}) failed"
             );
         }
