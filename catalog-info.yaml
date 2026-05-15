@@ -9,7 +9,9 @@ metadata:
   - infrastructure
   - migration
   - refactor
+  - rewrite
   - rust
+  - security
   labels:
     blitzy.com/language: rust
   annotations:
