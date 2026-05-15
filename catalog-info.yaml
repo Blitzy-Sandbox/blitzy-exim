@@ -5,6 +5,7 @@ metadata:
   description: Complete C-to-Rust migration of Exim MTA — 18-crate workspace with
     250K+ lines of Rust
   tags:
+  - c
   - infrastructure
   - migration
   - refactor
