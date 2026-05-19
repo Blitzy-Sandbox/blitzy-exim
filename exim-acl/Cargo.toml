@@ -1,0 +1,179 @@
+# =============================================================================
+# Exim ACL (Access Control List) Evaluation Engine — Crate Manifest
+# =============================================================================
+#
+# This crate replaces src/src/acl.c (5,147 lines) from the C Exim source tree.
+# It implements the complete ACL evaluation engine: verb evaluation (accept,
+# deny, defer, discard, drop, require, warn), condition checking across 30+
+# condition types, phase enforcement across 7+ SMTP phases, and ACL variable
+# management.
+#
+# The ACL engine is consumed by exim-core (for top-level ACL dispatch) and
+# exim-smtp (for per-SMTP-phase ACL invocation at connect, helo, mail, rcpt,
+# data, mime, dkim, prdr phases).
+#
+# Build commands:
+#   cargo check -p exim-acl                        # Type-check with defaults
+#   cargo check -p exim-acl --all-features         # Check all features
+#   cargo check -p exim-acl --features "dmarc,spf" # Check specific features
+# =============================================================================
+
+[package]
+name = "exim-acl"
+version = "0.1.0"
+edition = "2021"
+description = "ACL (Access Control List) evaluation engine for Exim MTA — verb evaluation (accept/deny/defer/discard/drop/require/warn), condition checking, and phase enforcement across 7+ SMTP phases"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Cargo feature flags replace ALL C preprocessor conditionals (per AAP §0.7.3).
+# Each feature maps to a specific #ifdef/#ifndef guard in acl.c. Feature names
+# are semantically meaningful Cargo-style kebab-case names.
+#
+# Preprocessor conditional mapping:
+#   #ifdef EXPERIMENTAL_DCC       → feature "dcc"
+#   #ifdef WITH_CONTENT_SCAN      → feature "content-scan"
+#   #ifndef DISABLE_DKIM          → feature "dkim"
+#   #ifdef EXIM_HAVE_DMARC        → feature "dmarc"
+#   #ifdef EXIM_HAVE_SPF          → feature "spf"
+#   #ifdef SUPPORT_I18N           → feature "i18n"
+#   #ifndef DISABLE_PRDR          → feature "prdr"
+#   #ifndef DISABLE_WELLKNOWN     → feature "wellknown"
+#   #ifdef EXPERIMENTAL_XCLIENT   → feature "xclient"
+#   #ifdef EXPERIMENTAL_ARC       → feature "arc"
+
+[features]
+# Default features match a typical Exim C build where PRDR and DKIM are enabled
+# (not disabled) and WITH_CONTENT_SCAN is active.
+default = ["prdr", "dkim", "content-scan"]
+
+# WITH_CONTENT_SCAN equivalent — enables content scanning ACL conditions:
+# ACLC_DECODE, ACLC_MALWARE, ACLC_MIME_REGEX, ACLC_REGEX, ACLC_SPAM conditions
+# and the CONTROL_NO_MBOX_UNSPOOL control modifier.
+# Source references: acl.c lines 72-74, 92-98, 102-104, 110-112, 253-258,
+#   279-286, 316-322, 557-565
+content-scan = []
+
+# EXPERIMENTAL_DCC equivalent — enables the DCC (Distributed Checksum
+# Clearinghouse) spam detection condition (ACLC_DCC).
+# Source references: acl.c lines 69-71, 178-183
+dcc = []
+
+# Replaces #ifndef DISABLE_DKIM — enables DKIM-related ACL conditions:
+# ACLC_DKIM_SIGNER, ACLC_DKIM_STATUS conditions and CONTROL_DKIM_VERIFY
+# control modifier (dkim_disable_verify).
+# Source references: acl.c lines 76-79, 192-207, 424-427, 486-493
+dkim = []
+
+# EXIM_HAVE_DMARC equivalent — enables the ACLC_DMARC_STATUS condition and
+# CONTROL_DMARC_VERIFY, CONTROL_DMARC_FORENSIC control modifiers.
+# Source references: acl.c lines 80-82, 209-216, 427-430, 495-504
+dmarc = []
+
+# EXIM_HAVE_SPF equivalent — enables ACLC_SPF and ACLC_SPF_GUESS conditions.
+# Source references: acl.c lines 113-116, 323-346
+spf = []
+
+# SUPPORT_I18N equivalent — enables the CONTROL_UTF8_DOWNCONVERT control
+# modifier for internationalized email address handling.
+# Source references: acl.c lines 450-452, 596-599, 2206, 3757, 4918
+i18n = []
+
+# Replaces #ifndef DISABLE_PRDR — enables Per-Recipient Data Response support.
+# Adds ACL_WHERE_PRDR phase and ACL_BIT_PRDR bitmask to phase enforcement.
+# Source references: acl.c lines 3702, 4904, 4958; macros.h lines 971, 1004
+prdr = []
+
+# Replaces #ifndef DISABLE_WELLKNOWN — enables wellknown response handling.
+# Adds ACL_WHERE_WELLKNOWN phase, ACL_BIT_WELLKNOWN bitmask, and
+# CONTROL_WELLKNOWN control modifier.
+# Source references: acl.c lines 601-605, 3199, 3797; macros.h lines 987, 1020
+wellknown = []
+
+# EXPERIMENTAL_XCLIENT equivalent — enables ACL_WHERE_XCLIENT phase for the
+# Postfix XCLIENT extension handler.
+# Source reference: macros.h line 841 (phase enum definition)
+xclient = []
+
+# EXPERIMENTAL_ARC equivalent — enables ARC (Authenticated Received Chain)
+# verification support via dynamic module loading in verify=arc condition.
+# Source references: acl.c lines 1001-1014, 1682, 1863
+arc = []
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+[dependencies]
+
+# ── Workspace crate dependencies ─────────────────────────────────────────────
+
+# String expansion engine — ACL conditions frequently expand their arguments
+# via the ${...} DSL. The C source calls expand_string() / expand_string_2()
+# throughout acl_check_condition() (e.g., acl.c line 3343:
+# `expand_string_2(cb->arg, &textonly)`).
+exim-expand = { path = "../exim-expand" }
+
+# Lookup dispatcher — required for DNSBL checks (dnslists condition), verify
+# callouts that perform DNS/lookup integration, and rate-limiting database
+# access (acl_ratelimit() uses hints DB lookups).
+exim-lookups = { path = "../exim-lookups" }
+
+# Rust memory management: Tainted<T>/Clean<T> newtypes for compile-time taint
+# tracking (acl.c line 4498: `is_tainted(acl_text)`), MessageArena for
+# per-message ACL block and condition block allocation.
+exim-store = { path = "../exim-store" }
+
+# Driver trait definitions — needed for verify operations (acl_verify() resolves
+# addresses through router/transport drivers) and driver integration in ACL
+# condition evaluation.
+exim-drivers = { path = "../exim-drivers" }
+
+# DNS resolution — required for DNSBL checking (acl_verify_csa(),
+# acl_verify_reverse()), CSA (Client SMTP Authorization) verification, and
+# the dnslists ACL condition which performs DNS lookups against blocklists.
+exim-dns = { path = "../exim-dns" }
+
+# ── Workspace shared dependencies ────────────────────────────────────────────
+# All versions inherited from root Cargo.toml [workspace.dependencies].
+
+# Serialization framework — used for ACL variable spool serialization when
+# persisting ACL variable state ($acl_c0..$acl_c9, $acl_m0..$acl_m9) across
+# message delivery attempts via the spool file system.
+serde = { workspace = true }
+
+# Error type derivation — generates Display + Error implementations for
+# ACL-specific error types (AclError, ConditionError, VerifyError, etc.).
+thiserror = { workspace = true }
+
+# Structured logging/debugging — replaces Exim's HDEBUG(D_acl) and
+# debug_printf_indent() calls used extensively throughout acl.c for ACL
+# evaluation tracing and condition matching diagnostics.
+tracing = { workspace = true }
+
+# Logging facade compatibility — enables interoperability with crates that
+# use the `log` facade instead of `tracing`.
+log = { workspace = true }
+
+# Rust-native regex engine — used for pattern matching in ACL conditions
+# (hosts, senders, domains matching uses regex-based list matching internally).
+regex = { workspace = true }
+
+# PCRE2 bindings — Exim-compatible pattern matching for ACL conditions that
+# rely on PCRE2 regex syntax. Per AAP §0.6.1: pcre2 version 0.2.11, used
+# by exim-acl and exim-expand for consistent Exim pattern matching behavior.
+pcre2 = { workspace = true }
+
+# =============================================================================
+# Library Target
+# =============================================================================
+# Pure library crate consumed by exim-core and exim-smtp. No binary targets.
+# Crate name in Rust code: exim_acl (hyphen → underscore per Rust convention).
+
+[lib]
+name = "exim_acl"
+path = "src/lib.rs"

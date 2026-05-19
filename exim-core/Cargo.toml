@@ -1,0 +1,524 @@
+# =============================================================================
+# exim-core — Main Binary Crate for Exim Mail Transfer Agent
+# =============================================================================
+#
+# This is the primary binary crate that produces the `exim` executable.
+# It replaces the C source entry point and orchestration layer:
+#
+#   Source Files Replaced:
+#   • src/src/exim.c         (6,274 lines — main() + mode dispatch)
+#   • src/src/daemon.c       (daemon process management, poll event loop)
+#   • src/src/queue.c        (queue enumeration + scheduled queue runs)
+#   • src/src/child.c        (fork/exec, child management, smtp_slots)
+#   • src/src/filtertest.c   (filter test mode)
+#   • src/src/globals.c/.h   (714 global variables → 4 scoped context structs)
+#
+# Architecture:
+#   src/main.rs       — entry point, mode dispatch (daemon/delivery/queue/verify/expand/filter/address/config)
+#   src/cli.rs        — CLI argument parsing: -bd, -bp, -bt, -be, -bV, -d, -q, -M* families
+#   src/daemon.rs     — poll-based event loop, socket binding, connection acceptance
+#   src/queue_runner.rs — queue enumeration, operator actions, scheduled runs
+#   src/signal.rs     — SIGHUP re-exec, SIGTERM shutdown, SIGCHLD reaping, SIGALRM scheduling
+#   src/process.rs    — fork/exec, child_open_uid, child management, smtp_slots
+#   src/modes.rs      — verify, expand-test, filter-test, address-test, config-check modes
+#   src/context.rs    — ServerContext, MessageContext, DeliveryContext, ConfigContext structs
+#
+# This crate depends on all 16 library crates in the workspace, providing
+# centralized feature flag propagation so users can configure the entire
+# Exim build from a single `cargo build -p exim-core --features "..."` command.
+#
+# Build commands:
+#   cargo build -p exim-core                       # Build with default features
+#   cargo build -p exim-core --release             # Optimized binary
+#   cargo build -p exim-core --features tls-openssl --no-default-features
+#   cargo build -p exim-core --features "lookup-pgsql,lookup-mysql"
+#
+# This crate contains ZERO unsafe code (per AAP §0.7.2).
+# All unsafe C library interactions are confined to the exim-ffi crate.
+
+[package]
+name = "exim-core"
+version = "4.99.0"
+edition = "2021"
+description = "Exim Mail Transfer Agent - main binary crate"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Binary Target
+# =============================================================================
+# The produced binary MUST be named `exim` (not `exim-core`) to match the
+# existing Exim installation conventions and test harness expectations.
+# The test/runtest Perl harness locates the binary by this name.
+
+[[bin]]
+name = "exim"
+path = "src/main.rs"
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+[dependencies]
+
+# ── Workspace crate dependencies (all 16 sibling library crates) ─────────────
+# Per AAP §0.5.1, exim-core depends on ALL other workspace crates. Each crate
+# replaces a specific subsystem from the C source tree.
+
+# Configuration file parser — replaces readconf.c (4,765 lines).
+# Provides ConfigContext, Arc<Config>, option list processing, macro expansion,
+# driver instance creation, config validation, and -bP printing.
+exim-config = { path = "../exim-config" }
+
+# String expansion ${...} DSL engine — replaces expand.c (9,210 lines).
+# Tokenizer → parser → evaluator pipeline for all variable/condition/lookup
+# expansion used throughout configuration and message processing.
+exim-expand = { path = "../exim-expand" }
+
+# SMTP protocol handling — replaces smtp_in.c (6,022 lines) + smtp_out.c.
+# Inbound SMTP command state machine and outbound connection management with
+# PIPELINING, CHUNKING/BDAT, PRDR, and ATRN extension support.
+exim-smtp = { path = "../exim-smtp" }
+
+# Delivery orchestration — replaces deliver.c (9,104 lines) + route.c.
+# Per-recipient router chain → transport dispatch, subprocess pool for parallel
+# remote delivery, retry scheduling, bounce/DSN generation, journal management.
+exim-deliver = { path = "../exim-deliver" }
+
+# ACL evaluation engine — replaces acl.c (5,147 lines).
+# Policy evaluation across 7+ SMTP phases (connect, helo, mail, rcpt, data,
+# mime, dkim, prdr) with accept/deny/defer/discard/drop/require/warn verbs.
+exim-acl = { path = "../exim-acl" }
+
+# TLS abstraction layer — replaces tls.c, tls-openssl.c (5,323 lines),
+# tls-gnu.c (4,491 lines), dane.c, dane-openssl.c.
+# TlsBackend trait with rustls (default) and openssl (optional) backends,
+# DANE/TLSA, OCSP stapling, SNI, client cert verification, session resumption.
+exim-tls = { path = "../exim-tls" }
+
+# Rust memory management — replaces store.c custom 5-pool allocator.
+# bumpalo::Bump per-message arena, Arc<Config> frozen config, HashMap search
+# cache, Tainted<T>/Clean<T> compile-time taint tracking newtypes.
+exim-store = { path = "../exim-store" }
+
+# Driver trait definitions and inventory-based registry — replaces drtables.c.
+# AuthDriver, RouterDriver, TransportDriver, LookupDriver traits with
+# inventory::submit! compile-time registration replacing C struct inheritance.
+exim-drivers = { path = "../exim-drivers" }
+
+# 9 authenticator driver implementations — replaces src/src/auths/ (26 files).
+# CRAM-MD5, Cyrus SASL, Dovecot, EXTERNAL, GSASL, Heimdal GSSAPI,
+# PLAIN/LOGIN, SPA/NTLM, TLS cert auth + shared base64/saslauthd helpers.
+exim-auths = { path = "../exim-auths" }
+
+# 7 router driver implementations — replaces src/src/routers/ (25 files).
+# accept, dnslookup, ipliteral, iplookup, manualroute, queryprogram, redirect
+# + 9 shared rf_* helper functions.
+exim-routers = { path = "../exim-routers" }
+
+# 6 transport driver implementations — replaces src/src/transports/ (14 files).
+# appendfile (mbox/MBX/Maildir/Mailstore), autoreply, lmtp, pipe, queuefile,
+# smtp (6,573 lines — largest driver) + Maildir helper.
+exim-transports = { path = "../exim-transports" }
+
+# 22+ lookup backend implementations — replaces src/src/lookups/ (26 files)
+# + src/src/search.c. CDB, DBM, DNS, dsearch, JSON, LDAP, LMDB, lsearch,
+# MySQL, NIS, NIS+, NMH, Oracle, passwd, PostgreSQL, PSL, readsock, Redis,
+# SPF, SQLite, testdb, Whoson + shared lf_* helpers.
+exim-lookups = { path = "../exim-lookups" }
+
+# Optional policy/auth/filter modules — replaces src/src/miscmods/ (34 files).
+# DKIM, ARC, SPF, DMARC, Exim filter, Sieve filter, PROXY, SOCKS, XCLIENT,
+# PAM, RADIUS, Perl, DSCP + in-tree PDKIM library.
+exim-miscmods = { path = "../exim-miscmods" }
+
+# DNS resolution — replaces dns.c, dnsbl.c, host.c.
+# A/AAAA/MX/SRV/TLSA/PTR resolution via hickory-resolver + DNSBL checking.
+exim-dns = { path = "../exim-dns" }
+
+# Spool file I/O — replaces spool_in.c, spool_out.c.
+# -H (header/metadata) and -D (data) file read/write with byte-level
+# compatibility for cross-version queue flush, message ID generation.
+exim-spool = { path = "../exim-spool" }
+
+# Minimal C FFI shim layer — ONLY crate with unsafe code (per AAP §0.7.2).
+# Wraps: libpam, libradius, libperl, libgsasl, libkrb5, libspf2,
+# Berkeley DB, GDBM, NDBM, TDB for hints database backends.
+exim-ffi = { path = "../exim-ffi" }
+
+# ── External dependencies (workspace-shared versions) ────────────────────────
+# All versions are pinned in the root Cargo.toml [workspace.dependencies]
+# section (per AAP §0.6.1) and referenced here via `workspace = true`.
+
+# CLI argument parsing — version 4.5.60 per AAP §0.6.1.
+# Parses Exim's full CLI interface: -bd (daemon), -bp (queue listing),
+# -bt (address testing), -be (expansion testing), -bV (version), -d (debug),
+# -q (queue runner), -M* (message manipulation) families and 50+ flags.
+clap = { workspace = true }
+
+# Application-level error handling with context propagation.
+# Used for main() error chain and mode dispatch error reporting.
+anyhow = { workspace = true }
+
+# Error type derivation — provides #[derive(Error)] for exim-core error enums.
+# Used for ModeError, DaemonError, QueueRunnerError, SignalError types.
+thiserror = { workspace = true }
+
+# Structured logging/debugging — replaces C debug.c/log.c.
+# Integrates with Exim's debug selector system (-d+all, -d+route,
+# -d+transport, -d+deliver, etc.) via tracing spans and events.
+tracing = { workspace = true }
+
+# Log output formatting — subscriber that formats tracing events into
+# Exim-compatible log lines for main log, reject log, and panic log.
+# Produces output parseable by existing exigrep/eximstats Perl tools.
+tracing-subscriber = { workspace = true }
+
+# Safe POSIX API wrappers — version 0.31.2 per AAP §0.6.1.
+# fork/exec for connection handling, signal management (SIGHUP, SIGTERM,
+# SIGCHLD, SIGALRM), socket operations for daemon listener, chown/chmod
+# for privilege management, and user/group lookup.
+nix = { workspace = true }
+
+# Rust-native regex for message ID validation in queue management and
+# selective delivery filtering by sender/recipient patterns.
+regex = { workspace = true }
+
+# C type definitions and system call bindings — version 0.2.183 per AAP §0.6.1.
+# Required for low-level POSIX operations: pid_t, uid_t, gid_t types,
+# signal constants, socket address structures, and file mode constants.
+libc = { workspace = true }
+
+# Logging facade — version 0.4.29.
+# Bridges third-party crate log output (from dependency crates that use
+# the `log` facade) into the tracing subscriber pipeline.
+log = { workspace = true }
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Cargo feature flags replace ALL 1,677 C preprocessor conditionals (#ifdef /
+# #ifndef) per AAP §0.7.3. The exim-core binary crate provides centralized
+# feature propagation to all dependent library crates, enabling a single
+# command-line interface for configuring the entire Exim build.
+#
+# Each feature defined here propagates to the corresponding library crate
+# using Cargo's `crate-name/feature-name` syntax. Library crates also define
+# their own default features, which are automatically active unless the
+# dependency specifies `default-features = false`.
+#
+# Usage examples:
+#   # Build with default features (rustls TLS + common drivers/lookups):
+#   cargo build -p exim-core --release
+#
+#   # Build with OpenSSL TLS backend instead of rustls:
+#   cargo build -p exim-core --release --no-default-features --features tls-openssl
+#
+#   # Add PostgreSQL and MySQL lookup backends:
+#   cargo build -p exim-core --release --features "lookup-pgsql,lookup-mysql"
+#
+#   # Add GSASL and Kerberos auth drivers:
+#   cargo build -p exim-core --release --features "auth-gsasl,auth-heimdal-gssapi"
+#
+#   # Enable GDBM hints database backend:
+#   cargo build -p exim-core --release --features hintsdb-gdbm
+
+[features]
+
+# Default feature set — matches a typical Exim build configuration.
+# TLS is enabled with the memory-safe rustls backend. All other defaults
+# come from the individual library crates' own default feature sets:
+#   • exim-tls:        tls-rustls (redundant but explicit for documentation)
+#   • exim-auths:      auth-cram-md5, auth-plaintext
+#   • exim-routers:    all 7 routers
+#   • exim-transports: 5 core transports + maildir + tls/dkim/prdr/etc.
+#   • exim-lookups:    lsearch, cdb, dbmdb, dnsdb, dsearch, passwd, testdb
+#   • exim-miscmods:   dkim, exim-filter, sieve-filter
+default = ["tls-rustls"]
+
+# ── TLS backend selection (propagate to exim-tls) ────────────────────────────
+# Exactly one TLS backend should be enabled. Enabling neither is equivalent
+# to the C DISABLE_TLS conditional (no TLS support compiled).
+
+# rustls — memory-safe TLS with no C library dependency (default).
+# Replaces C USE_GNUTLS conditional. Includes webpki-roots for Mozilla CA
+# certificates and rustls-pemfile for PEM parsing.
+tls-rustls = ["exim-tls/tls-rustls"]
+
+# OpenSSL — for environments requiring FIPS compliance, specific cipher
+# suites, or legacy TLS protocol versions. Replaces C USE_OPENSSL conditional.
+tls-openssl = ["exim-tls/tls-openssl"]
+
+# ── TLS sub-features (propagate to exim-tls) ─────────────────────────────────
+
+# DANE/TLSA certificate verification support.
+# Replaces C SUPPORT_DANE conditional.
+dane = ["exim-tls/dane"]
+
+# OCSP stapling for certificate revocation checking.
+# Replaces C !DISABLE_OCSP conditional.
+ocsp = ["exim-tls/ocsp"]
+
+# TLS session resumption for faster reconnection.
+# Replaces C !DISABLE_TLS_RESUME conditional.
+tls-resume = ["exim-tls/tls-resume"]
+
+# ── Authenticator driver features (propagate to exim-auths) ──────────────────
+# Each feature enables one auth driver module. Pure Rust drivers have no
+# additional system library requirements. FFI-dependent drivers (cyrus-sasl,
+# gsasl, heimdal-gssapi) require the corresponding C libraries installed.
+
+# CRAM-MD5: HMAC-MD5 challenge-response authentication (RFC 2195).
+# Replaces C AUTH_CRAM_MD5 conditional. Pure Rust.
+auth-cram-md5 = ["exim-auths/auth-cram-md5"]
+
+# Cyrus SASL: delegates to libsasl2 via FFI.
+# Replaces C AUTH_CYRUS_SASL conditional. Requires libsasl2.
+auth-cyrus-sasl = ["exim-auths/auth-cyrus-sasl"]
+
+# Dovecot: authenticates via Dovecot auth socket protocol.
+# Replaces C AUTH_DOVECOT conditional. Pure Rust.
+auth-dovecot = ["exim-auths/auth-dovecot"]
+
+# EXTERNAL: SASL EXTERNAL — identity from TLS client certificate.
+# Replaces C AUTH_EXTERNAL conditional. Pure Rust.
+auth-external = ["exim-auths/auth-external"]
+
+# GSASL: GNU SASL library for SCRAM and other mechanisms.
+# Replaces C AUTH_GSASL conditional. Requires libgsasl.
+auth-gsasl = ["exim-auths/auth-gsasl"]
+
+# Heimdal GSSAPI: Kerberos/GSSAPI authentication.
+# Replaces C AUTH_HEIMDAL_GSSAPI conditional. Requires libkrb5.
+auth-heimdal-gssapi = ["exim-auths/auth-heimdal-gssapi"]
+
+# PLAIN/LOGIN: cleartext SASL mechanisms with multi-prompt server support.
+# Replaces C AUTH_PLAINTEXT conditional. Pure Rust.
+auth-plaintext = ["exim-auths/auth-plaintext"]
+
+# SPA/NTLM: Microsoft Secure Password Authentication.
+# Replaces C AUTH_SPA conditional. Pure Rust (built-in MD4/DES).
+auth-spa = ["exim-auths/auth-spa"]
+
+# TLS cert: authentication based on TLS client certificate parameters.
+# Replaces C AUTH_TLS conditional. Pure Rust.
+auth-tls = ["exim-auths/auth-tls"]
+
+# ── Router driver features (propagate to exim-routers) ───────────────────────
+# Each feature enables one router driver module. All routers are pure Rust.
+
+# Catch-all local delivery router.
+# Replaces C ROUTER_ACCEPT conditional.
+router-accept = ["exim-routers/router-accept"]
+
+# DNS MX/A/AAAA/SRV lookup routing.
+# Replaces C ROUTER_DNSLOOKUP conditional.
+router-dnslookup = ["exim-routers/router-dnslookup"]
+
+# IP-literal domain routing (e.g., user@[192.168.1.1]).
+# Replaces C ROUTER_IPLITERAL conditional.
+router-ipliteral = ["exim-routers/router-ipliteral"]
+
+# External host query routing via UDP/TCP.
+# Replaces C ROUTER_IPLOOKUP conditional.
+router-iplookup = ["exim-routers/router-iplookup"]
+
+# Admin-defined explicit route lists.
+# Replaces C ROUTER_MANUALROUTE conditional.
+router-manualroute = ["exim-routers/router-manualroute"]
+
+# External program routing via pipe.
+# Replaces C ROUTER_QUERYPROGRAM conditional.
+router-queryprogram = ["exim-routers/router-queryprogram"]
+
+# Alias/forward/filter/Sieve redirect routing.
+# Replaces C ROUTER_REDIRECT conditional.
+router-redirect = ["exim-routers/router-redirect"]
+
+# ── Transport driver features (propagate to exim-transports) ─────────────────
+# Each feature enables one transport driver module.
+
+# mbox/MBX/Maildir/Mailstore delivery with POSIX file locking.
+# Replaces C TRANSPORT_APPENDFILE conditional.
+transport-appendfile = ["exim-transports/transport-appendfile"]
+
+# Vacation auto-response message generation.
+# Replaces C TRANSPORT_AUTOREPLY conditional.
+transport-autoreply = ["exim-transports/transport-autoreply"]
+
+# LMTP client transport (via command or socket).
+# Replaces C TRANSPORT_LMTP conditional.
+transport-lmtp = ["exim-transports/transport-lmtp"]
+
+# Pipe message to external command.
+# Replaces C TRANSPORT_PIPE conditional.
+transport-pipe = ["exim-transports/transport-pipe"]
+
+# Experimental spool file copy transport.
+# Replaces C EXPERIMENTAL_QUEUEFILE conditional.
+transport-queuefile = ["exim-transports/transport-queuefile"]
+
+# Full outbound SMTP/LMTP state machine.
+# Replaces C smtp.c (always compiled in C; feature-flagged here for consistency).
+transport-smtp = ["exim-transports/transport-smtp"]
+
+# ── Lookup backend features (propagate to exim-lookups) ──────────────────────
+# Each feature enables one lookup backend module. Pure Rust backends require
+# no system libraries. FFI-backed backends require the corresponding C libraries.
+# Async database backends (MySQL, PostgreSQL, LDAP) use tokio::block_on().
+
+# CDB read-only constant database. Pure Rust parser.
+lookup-cdb = ["exim-lookups/lookup-cdb"]
+
+# DBM hints database glue (BDB/GDBM/NDBM via FFI).
+lookup-dbmdb = ["exim-lookups/lookup-dbmdb"]
+
+# DNS query lookup via hickory-resolver (A/AAAA/MX/SRV/TLSA/PTR/TXT).
+lookup-dnsdb = ["exim-lookups/lookup-dnsdb"]
+
+# Directory entry search. Pure Rust (std::fs).
+lookup-dsearch = ["exim-lookups/lookup-dsearch"]
+
+# JSON file traversal via serde_json.
+lookup-json = ["exim-lookups/lookup-json"]
+
+# LDAP directory lookup via ldap3 crate (async, bridged via block_on).
+lookup-ldap = ["exim-lookups/lookup-ldap"]
+
+# LMDB key-value store via heed crate.
+lookup-lmdb = ["exim-lookups/lookup-lmdb"]
+
+# Line-scan file lookup: lsearch, wildlsearch, nwildlsearch. Pure Rust.
+lookup-lsearch = ["exim-lookups/lookup-lsearch"]
+
+# MySQL/MariaDB SQL lookup via mysql_async (async, bridged via block_on).
+lookup-mysql = ["exim-lookups/lookup-mysql"]
+
+# NIS (Yellow Pages) directory lookup via FFI.
+lookup-nis = ["exim-lookups/lookup-nis"]
+
+# NIS+ directory lookup via FFI.
+lookup-nisplus = ["exim-lookups/lookup-nisplus"]
+
+# NMH datagram protocol lookup. Pure Rust socket I/O.
+lookup-nmh = ["exim-lookups/lookup-nmh"]
+
+# Oracle OCI SQL lookup via FFI.
+lookup-oracle = ["exim-lookups/lookup-oracle"]
+
+# System passwd database lookup. Pure Rust via libc getpwnam.
+lookup-passwd = ["exim-lookups/lookup-passwd"]
+
+# PostgreSQL SQL lookup via tokio-postgres + connection pooling (async, bridged).
+lookup-pgsql = ["exim-lookups/lookup-pgsql"]
+
+# Public Suffix List lookup. Pure Rust.
+lookup-psl = ["exim-lookups/lookup-psl"]
+
+# Socket request/response lookup. Pure Rust TCP/Unix socket I/O.
+lookup-readsock = ["exim-lookups/lookup-readsock"]
+
+# Redis key-value lookup via redis crate.
+lookup-redis = ["exim-lookups/lookup-redis"]
+
+# SPF lookup shim (delegates to exim-miscmods SPF implementation).
+lookup-spf = ["exim-lookups/lookup-spf"]
+
+# SQLite query lookup via rusqlite (bundled SQLite).
+lookup-sqlite = ["exim-lookups/lookup-sqlite"]
+
+# Synthetic test backends (used by test suite).
+lookup-testdb = ["exim-lookups/lookup-testdb"]
+
+# Whoson dynamic IP lookup via FFI.
+lookup-whoson = ["exim-lookups/lookup-whoson"]
+
+# ── Optional module features (propagate to exim-miscmods) ────────────────────
+# Each feature enables one policy, authentication, or filter module.
+
+# DKIM verify/sign + in-tree PDKIM streaming parser and crypto abstraction.
+# Replaces C #ifndef DISABLE_DKIM conditional.
+dkim = ["exim-miscmods/dkim"]
+
+# ARC (Authenticated Received Chain) verify/sign. Requires DKIM.
+# Replaces C #ifdef EXPERIMENTAL_ARC conditional.
+arc = ["exim-miscmods/arc"]
+
+# SPF (Sender Policy Framework) via libspf2 FFI.
+# Replaces C #ifdef SUPPORT_SPF conditional.
+spf = ["exim-miscmods/spf"]
+
+# SPF via Perl — alternative SPF using embedded Perl interpreter.
+# Replaces C #ifdef EXPERIMENTAL_SPF_PERL conditional.
+spf-perl = ["exim-miscmods/spf-perl"]
+
+# DMARC via libopendmarc FFI. Requires SPF + DKIM.
+# Replaces C #ifdef SUPPORT_DMARC conditional.
+dmarc = ["exim-miscmods/dmarc"]
+
+# Native DMARC parser — experimental pure-Rust without libopendmarc.
+# Replaces C #ifdef EXPERIMENTAL_DMARC_NATIVE conditional.
+dmarc-native = ["exim-miscmods/dmarc-native"]
+
+# Exim legacy filter interpreter for .forward files.
+# Always compiled in C (no preprocessor guard); feature-flagged here.
+exim-filter = ["exim-miscmods/exim-filter"]
+
+# RFC 5228 Sieve filter interpreter.
+# Always compiled in C (no preprocessor guard); feature-flagged here.
+sieve-filter = ["exim-miscmods/sieve-filter"]
+
+# HAProxy PROXY protocol v1/v2 handler.
+# Replaces C #ifdef SUPPORT_PROXY conditional.
+proxy = ["exim-miscmods/proxy"]
+
+# SOCKS5 client connector for outbound SMTP via SOCKS proxy.
+# Replaces C #ifdef SUPPORT_SOCKS conditional.
+socks-proxy = ["exim-miscmods/socks"]
+
+# Postfix XCLIENT extension handler.
+# Replaces C #ifdef EXPERIMENTAL_XCLIENT conditional.
+xclient = ["exim-miscmods/xclient"]
+
+# PAM (Pluggable Authentication Modules) via libpam FFI.
+# Replaces C #ifdef SUPPORT_PAM conditional.
+pam = ["exim-miscmods/pam"]
+
+# RADIUS authentication via libradius FFI.
+# Replaces C RADIUS_CONFIG_FILE conditional.
+radius = ["exim-miscmods/radius"]
+
+# Embedded Perl interpreter via libperl FFI.
+# Replaces C EXIM_PERL conditional.
+perl = ["exim-miscmods/perl"]
+
+# DSCP (Differentiated Services Code Point) traffic marking.
+# Replaces C #ifdef SUPPORT_DSCP conditional.
+dscp = ["exim-miscmods/dscp"]
+
+# ── Hints database backend features (propagate to exim-ffi) ──────────────────
+# These control which hints database backend is compiled. The hints database
+# stores retry data, queue information, and callout cache entries. Backends
+# are mutually exclusive at runtime but can all be compiled simultaneously.
+
+# Berkeley DB hints database backend via FFI.
+# Replaces C USE_DB conditional.
+hintsdb-bdb = ["exim-ffi/hintsdb-bdb"]
+
+# GDBM hints database backend via FFI.
+# Replaces C USE_GDBM conditional.
+hintsdb-gdbm = ["exim-ffi/hintsdb-gdbm"]
+
+# NDBM hints database backend via FFI.
+# Replaces C USE_NDBM conditional.
+hintsdb-ndbm = ["exim-ffi/hintsdb-ndbm"]
+
+# TDB hints database backend via FFI.
+# Replaces C USE_TDB conditional.
+hintsdb-tdb = ["exim-ffi/hintsdb-tdb"]
+
+# SQLite hints database backend — uses rusqlite (pure Rust), NOT FFI.
+# Unlike the other hints backends, this does not require exim-ffi because
+# rusqlite provides a complete Rust-native SQLite implementation.
+hintsdb-sqlite = ["exim-lookups/lookup-sqlite"]

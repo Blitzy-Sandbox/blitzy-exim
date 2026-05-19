@@ -1,0 +1,126 @@
+# =============================================================================
+# exim-dns — DNS Resolution Crate for Exim MTA
+# =============================================================================
+#
+# Replaces DNS resolution functionality from the C codebase:
+#   • src/src/dns.c   (1,445 lines) — DNS query interface, fake-DNS test support,
+#                                      DNSSEC AD/AA bit checks, record type helpers
+#   • src/src/dnsbl.c (668 lines)   — DNSBL (DNS Block List) verification
+#   • src/src/host.c  (3,424 lines) — Host finding by DNS (MX/A/AAAA/SRV/PTR),
+#                                      address sorting, random number generator
+#
+# Architecture:
+#   lib.rs       — Public API: DnsResolver, DnsblChecker, error types
+#   resolver.rs  — A/AAAA/MX/SRV/TLSA/PTR resolution via hickory-resolver
+#   dnsbl.rs     — DNSBL checking with caching
+#
+# DNS data is considered tainted (untrusted external input). All DNS results
+# are wrapped in Tainted<T> from the exim-store crate to enforce compile-time
+# taint tracking, replacing the runtime `GET_TAINTED` flag in C dns.c (line 331).
+#
+# Cargo feature flags replace C preprocessor conditionals:
+#   "dnssec" (default) — replaces #ifndef DISABLE_DNSSEC in dns.c
+#   "i18n"             — replaces #ifdef SUPPORT_I18N in dns.c
+#
+# The hickory-resolver crate provides async DNS, bridged to the synchronous
+# fork-per-connection model via tokio::runtime::Runtime::block_on() per
+# AAP §0.7.3.  The tokio runtime is scoped to DNS query execution only — it
+# MUST NOT be used for the main daemon event loop.
+#
+# Source origin:
+#   dns.c   — dns_lookup_timerwrap(), dns_basic_lookup(), dns_special_lookup(),
+#             dns_is_secure(), dns_set_insecure(), dns_is_aa(), dns_text_type()
+#   dnsbl.c — verify_check_dnsbl(), one_check_dnsbl()
+#   host.c  — host_find_byname(), host_find_bydns(), host_aton(), host_nmtoa(),
+#             host_build_ifacelist(), host_sort(), random_number()
+
+[package]
+name = "exim-dns"
+version = "0.1.0"
+edition = "2021"
+description = "DNS resolution crate for Exim MTA — A/AAAA/MX/SRV/TLSA/PTR resolution via hickory-resolver and DNSBL checking"
+license = "GPL-2.0-or-later"
+publish = false
+
+[dependencies]
+
+# ── Workspace-internal dependency ────────────────────────────────────────────
+# Provides Tainted<T> / Clean<T> newtypes for compile-time taint tracking.
+# All DNS query results (hostnames, IP addresses, MX records, TXT records)
+# originate from untrusted external sources and are wrapped in Tainted<T>,
+# replacing the runtime string_copy_taint(buf, GET_TAINTED) pattern in dns.c.
+exim-store = { path = "../exim-store" }
+
+# ── DNS resolution (replaces C res_search() / res_query()) ──────────────────
+# hickory-resolver provides async A/AAAA/MX/SRV/TLSA/PTR lookups, replacing
+# the libresolv calls in dns.c.  Version 0.25.0 per AAP §0.6.1.
+# Used for: forward lookups, reverse (PTR) lookups, MX queries, SRV discovery,
+# TLSA records (for DANE/DNSSEC), and DNSBL IP-reversal queries.
+hickory-resolver = { workspace = true }
+
+# ── Type-safe bitwise flag operations ────────────────────────────────────────
+# Provides the bitflags! macro for generating the HostFindFlags struct,
+# replacing the C HOST_FIND_* bit constants defined in macros.h:
+#   HOST_FIND_BY_SRV, HOST_FIND_BY_MX, HOST_FIND_BY_A, HOST_FIND_BY_AAAA,
+#   HOST_FIND_QUALIFY_SINGLE, HOST_FIND_SEARCH_PARENTS,
+#   HOST_FIND_IPV4_FIRST, HOST_FIND_IPV4_ONLY
+bitflags = "2.8.0"
+
+# ── Error handling ───────────────────────────────────────────────────────────
+# Derives the Error trait for DnsError, DnsblError, and HostFindError types,
+# replacing the C integer return codes (DNS_SUCCEED, DNS_NOMATCH, DNS_NODATA,
+# DNS_AGAIN, DNS_FAIL) with type-safe Rust error variants.
+thiserror = { workspace = true }
+
+# ── Structured logging (replaces DEBUG(D_dns) macros) ────────────────────────
+# DNS query attempts, resolution results, DNSSEC validation status, cache hits,
+# and DNSBL match results are logged through the tracing infrastructure,
+# matching Exim's -d+dns debug selector.
+tracing = { workspace = true }
+
+# ── Logging facade ───────────────────────────────────────────────────────────
+# Provides compatibility with crates that use the log facade instead of tracing.
+# hickory-resolver internally uses the log crate for its diagnostic output.
+log = { workspace = true }
+
+# ── Serialization ────────────────────────────────────────────────────────────
+# Used for serialization of DNS result caching structures and configuration
+# of resolver options.  Enables derive macros for Serialize/Deserialize on
+# DNS record types and DNSBL cache entries.
+serde = { workspace = true }
+
+# ── Async runtime bridge ────────────────────────────────────────────────────
+# hickory-resolver provides an async API.  Per AAP §0.7.3, the tokio runtime
+# is scoped to DNS query execution ONLY via tokio::runtime::Runtime::block_on().
+# The daemon event loop uses the same fork-per-connection + poll/select model
+# as the C implementation.  A small tokio runtime is created per-query or
+# per-process (not per-connection) to bridge the async DNS resolution into
+# the synchronous call chain.
+tokio = { workspace = true }
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+# Cargo feature flags replace C preprocessor conditionals per AAP §0.7.3.
+# Each feature maps to a specific #ifdef/#ifndef block in the original C source.
+
+[features]
+
+# Default features match the standard Exim build (DNSSEC enabled).
+default = ["dnssec"]
+
+# ── DNSSEC validation support ────────────────────────────────────────────────
+# Replaces: #ifndef DISABLE_DNSSEC in dns.c (lines 532–591)
+# When enabled, dns_is_secure() checks the AD (Authentic Data) bit and AA
+# (Authoritative Answer) bit in DNS responses for DNSSEC validation.
+# When disabled, dns_is_secure() unconditionally returns false and
+# dns_set_insecure() / dns_is_aa() are no-ops, matching the C behavior
+# when compiled with DISABLE_DNSSEC.
+dnssec = []
+
+# ── Internationalized domain name support ────────────────────────────────────
+# Replaces: #ifdef SUPPORT_I18N in dns.c (lines 857–873)
+# When enabled, UTF-8 domain names are converted to A-label (ACE) form
+# via string_domain_utf8_to_alabel() before DNS lookup, supporting
+# internationalized email addresses per RFC 6531.
+i18n = []

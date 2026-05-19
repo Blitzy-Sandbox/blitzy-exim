@@ -1,0 +1,128 @@
+# =============================================================================
+# exim-spool — Spool File I/O Crate
+# =============================================================================
+#
+# Replaces the C spool file I/O subsystem:
+#   src/src/spool_in.c   (1,122 lines) — spool header/metadata reading
+#   src/src/spool_out.c  (578 lines)   — spool header/metadata writing
+#   src/src/spool_mbox.c (247 lines)   — MBOX materialization for content scanning
+#
+# This crate handles reading and writing spool files (-H header/metadata and
+# -D data files) with BYTE-LEVEL COMPATIBILITY required between C Exim and
+# Rust Exim (AAP §0.7.1).  Spool files written by C Exim must be readable
+# by Rust Exim and vice versa; -D and -H file formats must be byte-level
+# compatible.
+#
+# Source origin:
+#   spool_in.c   — spool_open_datafile(), spool_read_header(), field parsing
+#   spool_out.c  — spool_write_header(), spool_open_temp(), field serialization
+#   spool_mbox.c — spool_mbox() MBOX creation for content scanning (WITH_CONTENT_SCAN)
+#
+# Feature flags (AAP §0.7.3) replace C preprocessor conditionals:
+#   WITH_CONTENT_SCAN  → content-scan  (spam_bar, spam_score, MBOX materialization)
+#   SUPPORT_I18N       → i18n          (SMTPUTF8 / UTF-8 downconvert)
+#   DISABLE_TLS (inv.) → tls           (tls_cipher, tls_peerdn, tls_sni, etc.)
+#   DISABLE_DKIM (inv.)→ dkim          (DKIM-related spool handling)
+#   SUPPORT_DANE       → dane          (dane_verified field in TLS state)
+#   HAVE_LOCAL_SCAN    → local-scan    (local_scan_data field)
+
+[package]
+name = "exim-spool"
+version = "0.1.0"
+edition = "2021"
+description = "Spool file I/O crate for Exim MTA — byte-level compatible -H header and -D data file read/write, message ID generation (base-62)"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Each feature maps to a C preprocessor conditional in the original spool
+# source files.  Features gate conditional compilation of spool field
+# read/write logic and MBOX materialization.  None of these features pull
+# in additional crate dependencies — they only control #[cfg(feature = "...")]
+# gating within this crate's Rust source modules.
+
+[features]
+default = []
+
+# Replaces #ifdef WITH_CONTENT_SCAN — gates spool_mbox.c functionality
+# (spam_bar, spam_score, spam_score_int variables in spool header, and
+# MBOX materialization for content scanning engines).
+content-scan = []
+
+# Replaces #ifdef SUPPORT_I18N — gates SMTPUTF8 support and UTF-8
+# downconvert handling in spool files (message_smtputf8, message_utf8_downconvert).
+i18n = []
+
+# Replaces #ifndef DISABLE_TLS (inverted logic) — gates TLS-related spool
+# fields: tls_cipher, tls_peerdn, tls_sni, tls_certificate_verified,
+# tls_ocsp, tls_resumption, tls_ver, tls_peercert, tls_ourcert.
+tls = []
+
+# Replaces #ifndef DISABLE_DKIM (inverted logic) — gates DKIM-related
+# spool handling (dkim_signers, dkim_collect_input, dkim_disable_verify).
+dkim = []
+
+# Replaces #ifdef SUPPORT_DANE — gates the dane_verified field in TLS
+# state within spool files.  Nested under TLS in the C source (#if
+# !defined(DISABLE_TLS) ... #ifdef SUPPORT_DANE).
+dane = []
+
+# Replaces #ifdef HAVE_LOCAL_SCAN — gates the local_scan_data field
+# in spool header files.
+local-scan = []
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+[dependencies]
+
+# ── Workspace crate dependency ───────────────────────────────────────────────
+# Required for Tainted<T>/Clean<T> newtypes (taint tracking on spool data
+# read from disk), MessageArena for per-message allocations during spool
+# read operations, and Arc<Config> for frozen config access (spool_directory,
+# split_spool_directory, etc.).
+exim-store = { path = "../exim-store" }
+
+# ── Serialization framework ─────────────────────────────────────────────────
+# Used for spool data structure serialization/deserialization support,
+# enabling structured representation of spool header fields.
+serde = { workspace = true }
+
+# ── Error type derivation ────────────────────────────────────────────────────
+# Derives error types for spool read/write operations, mapping to the C
+# spool_read_* return codes: spool_read_OK, spool_read_notopen,
+# spool_read_enverror, spool_read_hdrerror.
+thiserror = { workspace = true }
+
+# ── Structured logging ───────────────────────────────────────────────────────
+# Replaces DEBUG(D_deliver) debug_printf / debug_printf_indent calls in the
+# C spool source with structured tracing spans and events.
+tracing = { workspace = true }
+
+# ── Logging facade ───────────────────────────────────────────────────────────
+# Provides the log facade for crate-level compatibility with libraries that
+# use the `log` crate rather than `tracing` directly.
+log = { workspace = true }
+
+# ── Safe POSIX API wrappers ──────────────────────────────────────────────────
+# Required for fcntl file locking (F_WRLCK on spool data first line), fchown
+# (setting exim_uid:exim_gid on temp files), and fchmod (setting SPOOL_MODE
+# permissions).  AAP §0.7.2 forbids unsafe blocks outside exim-ffi, so nix
+# provides safe wrappers for these POSIX calls.
+nix = { workspace = true, features = ["fs"] }
+
+# ── POSIX constant definitions ───────────────────────────────────────────────
+# Provides O_NOFOLLOW (symlink attack protection) and O_CLOEXEC (close-on-exec)
+# constants, plus the libc::flock struct for POSIX record locking byte ranges.
+libc = { workspace = true }
+
+# =============================================================================
+# Dev Dependencies (testing only)
+# =============================================================================
+
+[dev-dependencies]
+tempfile = "3"

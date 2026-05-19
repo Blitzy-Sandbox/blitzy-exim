@@ -9,3 +9,12 @@
 .gdb_history
 .xauth*
 cscope.out
+
+# Rust build artifacts (Cargo workspace)
+/target/
+
+# Benchmark output artifacts
+/bench/results/
+
+# Compiled test binaries
+*.test_bin

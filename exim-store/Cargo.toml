@@ -1,0 +1,78 @@
+# =============================================================================
+# exim-store — Rust Memory Management Crate
+# =============================================================================
+#
+# Replaces Exim's custom stacking allocator (store.c / store.h) with Rust-native
+# memory management primitives.  This is a foundational crate depended upon by
+# every other workspace member.
+#
+# Memory Model Replacement (AAP §0.4.3):
+#
+#   C Store Pool        Rust Replacement
+#   ─────────────────   ──────────────────────────────────────────────────
+#   POOL_MAIN (+taint)  bumpalo::Bump arena, dropped at message completion
+#   POOL_PERM (+taint)  Owned String / Vec / structs with process lifetime
+#   POOL_CONFIG (+taint) Arc<Config> frozen after parse
+#   POOL_SEARCH (+taint) HashMap with explicit clear() on lookup tidyup
+#   POOL_MESSAGE (+taint) Scoped struct dropped at end of message transaction
+#   Taint tracking       Tainted<T> / Clean<T> newtypes (zero runtime cost)
+#
+# Source origin: src/src/store.c (1,336 lines) + src/src/store.h (92 lines)
+
+[package]
+name = "exim-store"
+version = "0.1.0"
+edition = "2021"
+description = "Rust memory management crate replacing Exim's custom stacking allocator with bumpalo arenas, Arc<Config>, and Tainted<T>/Clean<T> newtypes"
+license = "GPL-2.0-or-later"
+publish = false
+
+[dependencies]
+
+# ── Arena allocation (replaces POOL_MAIN stacking allocator) ─────────────────
+# bumpalo provides per-message bump arenas that are dropped at message
+# completion, replacing store_get() / store_reset() / store_mark() from
+# store.c.  The "collections" feature enables BumpVec and BumpString for
+# arena-allocated growable containers.
+bumpalo = { workspace = true }
+
+# ── Alternative arena (for homogeneous typed allocations) ────────────────────
+# typed-arena provides efficient arenas for same-type allocations, useful for
+# tree nodes and linked structures that were previously allocated from
+# POOL_PERM in the C codebase.
+typed-arena = { workspace = true }
+
+# ── Serialization ────────────────────────────────────────────────────────────
+# Used for serialization of config types stored in Arc<Config>, enabling
+# config dump / inspect operations and future config caching.
+serde = { workspace = true }
+
+# ── Error handling ───────────────────────────────────────────────────────────
+# Derives the Error trait for StoreError, TaintError, and related error types
+# returned by arena and taint-checking operations.
+thiserror = { workspace = true }
+
+# ── Structured logging ───────────────────────────────────────────────────────
+# Arena allocation / deallocation events, taint violations, and memory
+# statistics are logged through the tracing infrastructure, matching Exim's
+# -d debug selector system (-d+all, -d+memory, etc.).
+tracing = { workspace = true }
+
+# ── Logging facade ───────────────────────────────────────────────────────────
+# Provides compatibility with crates that use the log facade instead of tracing.
+log = { workspace = true }
+
+[dev-dependencies]
+
+# ── Test-only JSON serialization ─────────────────────────────────────────────
+# Used in unit tests to verify Serialize/Deserialize implementations for
+# Tainted<T> and Clean<T> newtypes.
+serde_json = { workspace = true }
+
+[features]
+# This foundational crate has no feature-gated backends.  It provides core
+# memory management types (MessageArena, Tainted<T>, Clean<T>, ConfigStore,
+# SearchCache) consumed by every other workspace crate.  Cargo feature flags
+# in downstream crates (exim-lookups, exim-tls, etc.) replace the 1,677 C
+# preprocessor conditionals per AAP §0.7.3.
+default = []

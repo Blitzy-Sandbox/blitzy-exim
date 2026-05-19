@@ -1,0 +1,62 @@
+# =============================================================================
+# exim-drivers — Trait-Based Driver System for Exim MTA
+# =============================================================================
+#
+# This crate provides the foundational driver trait definitions and the
+# inventory-based compile-time registration system that replaces the C
+# `driver_info` struct inheritance pattern from `drtables.c` and `structs.h`.
+#
+# It defines four driver traits:
+#   - AuthDriver       (replaces auth_info function pointers)
+#   - RouterDriver     (replaces router_info function pointers)
+#   - TransportDriver  (replaces transport_info function pointers)
+#   - LookupDriver     (replaces lookup_info function pointers from lookupapi.h)
+#
+# All driver implementation crates (exim-auths, exim-routers, exim-transports,
+# exim-lookups, exim-miscmods) depend on this crate for trait definitions and
+# compile-time registration via `inventory::submit!`.
+#
+# This crate contains ZERO unsafe code (per AAP §0.7.2).
+
+[package]
+name = "exim-drivers"
+version = "0.1.0"
+edition = "2021"
+description = "Trait-based driver system for Exim MTA — defines AuthDriver, RouterDriver, TransportDriver, LookupDriver traits and inventory-based compile-time registration"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+# Per AAP §0.6.1 and §0.4.2:
+#   - inventory: Compile-time driver registration replacing drtables.c
+#     linked-list registration. Per AAP §0.7.3: "Driver registration via
+#     `inventory` crate — each driver implementation uses `inventory::submit!`
+#     for compile-time collection; runtime driver resolution by name from config"
+#   - thiserror: Error type derivation for DriverError enum
+#   - tracing: Structured logging/debugging (replaces C debug.c/log.c)
+#   - log: Logging facade compatibility for crate interoperability
+#   - serde: Serialization support for driver option configuration
+
+[dependencies]
+inventory = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+
+# =============================================================================
+# Features
+# =============================================================================
+# Per AAP §0.7.3: Cargo feature flags replace preprocessor conditionals.
+# This is a foundational crate providing trait definitions — no feature-gating
+# is needed here. Individual driver features are gated in the respective
+# driver implementation crates:
+#   - exim-auths:      auth-cram-md5, auth-plaintext, auth-dovecot, etc.
+#   - exim-routers:    router-accept, router-dnslookup, router-redirect, etc.
+#   - exim-transports: transport-appendfile, transport-smtp, transport-pipe, etc.
+#   - exim-lookups:    lookup-lsearch, lookup-mysql, lookup-redis, etc.
+
+[features]
+default = []

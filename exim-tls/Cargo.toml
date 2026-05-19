@@ -1,0 +1,174 @@
+# =============================================================================
+# exim-tls — TLS Abstraction Crate for Exim MTA
+# =============================================================================
+#
+# This crate provides a unified TLS abstraction layer replacing Exim's dual
+# TLS backend implementation across six C source files (~12,579 lines total):
+#
+#   Source Files Replaced:
+#   • src/src/tls.c          (929 lines  — backend-independent TLS glue,
+#                              credential reload/watch, session resumption key)
+#   • src/src/tls-openssl.c  (5,323 lines — OpenSSL backend with DANE, OCSP,
+#                              SNI, session cache, verify callback chain)
+#   • src/src/tls-gnu.c      (4,491 lines — GnuTLS backend with version-
+#                              specific capability detection)
+#   • src/src/dane.c         (49 lines   — DANE/TLSA support dispatcher)
+#   • src/src/dane-openssl.c (1,740 lines — DANE OpenSSL backend with TLSA
+#                              record matching and certificate verification)
+#   • src/src/danessl.h      (47 lines   — DANE SSL API header definitions)
+#
+# Architecture:
+#   Defines a TlsBackend trait with two pluggable implementations:
+#   • rustls  (default) — memory-safe TLS with no C library dependency
+#   • openssl (optional) — for environments requiring OpenSSL (FIPS, etc.)
+#
+#   Submodules:
+#   • lib.rs           — TlsBackend trait definition and public API
+#   • rustls_backend   — rustls implementation of TlsBackend trait
+#   • openssl_backend  — openssl crate implementation of TlsBackend trait
+#   • dane             — DANE/TLSA support for certificate verification
+#   • ocsp             — OCSP stapling for certificate revocation checking
+#   • sni              — Server Name Indication for virtual hosting
+#   • client_cert      — Client certificate extraction and verification
+#   • session_cache    — TLS session resumption and ticket management
+#
+# Feature Flag Mapping (C preprocessor → Cargo features):
+#   C Conditional        → Cargo Feature   → Effect
+#   ────────────────────   ──────────────   ─────────────────────────────────
+#   USE_GNUTLS           → tls-rustls       Enables rustls + webpki-roots +
+#                           (default)        rustls-pemfile dependencies
+#   USE_OPENSSL          → tls-openssl      Enables openssl crate dependency
+#   SUPPORT_DANE         → dane             Enables DANE/TLSA verification
+#   !DISABLE_OCSP        → ocsp             Enables OCSP stapling support
+#   !DISABLE_TLS_RESUME  → tls-resume       Enables sha2 + getrandom deps
+#                                            for session resumption keys
+#   DISABLE_TLS          → (omit both       No TLS support compiled
+#                           tls-rustls and
+#                           tls-openssl)
+
+[package]
+name = "exim-tls"
+version = "0.1.0"
+edition = "2021"
+description = "TLS abstraction crate for Exim MTA — provides TlsBackend trait with rustls (default) and openssl (optional) backends, DANE/TLSA, OCSP stapling, SNI, client cert verification, and TLS session resumption"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+# These Cargo feature flags replace the C preprocessor conditionals that
+# controlled TLS backend selection and optional TLS capabilities in the
+# original C source tree.
+#
+# The tls-rustls feature is the default, providing a memory-safe TLS
+# implementation with no C library dependency. The tls-openssl feature
+# provides an alternative for environments with specific OpenSSL requirements
+# (FIPS compliance, particular cipher suites, legacy compatibility).
+#
+# While Cargo technically allows both tls-rustls and tls-openssl to be enabled
+# simultaneously, the TlsBackend trait implementation selected at runtime is
+# determined by configuration (tls_require_ciphers setting). In practice,
+# builds should enable exactly one backend — mirroring the C build's mutual
+# exclusion between USE_OPENSSL and USE_GNUTLS.
+
+[features]
+default = ["tls-rustls"]
+
+# TLS backend selection — enable one of these to compile a TLS backend.
+# Enabling neither is equivalent to the C DISABLE_TLS conditional.
+tls-rustls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
+tls-openssl = ["dep:openssl"]
+
+# Optional TLS capabilities — each replaces a C preprocessor conditional.
+dane = ["dep:sha2"]                         # DANE/TLSA support (C: SUPPORT_DANE)
+ocsp = []                                   # OCSP stapling (C: !DISABLE_OCSP)
+tls-resume = ["dep:sha2", "dep:getrandom"]  # Session resumption (C: !DISABLE_TLS_RESUME)
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+[dependencies]
+
+# ── Workspace crate dependencies ─────────────────────────────────────────────
+# exim-store provides Tainted<T>/Clean<T> newtypes for compile-time taint
+# tracking of TLS certificate paths and hostnames, plus memory management
+# primitives for per-message TLS state.
+exim-store = { path = "../exim-store" }
+
+# exim-ffi provides safe wrappers for inherently-unsafe POSIX operations.
+# Used here for fd::tcp_stream_from_raw_fd() — converting raw socket
+# descriptors from accept()/connect() into TcpStream for TLS handshake.
+# This keeps ALL unsafe code in the exim-ffi crate per AAP §0.7.2.
+exim-ffi = { path = "../exim-ffi" }
+
+# ── Workspace-shared dependencies ────────────────────────────────────────────
+# These reference versions pinned in the root Cargo.toml [workspace.dependencies]
+# to guarantee version consistency across all 18 workspace crates.
+
+# Error type derivation — provides #[derive(Error)] for TlsError enum that
+# unifies errors from rustls, openssl, certificate parsing, and I/O.
+thiserror = { workspace = true }
+
+# Structured logging replacing C DEBUG(D_tls) macro calls throughout tls.c,
+# tls-openssl.c, and tls-gnu.c. Integrates with Exim's debug selector system
+# (-d+tls flag) via tracing spans and events.
+tracing = { workspace = true }
+
+# Logging facade compatibility — bridges third-party crate log output (from
+# rustls, openssl, etc.) into the tracing subscriber pipeline.
+log = { workspace = true }
+
+# Serialization support for TLS configuration types (certificate paths, cipher
+# lists, protocol versions) stored in Arc<Config> via exim-config.
+serde = { workspace = true }
+
+# ── TLS backend: rustls (default, optional) ──────────────────────────────────
+# Memory-safe TLS implementation with no C library dependency. Version 0.23.37
+# per AAP §0.6.1. Activated by the tls-rustls feature flag, which also pulls
+# in webpki-roots for Mozilla root CA certificates and rustls-pemfile for
+# parsing PEM-encoded certificates and private keys from Exim config paths.
+rustls = { workspace = true, optional = true }
+webpki-roots = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+# ── TLS backend: openssl (optional) ─────────────────────────────────────────
+# OpenSSL bindings for environments requiring OpenSSL-specific functionality:
+# FIPS 140-2 compliance, specific cipher suites, or legacy TLS protocol
+# versions. Version 0.10.75 per AAP §0.6.1. Activated by the tls-openssl
+# feature flag. Replaces the C tls-openssl.c backend (5,323 lines).
+openssl = { workspace = true, optional = true }
+
+# ── X.509 certificate parsing (always compiled) ─────────────────────────────
+# Pure Rust X.509 v3 (RFC 5280) DER certificate parser. This is a non-optional
+# dependency because the client_cert module is always compiled and requires
+# certificate introspection regardless of the selected TLS backend.
+#
+# Used by three modules:
+# • client_cert — Extract Subject Alternative Names (DNS and IP entries),
+#   Subject Distinguished Name, and Common Name from DER-encoded peer
+#   certificates during TLS client certificate verification. Replaces
+#   C OpenSSL X509_check_host(), X509_NAME_oneline(), X509_get_subject_name()
+#   calls from tls-openssl.c verify_callback chain.
+# • dane — TLSA record matching against certificate and SPKI data per
+#   RFC 6698/7671/7672. Replaces C dane-openssl.c DANE verification.
+# • ocsp — Validate OCSP responses against server certificates.
+x509-parser = "0.16.0"
+
+# ── TLS session resumption dependencies (optional) ──────────────────────────
+# These dependencies are gated behind the tls-resume feature flag, which
+# replaces the C !DISABLE_TLS_RESUME preprocessor conditional.
+
+# Pure Rust SHA-256 implementation for computing TLS session resumption keys.
+# Replaces C exim_sha_init(HASH_SHA2_256) / exim_sha_update() /
+# exim_sha_finish() from tls.c tls_client_resumption_key(). The session
+# resumption key is a SHA-256 hash of connection parameters (hostname, port,
+# SNI, DANE status) used to index the session ticket cache.
+sha2 = { version = "0.10.9", optional = true }
+
+# OS-provided cryptographically secure random byte generation for Session
+# Ticket Encryption Key (STEK) material: 16-byte key names, 32-byte AES-256
+# keys, and 16-byte HMAC keys. Replaces C RAND_bytes() calls from
+# tls-openssl.c tk_init() and the GnuTLS session ticket key generation.
+getrandom = { version = "0.2", optional = true }

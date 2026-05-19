@@ -1,0 +1,326 @@
+# =============================================================================
+# exim-smtp — SMTP Protocol Handling Crate for Exim MTA
+# =============================================================================
+#
+# This crate replaces the C SMTP protocol implementation across three source
+# files (~7,113 lines total):
+#
+#   Source Files Replaced:
+#   • src/src/smtp_in.c  (6,022 lines — inbound SMTP server state machine with
+#                          PIPELINING, CHUNKING/BDAT, AUTH, STARTTLS, ACL hooks,
+#                          PRDR, ATRN, WELLKNOWN, XCLIENT extensions)
+#   • src/src/smtp_out.c (924 lines  — outbound SMTP client I/O: connection
+#                          management, pipelining, TLS negotiation, SOCKS proxy,
+#                          DSCP marking, TCP Fast Open, response parsing)
+#   • src/src/atrn.c     (167 lines  — ATRN/ODMR extension: provider role swap,
+#                          customer connection flip, queue-run triggering)
+#
+# Architecture:
+#   The crate is organized into two module trees plus top-level ATRN support:
+#
+#   lib.rs                          — Public API
+#   inbound/
+#   ├── mod.rs                      — Inbound SMTP module root
+#   ├── command_loop.rs             — SMTP command state machine with type-state
+#   │                                 pattern: Connected → Greeted → MailFrom →
+#   │                                 RcptTo → Data (compile-time ordering)
+#   ├── pipelining.rs               — PIPELINING support (RFC 2920)
+#   ├── chunking.rs                 — CHUNKING/BDAT support (RFC 3030)
+#   ├── prdr.rs                     — Per-Recipient Data Response
+#   └── atrn.rs                     — ATRN extension (RFC 2645)
+#   outbound/
+#   ├── mod.rs                      — Outbound SMTP module root
+#   ├── connection.rs               — Connection management + reuse
+#   ├── parallel.rs                 — Parallel delivery dispatch
+#   ├── tls_negotiation.rs          — STARTTLS initiation on outbound
+#   └── response.rs                 — SMTP response parsing
+#
+# Consumers:
+#   • exim-core   — Main binary invokes SMTP server for daemon mode
+#   • exim-deliver — Delivery orchestration uses outbound SMTP client
+#
+# Design Patterns (per AAP §0.4.2):
+#   • Type-state pattern enforces valid SMTP command ordering at compile time
+#   • Scoped context passing replaces 714 global variables (ServerContext,
+#     MessageContext passed through all SMTP call chains)
+#   • Tainted<T>/Clean<T> newtypes for taint tracking of SMTP input data
+#   • Cargo feature flags replace all preprocessor conditionals
+#
+# Feature Flag Mapping (C preprocessor → Cargo features):
+#   C Conditional               → Cargo Feature     → Description
+#   ──────────────────────────    ─────────────────    ──────────────────────
+#   #ifndef DISABLE_TLS         → tls                 STARTTLS, TLS-on-connect
+#   #ifndef DISABLE_PRDR        → prdr                Per-Recipient Data Response
+#   #ifndef DISABLE_PIPE_CONNECT→ pipe-connect         Early pipelining
+#   #ifndef DISABLE_DKIM        → dkim                DKIM verification I/O feed
+#   #ifndef DISABLE_WELLKNOWN   → wellknown           WELLKNOWN SMTP extension
+#   #ifndef DISABLE_ESMTP_LIMITS→ esmtp-limits         ESMTP LIMITS extension
+#   #ifndef DISABLE_EVENT       → events              Event hook support
+#   #ifdef EXPERIMENTAL_XCLIENT → xclient             XCLIENT SMTP extension
+#   #ifdef EXPERIMENTAL_DCC     → dcc                 DCC content scanning
+#   #ifdef SUPPORT_PROXY        → proxy               HAProxy PROXY protocol
+#   #ifdef SUPPORT_I18N         → i18n                SMTPUTF8 internationalization
+#   #ifdef SUPPORT_SRS          → srs                 Sender Rewriting Scheme
+#   #ifdef WITH_CONTENT_SCAN    → content-scan        MIME/malware/spam scanning
+#   #ifdef HAVE_LOCAL_SCAN      → local-scan          Local scan hook
+#   #ifdef SUPPORT_DSCP         → dscp                DSCP/QoS traffic marking
+#   #ifdef SUPPORT_SOCKS        → socks               SOCKS5 proxy support
+
+[package]
+name = "exim-smtp"
+version = "0.1.0"
+edition = "2021"
+description = "SMTP protocol handling crate for Exim MTA — inbound SMTP server (PIPELINING, CHUNKING/BDAT, PRDR, ATRN) and outbound SMTP client (connection management, parallel delivery, STARTTLS negotiation, response parsing) with type-state compile-time command ordering enforcement"
+license = "GPL-2.0-or-later"
+publish = false
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+#
+# Cargo feature flags replace ALL C preprocessor conditionals found in
+# smtp_in.c (14 distinct groups), smtp_out.c (5 groups, with overlaps), and
+# atrn.c (1 group) per AAP §0.7.3.
+#
+# Feature names use kebab-case for consistency with other workspace crates.
+# Each feature maps to a specific #ifdef/#ifndef guard in the original C source.
+#
+# The default feature set matches a typical Exim C build where TLS, PRDR, DKIM,
+# content scanning, pipe-connect optimization, and event hooks are all enabled.
+
+[features]
+
+# Default features — match a typical Exim C build configuration where
+# DISABLE_TLS, DISABLE_PRDR, DISABLE_DKIM, DISABLE_PIPE_CONNECT, and
+# DISABLE_EVENT are NOT set, and WITH_CONTENT_SCAN is defined.
+default = ["tls", "prdr", "dkim", "content-scan", "pipe-connect", "events"]
+
+# ── TLS support ──────────────────────────────────────────────────────────────
+# Replaces: #ifndef DISABLE_TLS (35+ occurrences across smtp_in.c, smtp_out.c,
+#           and atrn.c)
+# Enables: STARTTLS command advertisement and negotiation in inbound SMTP,
+#          TLS-on-connect mode, TLS session info logging, TLS write path in
+#          outbound flush_buffer(), and TLS state transfer in ATRN role swap.
+# Gates the optional exim-tls dependency — when disabled, the entire TLS
+# subsystem is excluded from compilation.
+tls = ["dep:exim-tls"]
+
+# ── DANE/TLSA support ───────────────────────────────────────────────────────
+# Replaces: #ifdef SUPPORT_DANE (smtp_out.c, dane.c, tls-openssl.c)
+# Enables: DANE/TLSA certificate verification on outbound SMTP connections
+#          after TLS handshake. Forwards to exim-tls's dane feature. Requires
+#          the tls feature to also be enabled (uses optional dep syntax "?").
+dane = ["exim-tls?/dane"]
+
+# ── Per-Recipient Data Response ──────────────────────────────────────────────
+# Replaces: #ifndef DISABLE_PRDR (smtp_in.c lines 291, 309, 1784, 3137,
+#           4457, 4790, 4955, 4963)
+# Enables: PRDR EHLO extension advertisement, MAIL FROM PRDR option parsing,
+#          per-recipient response collection during DATA phase.
+prdr = []
+
+# ── Early pipelining optimization ────────────────────────────────────────────
+# Replaces: #ifndef DISABLE_PIPE_CONNECT (smtp_in.c lines 136, 1178, 2794,
+#           2813, 2844, 3931, 4193, 4356, 4489, 5309; smtp_out.c line 848)
+# Enables: PIPE_CONNECT/early-data support allowing clients to send EHLO+MAIL+
+#          RCPT before receiving the server banner, reducing round trips.
+pipe-connect = []
+
+# ── DKIM verification I/O feed ───────────────────────────────────────────────
+# Replaces: #ifndef DISABLE_DKIM (smtp_in.c lines 469, 525, 584, 750, 766,
+#           799, 874)
+# Enables: DKIM verification data feed in the SMTP I/O path — received message
+#          bytes are passed to the DKIM verification engine during reception.
+dkim = []
+
+# ── WELLKNOWN command support ────────────────────────────────────────────────
+# Replaces: #ifndef DISABLE_WELLKNOWN (smtp_in.c lines 71, 221, 248, 2043,
+#           3751, 4475, 4526, 5669)
+# Enables: WELLKNOWN SMTP command and EHLO extension advertisement for the
+#          RFC draft WELLKNOWN discovery mechanism.
+wellknown = []
+
+# ── ESMTP LIMITS extension ───────────────────────────────────────────────────
+# Replaces: #ifndef DISABLE_ESMTP_LIMITS (smtp_in.c line 4278)
+# Enables: LIMITS EHLO extension advertising server-imposed limits such as
+#          maximum message size, maximum recipients per message, etc.
+esmtp-limits = []
+
+# ── Event hook support ───────────────────────────────────────────────────────
+# Replaces: #ifndef DISABLE_EVENT (smtp_in.c lines 2892, 3914, 4029;
+#           smtp_out.c line 353)
+# Enables: event_raise() hook calls at tcp:connect, smtp:connect, and other
+#          SMTP protocol events for integration with external event consumers.
+events = []
+
+# ── XCLIENT SMTP extension ──────────────────────────────────────────────────
+# Replaces: #ifdef EXPERIMENTAL_XCLIENT (smtp_in.c lines 60, 190, 206, 251,
+#           3820, 4442, 4534, 5673)
+# Enables: XCLIENT command support (Postfix-compatible) for trusted proxies
+#          to override client connection attributes (address, name, helo).
+xclient = []
+
+# ── DCC content scanning integration ────────────────────────────────────────
+# Replaces: #ifdef EXPERIMENTAL_DCC (smtp_in.c line 1800)
+# Enables: DCC (Distributed Checksum Clearinghouse) spam detection integration
+#          in the SMTP DATA/BDAT reception path.
+dcc = []
+
+# ── HAProxy PROXY protocol support ──────────────────────────────────────────
+# Replaces: #ifdef SUPPORT_PROXY (smtp_in.c lines 102, 1310, 1365, 5951)
+# Enables: HAProxy PROXY protocol v1/v2 parsing at SMTP connection start,
+#          allowing the SMTP server to receive real client IP from load
+#          balancers and reverse proxies.
+proxy = []
+
+# ── SMTPUTF8 internationalization ────────────────────────────────────────────
+# Replaces: #ifdef SUPPORT_I18N (smtp_in.c lines 141, 295, 314, 1787, 4212,
+#           4466, 4797)
+# Enables: SMTPUTF8 EHLO extension, internationalized email address handling
+#          in MAIL FROM/RCPT TO commands per RFC 6531.
+i18n = []
+
+# ── Sender Rewriting Scheme ──────────────────────────────────────────────────
+# Replaces: #ifdef SUPPORT_SRS (smtp_in.c line 1790)
+# Enables: SRS (Sender Rewriting Scheme) processing for SPF-compatible
+#          forwarding address rewriting.
+srs = []
+
+# ── MIME/malware/spam content scanning ───────────────────────────────────────
+# Replaces: #ifdef WITH_CONTENT_SCAN (smtp_in.c lines 1756, 1796, 3132, 3158)
+# Enables: Content scanning hooks in the SMTP DATA reception path for MIME
+#          decoding, malware scanning, and spam detection integration.
+content-scan = []
+
+# ── Local scan hook ──────────────────────────────────────────────────────────
+# Replaces: #ifdef HAVE_LOCAL_SCAN (smtp_in.c line 1793)
+# Enables: local_scan() function hook called during message reception for
+#          site-specific message inspection and modification.
+local-scan = []
+
+# ── DSCP/QoS traffic marking ────────────────────────────────────────────────
+# Replaces: #ifdef SUPPORT_DSCP (smtp_out.c line 290)
+# Enables: DSCP (Differentiated Services Code Point) traffic class marking
+#          on outbound SMTP sockets via setsockopt() for QoS prioritization.
+dscp = []
+
+# ── SOCKS5 proxy support ────────────────────────────────────────────────────
+# Replaces: #ifdef SUPPORT_SOCKS (smtp_out.c lines 502, 511)
+# Enables: SOCKS5 proxy support for outbound SMTP connections, allowing
+#          mail delivery through SOCKS proxies.
+socks = []
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+[dependencies]
+
+# ── Workspace crate dependencies ─────────────────────────────────────────────
+
+# ACL evaluation engine — the inbound SMTP command loop invokes ACL checks at
+# every SMTP phase: CONNECT, HELO, MAIL, RCPT, DATA, AUTH, STARTTLS, VRFY,
+# EXPN, ETRN, ATRN, WELLKNOWN. Replaces calls to acl_check(ACL_WHERE_RCPT, ...)
+# and acl_check(ACL_WHERE_DATA, ...) found throughout smtp_in.c.
+# Configuration types — provides exim_config::types::ConfigContext which is the
+# canonical source of parsed configuration.  The SMTP crate defines its own
+# SmtpConfigContext with a `from_config()` bridge to convert from the canonical
+# type, avoiding type incompatibility between the core context system and the
+# SMTP session (see command_loop.rs header comment for details).
+exim-config = { path = "../exim-config" }
+
+exim-acl = { path = "../exim-acl" }
+
+# TLS abstraction — provides STARTTLS negotiation for both inbound SMTP
+# (smtp_in.c: tls_server_start()) and outbound SMTP (smtp_out.c: TLS write via
+# tls_write() in flush_buffer()). DANE verification also routes through this
+# crate. Made optional and gated behind the "tls" feature flag, since the
+# entire TLS subsystem can be disabled (#ifndef DISABLE_TLS).
+exim-tls = { path = "../exim-tls", optional = true }
+
+# Memory management — Tainted<T>/Clean<T> newtypes for compile-time taint
+# tracking of untrusted SMTP input data (smtp_out.c line 58: is_tainted(expint)
+# check), MessageArena for per-message SMTP session state allocation, arena
+# allocation replacing POOL_MAIN/POOL_MESSAGE C store pools.
+exim-store = { path = "../exim-store" }
+
+# FFI safe wrappers — provides safe_read_fd() and safe_poll_readable_fd() for
+# bridging RawFd to nix 0.31.2's I/O-safe BorrowedFd API without requiring
+# unsafe code in this crate. Used by inbound/pipelining.rs for SMTP socket
+# reads and readability checks (per AAP §0.7.2: zero unsafe outside exim-ffi).
+exim-ffi = { path = "../exim-ffi" }
+
+# Driver trait definitions — needed for AUTH driver integration during SMTP AUTH
+# command handling. The SMTP server dispatches to registered AuthDriver
+# implementations when processing AUTH commands from clients.
+exim-drivers = { path = "../exim-drivers" }
+
+# String expansion engine — config option expansion used extensively in both
+# smtp_in.c (expand_string() for host checks, SMTP banner, ACL args, etc.)
+# and smtp_out.c (expand_string(istring) for interface expansion at line 49,
+# expand_string(tblock->port) for port resolution at line 122).
+exim-expand = { path = "../exim-expand" }
+
+# DNS resolution — required for host verification checks during inbound SMTP
+# (verify_check_host patterns, DNSBL checks), MX resolution for outbound
+# connection routing, and reverse DNS lookups for sender verification.
+exim-dns = { path = "../exim-dns" }
+
+# Spool file I/O — message ID generation, spool header/data file writing.
+# Used after SMTP DATA to write the received message to the spool directory.
+exim-spool = { path = "../exim-spool" }
+
+# ── Workspace-shared external dependencies ───────────────────────────────────
+# All versions inherited from root Cargo.toml [workspace.dependencies] to
+# guarantee version consistency across all 18 workspace crates (AAP §0.6.3).
+
+# Error type derivation — generates Display + Error implementations for
+# SmtpError, ConnectionError, ProtocolError, and other SMTP-specific error
+# types. Replaces C integer return codes and string error messages.
+thiserror = { workspace = true }
+
+# Structured logging/debugging — replaces Exim's HDEBUG(D_receive) and
+# debug_printf()/log_write() calls used extensively throughout smtp_in.c
+# (100+ occurrences) and smtp_out.c for SMTP session tracing, command logging,
+# error diagnostics, and TLS negotiation status. Integrates with Exim's debug
+# selector system (-d+receive, -d+transport flags) via tracing spans and events.
+tracing = { workspace = true }
+
+# Logging facade compatibility — bridges log output from third-party crates
+# into the tracing subscriber pipeline.
+log = { workspace = true }
+
+# Serialization framework — used for SMTP session state serialization when
+# persisting session context across delivery attempts, and for structured
+# representation of SMTP response data.
+serde = { workspace = true }
+
+# Pattern matching — Rust-native regex for host matching patterns, address
+# validation, and SMTP command argument parsing in the inbound command loop
+# (host list matching, sender/recipient pattern checks).
+regex = { workspace = true }
+
+# C type definitions and system call bindings — required for low-level socket
+# operations: select()/poll() for synchronization checks (smtp_in.c line 711:
+# check_sync()), getsockname()/getpeername() for connection info, setsockopt()
+# for TCP_NODELAY (smtp_out.c line 278), TCP_CORK (smtp_in.c line 1148), DSCP
+# marking, IP options checking (smtp_in.c line 2185+), and socket buffer
+# management.
+libc = { workspace = true }
+
+# Safe POSIX API wrappers — provides type-safe interfaces for socket operations
+# (bind, connect, listen, accept), poll/select I/O multiplexing, signal
+# handling during SMTP session management, and fork/exec for ATRN provider
+# queue runs. Version 0.31.2 per AAP §0.6.1.
+nix = { workspace = true, features = ["net"] }
+
+# =============================================================================
+# Library Target
+# =============================================================================
+# Pure library crate consumed by exim-core (daemon SMTP server) and
+# exim-deliver (outbound SMTP delivery). No binary targets.
+# Crate name in Rust code: exim_smtp (hyphen → underscore per Rust convention).
+
+[lib]
+name = "exim_smtp"
+path = "src/lib.rs"
